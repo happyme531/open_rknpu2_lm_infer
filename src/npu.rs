@@ -21,7 +21,7 @@ mod ffi {
 }
 use ffi::*;
 mod attention;
-pub use attention::Attention;
+pub use attention::{Attention, FullAttention};
 mod gated_delta;
 pub use gated_delta::GatedDelta;
 mod floating;
@@ -197,6 +197,49 @@ struct AttentionWork {
     v: Vec<u16>,
     output: Vec<f32>,
     output_half: Vec<u16>,
+}
+impl AttentionWork {
+    fn new(
+        domain: *mut rk_npu_iommu_domain,
+        config: rk_npu_attention_f16_config,
+        kv_rows: usize,
+    ) -> Result<Self> {
+        let mut sizes = rk_npu_attention_f16_sizes::default();
+        check(
+            unsafe {
+                rk_npu_attention_f16_query(
+                    &config,
+                    config.initial_capacity,
+                    config.max_query_rows,
+                    config.initial_capacity,
+                    &mut sizes,
+                )
+            },
+            "query native Attention sizes",
+        )?;
+        let mut raw = ptr::null_mut();
+        check(
+            unsafe { rk_npu_attention_f16_prepare(domain, &config, &mut raw) },
+            "prepare native Attention",
+        )?;
+        let query_elements =
+            config.query_heads as usize * config.max_query_rows as usize * config.head_dim as usize;
+        let kv_elements = config.kv_heads as usize * kv_rows * config.head_dim as usize;
+        Ok(Self {
+            workspace: Handle::new(
+                raw,
+                rk_npu_attention_f16_workspace_free,
+                "attention workspace",
+            )?,
+            config,
+            active_core_mask: sizes.active_core_mask,
+            q: vec![0; query_elements],
+            k: vec![0; kv_elements],
+            v: vec![0; kv_elements],
+            output: vec![0.0; query_elements],
+            output_half: Vec::new(),
+        })
+    }
 }
 struct Material {
     matrix: QuantMatrix,
@@ -456,9 +499,39 @@ impl Backend {
     ) -> Result<Attention> {
         self.attention_masked(query_heads, kv_heads, dimension, softmax_scale, false)
     }
-    /// Full self attention, with a separate backend workspace from causal KV.
-    pub fn noncausal_attention(&self, heads: usize, dimension: usize) -> Result<Attention> {
-        self.noncausal_gqa(heads, heads, dimension)
+    /// Temporary K/V and query scratch sized to one complete input sequence.
+    pub fn full_attention(
+        &self,
+        heads: usize,
+        dimension: usize,
+        rows: usize,
+    ) -> Result<FullAttention> {
+        ensure!(
+            rows > 0 && rows <= (i32::MAX as usize / 32) * 32,
+            "image Attention rows exceed the native integer range: {rows}"
+        );
+        let b = self.0.borrow();
+        let mut config = attention_config(
+            &b.options,
+            heads,
+            heads,
+            dimension,
+            (dimension as f32).sqrt().recip(),
+        );
+        config.mask_mode = RK_NPU_ATTENTION_F16_NO_MASK;
+        config.max_capacity = rows.div_ceil(32) as i32 * 32;
+        config.initial_capacity = config.max_capacity;
+        let work = AttentionWork::new(b.domain.raw, config, 0)?;
+        let mut raw = ptr::null_mut();
+        check(
+            unsafe { rk_npu_attention_f16_cache_create(b.domain.raw, &config, &mut raw) },
+            "allocate image K/V buffers",
+        )?;
+        Ok(FullAttention {
+            kv: Handle::new(raw, rk_npu_attention_f16_cache_free, "image K/V buffers")?,
+            work,
+            owner: self.clone(),
+        })
     }
     /// Bidirectional grouped-query attention for block diffusion drafting.
     pub fn noncausal_gqa(
@@ -501,38 +574,7 @@ impl Backend {
             if noncausal {
                 config.mask_mode = RK_NPU_ATTENTION_F16_NO_MASK;
             }
-            let mut sizes = rk_npu_attention_f16_sizes::default();
-            check(
-                unsafe {
-                    rk_npu_attention_f16_query(
-                        &config,
-                        config.initial_capacity,
-                        config.max_query_rows,
-                        config.initial_capacity,
-                        &mut sizes,
-                    )
-                },
-                "query native GQA sizes",
-            )?;
-            let mut raw = ptr::null_mut();
-            check(
-                unsafe { rk_npu_attention_f16_prepare(b.domain.raw, &config, &mut raw) },
-                "prepare native GQA",
-            )?;
-            b.attention = Some(AttentionWork {
-                workspace: Handle::new(
-                    raw,
-                    rk_npu_attention_f16_workspace_free,
-                    "attention workspace",
-                )?,
-                config,
-                active_core_mask: sizes.active_core_mask,
-                q: vec![0; query_heads * config.max_query_rows as usize * dimension],
-                k: vec![0; kv_heads * b.options.chunk * dimension],
-                v: vec![0; kv_heads * b.options.chunk * dimension],
-                output: vec![0.0; query_heads * config.max_query_rows as usize * dimension],
-                output_half: Vec::new(),
-            });
+            b.attention = Some(AttentionWork::new(b.domain.raw, config, b.options.chunk)?);
         }
         let cfg = &b.attention.as_ref().unwrap().config;
         ensure!(

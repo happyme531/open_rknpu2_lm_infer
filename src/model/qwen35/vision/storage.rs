@@ -2,7 +2,7 @@
 use crate::{
     layers::layer_norm::LayerNorm,
     model::trace::Trace,
-    npu::{Attention, FloatLinear},
+    npu::{FloatLinear, FullAttention},
     ops::{gelu, vision_half},
     vision::math,
 };
@@ -22,7 +22,7 @@ pub(super) trait Element: Copy + Default {
         output: &mut [Self],
     ) -> Result<()>;
     fn attention(
-        layer: &Attention,
+        layer: &mut FullAttention,
         q: &[Self],
         k: &[Self],
         v: &[Self],
@@ -71,7 +71,7 @@ impl Element for u16 {
         layer.run_half(pool, input, output)
     }
     fn attention(
-        layer: &Attention,
+        layer: &mut FullAttention,
         q: &[Self],
         k: &[Self],
         v: &[Self],
@@ -141,7 +141,7 @@ impl Element for f32 {
         layer.run(pool, input, output)
     }
     fn attention(
-        layer: &Attention,
+        layer: &mut FullAttention,
         q: &[Self],
         k: &[Self],
         v: &[Self],

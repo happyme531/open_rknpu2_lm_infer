@@ -1,3 +1,0 @@
-[ perf record: Woken up 18599 times to write data ]
-[ perf record: Captured and wrote 0.215 MB /tmp/qwen35-cpu-profile-20261017.data (5214 samples) ]
-Terminated

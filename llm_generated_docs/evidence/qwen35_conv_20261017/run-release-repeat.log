@@ -1,9 +1,0 @@
-Waiting for the shared NPU lock
-threads=4, rows=1: 24 layers 3.0598214999999995 ms
-threads=4, rows=8: 24 layers 5.149621857142857 ms
-threads=4, rows=32: 24 layers 9.374028428571426 ms
-threads=4, rows=128: 24 layers 29.874390142857145 ms
-threads=1, rows=1: 24 layers 2.898704384615385 ms
-threads=1, rows=8: 24 layers 8.390329428571428 ms
-threads=1, rows=32: 24 layers 24.53991285714286 ms
-threads=1, rows=128: 24 layers 94.172371 ms

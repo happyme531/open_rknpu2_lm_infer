@@ -1,6 +1,6 @@
 [package]
 name = "open_rknpu2_lm_infer"
-version = "0.3.1"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"

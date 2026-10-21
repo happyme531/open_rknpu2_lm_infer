@@ -8,19 +8,34 @@
 ![Rust](https://img.shields.io/badge/rust-1.95-orange)
 ![Platform](https://img.shields.io/badge/platform-RK3588-green)
 
+[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
+[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 </div>
 
 ## Highlights
 
-- 🚀 **Faster than the vendor SDK**: Autotuning, heterogeneous pipelining, dataflow optimization, and zero-copy execution deliver over 50% higher average inference speed than the vendor's rknn-llm SDK, with larger gains at longer contexts: up to **2.33×** for prefill and **3.56×** for decode. With a 3,800-token history, Qwen3-4B generates 128 tokens in 15.6 seconds, down from 55.4 seconds.
+- 🚀 **Faster than the vendor SDK**: Autotuning, heterogeneous pipelining, dataflow optimization, and zero-copy execution deliver over 50% higher average inference speed than the vendor's rknn-llm SDK, with larger gains at longer contexts: up to **2.59×** for prefill and **3.56×** for decode. With a 3,800-token history, Qwen3-4B generates 128 tokens in 15.6 seconds, down from 55.4 seconds.
 - 🎯 **Better accuracy than the vendor SDK**: Advanced quantization algorithms reduce WikiText-2 perplexity by 2.64% for Qwen3-4B and 2.28% for MiniCPM5-2B compared with rknn-llm W8A8.
 - 🔓 **Fully open source**: Built on our high-performance, open-source RKNPU2 operator library, [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/). The entire inference pipeline runs without proprietary vendor libraries, so you can study it, optimize it, and add support for new models.
 - 📦 **Mixed W4/W8 quantization**: A mix of 4-bit and 8-bit weights with dynamic 8-bit activations uses less memory than the vendor's W8A8 quantization. Weights are loaded on demand through mmap; Qwen3-4B reaches a peak RSS of approximately 3.4 GiB with a 4K context.
 - 🧩 **Ready to use**: A single binary provides a CLI, a terminal chat TUI, and an OpenAI-compatible API, with support for streaming, thinking, function calling, and prefix caching.
 
-## Performance: Compared with rknn-llm 1.3.1
+## Performance
+
+### Qwen3.5-4B
+
+| Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer (MTP1) | Speedup |
+|---|---:|---:|---:|
+| Vision encoding 448×448 (ms) | 1863 | 1112.38 | +67% |
+| pp512 (tps) | 58.347 | 147.832 | +153.4% |
+| pp1024 | 57.844 | 148.166 | +156.1% |
+| pp3800 | 54.029 | 139.917 | +159.0% |
+| decode128 @512 (tps) | 5.538 | 10.611 | +91.6% |
+| decode128 @1024 | 5.416 | 10.379 | +91.7% |
+| decode128 @3800 | 4.565 | 9.896 | +116.8% |
 
 ### Qwen3-4B
 
@@ -59,6 +74,7 @@
 
 | Model | rknn-llm W8A8 | open_rknpu2_lm_infer mixed quantization | PPL change (lower is better) |
 |---|---:|---:|---:|
+| Qwen3.5-4B | 8.5197 | 8.5790 | +0.70% |
 | Qwen3-4B | 12.8709 | 12.5317 | -2.64% |
 | Granite-4.2-3B | 15.7448 | 16.0519 | +1.95% |
 | MiniCPM5-2B | 14.1293 | 13.8073 | -2.28% |
@@ -70,20 +86,22 @@
 | qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
+| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
-An experimental `qwen3_5` / `qwen3_5_text` backend supports the hybrid text decoder and PPL scoring. Qwen3.5 checkpoints with BF16 vision weights also support static images, multiple images and image history through the CLI, terminal chat and OpenAI chat API. See the [C7 text validation](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md) and [vision usage and validation](llm_generated_docs/QWEN35_VISION_PROGRESS.md). Video is pending.
-
-For a Qwen3.5 checkpoint containing its single MTP layer and shared embedding/output head, enable speculative generation with `--spec-type draft-mtp` on `run`, `chat` or `serve`. The llama.cpp-style options are `--spec-draft-n-max` (default 3, supported range 0–7), `--spec-draft-p-min` (default 0) and `--spec-draft-sampling greedy|probabilistic` (default greedy). A nonzero maximum must be smaller than `--ubatch-size`. Confidence uses the draft's top-10 candidate probabilities; a candidate below the threshold is discarded and drafting stops. Greedy drafts use target sample-and-match verification; probabilistic drafts use exact rejection sampling. MTP is disabled by default (`--spec-type none`). Rotated C7 checkpoints require their supplied `mtp_coordinate_adapter.json`. See the [commands, numerical checks and measurements](llm_generated_docs/QWEN35_MTP_RUNTIME.md).
-
-Qwen3.5 GDN uses the NPU for actual prefill windows above 12 tokens on supported Hk16/Hv32, Dk128/Dv128, K4 shapes. Smaller windows and decode use the CPU. NPU products use ordinary TF32 with FP32 canonical state shared with CPU decode. See [routing, precision and measurements](llm_generated_docs/QWEN35_NPU_GDN_PREFILL.md), including the short-window performance tradeoff.
-
-ViT uses FP16 intermediate tensors and fused NPU GEMM + bias + approximate GELU in the FFN by default. Set `--vision-dtype fp32` for FP32 intermediate storage in numerical comparisons; FFN fusion and FP16 NPU matmul remain enabled. LayerNorm/softmax reductions accumulate in FP32; the merger retains its exact erf GELU. See [fusion measurements and precision](llm_generated_docs/NPU_FFN_GELU_RESEARCH.md). The option applies to `run`, `chat`, `serve`, and the vision diagnostics in `tests/tools/`.
-
 ## Quick Start
 
-Copy and paste the following commands on an RK3588 Linux board to download the latest [release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) and the Qwen3-4B model, then start a terminal chat session. Supports Debian 11 / glibc 2.31 or newer, with no compilation required.
+You need an RK3588 device running Linux. The current version supports only the vendor's `rknpu2` kernel driver, version 0.9.6 or newer.
+
+Run the following command as root to check the driver version:
+
+```bash
+cat /sys/kernel/debug/rknpu/version
+RKNPU driver: v0.9.8
+```
+
+Then copy and paste the following commands to download the latest [release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) and the Qwen3-4B model, then start a terminal chat session. Supports Debian 11 / glibc 2.31 or newer, with no compilation required.
 
 ```bash
 sudo apt install curl jq python3-pip libgomp1 libstdc++6
@@ -99,6 +117,16 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
 
+### Image Input and MTP
+
+Use a Qwen3.5-4B model directory containing both vision and MTP weights. The following command uses the K1 configuration from the image-text benchmark:
+
+```sh
+./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p 'Describe this photo in detail.'
+```
+
+Images are passed to the model at their original resolution unless they exceed the model's limits. Different resolutions are supported dynamically, but vision encoding may be slower if the corresponding number of vision tokens has not been tuned.
+
 ## Getting full tuned performance
 
 The default inference strategies do not deliver optimal performance. You can manually tune once for a specific model.
@@ -108,18 +136,13 @@ The default inference strategies do not deliver optimal performance. You can man
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+# Tune batches used by speculative decoding to improve its speed
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,128
+# Tune the vision encoder for a specific input resolution
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
 ```
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
-
-For a Qwen3.5 checkpoint with vision weights, tune its visual encoder separately:
-
-```sh
-./bin/open_rknpu2_lm_infer -m MODEL tune --vision
-./bin/open_rknpu2_lm_infer -m MODEL tune --vision --image photo.jpg
-```
-
-The first command prepares common input sizes (256×256, 384×256 and 512×512). Repeat `--image` to prepare the actual resized dimensions of your images. Projection sizes come from the model configuration; text weights are not loaded. Use the same cache and CPU/NPU options for later inference. Ordinary inference only reads cached profiles and never starts a tuning search. `run`, `chat`, `serve` and `tune` do not acquire the global board test lock.
 
 ## Architecture
 
@@ -128,10 +151,10 @@ The first command prepares common input sizes (256×256, 384×256 and 512×512).
                  │
    Engine ── Dedicated inference thread · Request queue · Sampling · Prefix KV reuse
                  │
-   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5 (text)
+   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5 (vision + MTP)
         │                         │
    CPU (Rust + C++)          NPU (rk_npu_matmul, C ABI)
-   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · FP16 GQA Attention
+   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · Attention · ViT · GDN
                                   │
                          Open-source RKNPU2 kernel driver
 ```
@@ -182,6 +205,13 @@ for chunk in stream:
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+## TODO
+
+- Support the upstream `rocket` kernel driver. This may need to wait until NPU DVFS support is more complete.
+- Prefill MFU currently reaches around 20% under favorable conditions, with room for improvement.
+- Support more models, including Transformer models beyond LLMs.
+- Contributions are welcome: fork the project and submit a PR!
 
 ## License
 

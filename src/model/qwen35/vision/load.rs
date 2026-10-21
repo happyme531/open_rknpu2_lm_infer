@@ -84,13 +84,11 @@ pub(super) fn load(
     let positions = config.side * config.side;
     ensure!(domain < 16, "no free IOMMU domain for vision weights");
     let mut options = options.clone();
-    options.context = 1024;
     options.chunk = 128;
     let device = Backend::new(&options, domain)?;
-    let attention = device.noncausal_attention(config.heads, config.hidden / config.heads)?;
     let backend = match options.vision_dtype {
-        VisionDtype::Fp16 => FloatBackend::fp16_storage(device),
-        VisionDtype::Fp32 => FloatBackend::new(device),
+        VisionDtype::Fp16 => FloatBackend::fp16_storage(device.clone()),
+        VisionDtype::Fp32 => FloatBackend::new(device.clone()),
     };
     let h = config.hidden;
     let f = config.intermediate;
@@ -146,6 +144,6 @@ pub(super) fn load(
         position,
         blocks,
         merger,
-        attention,
+        backend: device,
     })
 }

@@ -9,6 +9,13 @@ pub struct Attention {
     pub(super) owner: Backend,
 }
 
+/// Noncausal Attention with sequence-local scratch, freed on drop.
+pub struct FullAttention {
+    pub(super) kv: Handle<rk_npu_attention_f16_cache>,
+    pub(super) work: AttentionWork,
+    pub(super) owner: Backend,
+}
+
 fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
     let mut first = 0;
     #[cfg(target_arch = "aarch64")]
@@ -38,21 +45,23 @@ fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
     );
     Ok(())
 }
-impl Attention {
+impl FullAttention {
     /// Stateless image attention with FP16 storage at both boundaries.
     pub fn run_full_half(
-        &self,
+        &mut self,
         q: &[u16],
         k: &[u16],
         v: &[u16],
         output: &mut [u16],
         rows: usize,
     ) -> Result<()> {
-        let mut b = self.owner.0.borrow_mut();
-        let (heads, d) = (self.query_heads, self.dimension);
+        let b = self.owner.0.borrow();
+        let w = &mut self.work;
+        let (heads, d) = (w.config.query_heads as usize, w.config.head_dim as usize);
         ensure!(
-            rows > 0 && rows <= b.options.context && heads == self.kv_heads,
-            "invalid full FP16 attention shape"
+            rows > 0 && rows <= w.config.max_capacity as usize,
+            "image FP16 Attention rows={rows} exceed prepared buffer capacity={}",
+            w.config.max_capacity
         );
         ensure!(
             [q.len(), k.len(), v.len(), output.len()]
@@ -61,14 +70,6 @@ impl Attention {
             "full FP16 attention tensor shape mismatch"
         );
         let context = b.context.raw;
-        let w = b
-            .attention
-            .as_mut()
-            .context("missing attention workspace")?;
-        ensure!(
-            w.config.mask_mode == RK_NPU_ATTENTION_F16_NO_MASK,
-            "full attention requires NO_MASK"
-        );
         w.k.resize(rows * heads * d, 0);
         w.v.resize(rows * heads * d, 0);
         for h in 0..heads {
@@ -83,7 +84,7 @@ impl Attention {
             unsafe {
                 rk_npu_attention_f16_cache_load(
                     context,
-                    self.cache.raw,
+                    self.kv.raw,
                     w.k.as_ptr(),
                     w.v.as_ptr(),
                     rows as i32,
@@ -107,7 +108,7 @@ impl Attention {
                     rk_npu_attention_f16_run_half(
                         context,
                         w.workspace.raw,
-                        self.cache.raw,
+                        self.kv.raw,
                         w.q.as_ptr(),
                         m as i32,
                         offset as i32,
@@ -131,18 +132,20 @@ impl Attention {
     /// Stateless noncausal attention over one complete image. All K/V rows are
     /// loaded before tiled queries; no padding rows enter the cache.
     pub fn run_full(
-        &self,
+        &mut self,
         q: &[f32],
         k: &[f32],
         v: &[f32],
         output: &mut [f32],
         rows: usize,
     ) -> Result<()> {
-        let mut b = self.owner.0.borrow_mut();
-        let (heads, d) = (self.query_heads, self.dimension);
+        let b = self.owner.0.borrow();
+        let w = &mut self.work;
+        let (heads, d) = (w.config.query_heads as usize, w.config.head_dim as usize);
         ensure!(
-            rows > 0 && rows <= b.options.context && heads == self.kv_heads,
-            "invalid full attention shape"
+            rows > 0 && rows <= w.config.max_capacity as usize,
+            "image Attention rows={rows} exceed prepared buffer capacity={}",
+            w.config.max_capacity
         );
         ensure!(
             [q.len(), k.len(), v.len(), output.len()]
@@ -151,14 +154,6 @@ impl Attention {
             "full attention tensor shape mismatch"
         );
         let context = b.context.raw;
-        let w = b
-            .attention
-            .as_mut()
-            .context("missing attention workspace")?;
-        ensure!(
-            w.config.mask_mode == RK_NPU_ATTENTION_F16_NO_MASK,
-            "full attention requires NO_MASK"
-        );
         w.k.resize(rows * heads * d, 0);
         w.v.resize(rows * heads * d, 0);
         for h in 0..heads {
@@ -173,7 +168,7 @@ impl Attention {
             unsafe {
                 rk_npu_attention_f16_cache_load(
                     context,
-                    self.cache.raw,
+                    self.kv.raw,
                     w.k.as_ptr(),
                     w.v.as_ptr(),
                     rows as i32,
@@ -196,7 +191,7 @@ impl Attention {
                     rk_npu_attention_f16_run(
                         context,
                         w.workspace.raw,
-                        self.cache.raw,
+                        self.kv.raw,
                         w.q.as_ptr(),
                         m as i32,
                         offset as i32,
@@ -217,6 +212,8 @@ impl Attention {
         }
         Ok(())
     }
+}
+impl Attention {
     pub fn truncate(&self, length: usize) -> Result<()> {
         ensure!(
             length <= i32::MAX as usize,

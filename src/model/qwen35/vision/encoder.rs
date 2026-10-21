@@ -117,6 +117,7 @@ impl Encoder {
         let c = &w.config;
         let rows = image.grid[1] * image.grid[2];
         let h = c.hidden;
+        let mut attention = w.backend.full_attention(c.heads, h / c.heads, rows)?;
         let mut hidden = vec![T::default(); rows * h];
         let mut normalized = hidden.clone();
         let mut qkv = vec![T::default(); rows * 3 * h];
@@ -156,7 +157,7 @@ impl Encoder {
             T::rotary(&rotary, pool, &mut q)?;
             T::rotary(&rotary, pool, &mut k)?;
             stages.mark("qkv_split_rope");
-            T::attention(&w.attention, &q, &k, &v, &mut attended, rows)?;
+            T::attention(&mut attention, &q, &k, &v, &mut attended, rows)?;
             stages.mark("attention");
             T::linear(&block.proj, &attended, &mut projected, rows)?;
             stages.mark("attention_output_linear");
@@ -172,6 +173,7 @@ impl Encoder {
             T::trace(&self.trace, index as i32, "vision_hidden", &hidden)?;
             stages.mark("residual2_trace");
         }
+        drop(attention);
         ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
         T::norm(&w.merger.norm, pool, &hidden, &mut normalized)?;
         stages.mark("merger_norm");

@@ -1,8 +1,0 @@
-cmake_minimum_required(VERSION 3.14)
-project(qwen35_gdn_kernel_reference LANGUAGES CXX)
-set(CPU_MODULE "${CMAKE_CURRENT_LIST_DIR}/../reference_cpu")
-add_subdirectory("${CPU_MODULE}" qwen35-cpu)
-add_executable(gdn_kernel_runner main.cpp)
-target_compile_features(gdn_kernel_runner PRIVATE cxx_std_17)
-target_include_directories(gdn_kernel_runner PRIVATE "${CPU_MODULE}")
-target_link_libraries(gdn_kernel_runner PRIVATE qwen35_cpu)

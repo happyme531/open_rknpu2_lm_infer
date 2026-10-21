@@ -1,6 +1,0 @@
-   Compiling open_rknpu2_lm_infer v0.3.1 (/tmp/qwen35-runtime)
-    Finished `release` profile [optimized] target(s) in 7m 19s
-  Executable unittests src/lib.rs (target/release/deps/open_rknpu2_lm_infer-227a8b35b93bfb51)
-  Executable unittests src/main.rs (target/release/deps/open_rknpu2_lm_infer-7ba10d6422d47ca4)
-  Executable tests/openmp_startup.rs (target/release/deps/openmp_startup-abda2d17553db2c7)
-  Executable tests/qwen35.rs (target/release/deps/qwen35-f6bd976af1ae5434)

@@ -1,8 +1,0 @@
-{
-  "float_tune": "9275aebdeae5e957e424ae6b49e8e713dfef211b8fbe7ea38fae62d78969ae93",
-  "vision_probe": "11ffa0ef125879498a6f647050063c6e9bb4d0b382b5ea899bb41ec3f3a6512b",
-  "vision_profile": "16cf8020c3f7c6e797f2befad39161c5a22d81b6c908c870f7cf3aec605c7d09",
-  "test_mm_tune": "c18b0f32f6ec940abbc332cd4f3ca331415f0cf99554a482353476b0ad979a19",
-  "librk_npu_matmul.so": "7ccafea1fd574534a6bb1c62333068cebe93e8d1d8b3d0985ce30fc7d17438d2",
-  "fp16_reduce_ablation": "8eccae8de7b1798da6e476fc0f442970e4cf13b0fe73c79da9a57ff2a61915da"
-}

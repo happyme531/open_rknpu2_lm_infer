@@ -4,7 +4,7 @@ mod load;
 mod storage;
 use crate::{
     layers::layer_norm::LayerNorm,
-    npu::{Attention, FloatLinear},
+    npu::{Backend, FloatLinear},
 };
 pub use encoder::Encoder;
 
@@ -67,7 +67,7 @@ pub(super) struct Weights {
     position: Vec<f32>,
     blocks: Vec<Block>,
     merger: Merger,
-    attention: Attention,
+    backend: Backend,
 }
 
 #[cfg(test)]

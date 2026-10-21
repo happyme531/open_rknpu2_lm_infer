@@ -1,7 +1,0 @@
-Waiting for the shared NPU lock
-
-running 1 test
-test npu::tests::generic_attention_geometries_match_cpu ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.13s
-

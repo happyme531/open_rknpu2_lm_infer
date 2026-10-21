@@ -10,7 +10,7 @@
 
 - `vision/`：图像解码、受限 resize、归一化、patch 排列及二维位置；通用 LayerNorm/GELU 分别位于 `layers/layer_norm.rs` 和 `ops/gelu.rs`。
 - `input.rs`：展开后的 token、图像内容身份、图像 span、三轴位置和上下文预算；逻辑 KV 行与 RoPE 坐标分别维护。
-- `npu/floating.rs`：公共 C ABI 的 FP16 Linear；独立于量化 Linear。无因果 Attention 复用公开 native 算子。
+- `npu/floating.rs`：公共 C ABI 的 FP16 Linear；独立于量化 Linear。无因果 Attention 复用公开 native 算子，`FullAttention` 按实际 patch 数准备本图临时 K/V 与 scratch，跨层覆写复用，blocks 完成后释放，不保留视觉 KV 状态。
 - `model/qwen35/vision/`：C7 结构、权重映射、24层 ViT、merger；按需加载，输出已在 C7 residual 坐标系，不再旋转。
 - `engine/context.rs`：前缀身份与位置匹配；视觉 feature cache 限定容量。
 - `api/request.rs`：请求解析和 content parts 规范化。

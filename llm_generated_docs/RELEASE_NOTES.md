@@ -1,3 +1,21 @@
+# v0.6.1
+
+- 修复 Qwen3.5 图片超过1024个patch时出现 `invalid full FP16 attention shape` 的问题；视觉 Attention 按预处理后的实际图像长度分配工作区。
+- 使用 `FullAttention` 临时 K/V buffer，在图像的 Transformer blocks 间覆写复用，blocks 完成后释放，独立于文本上下文容量。
+- 同步算子库，移除 Attention 对32768行容量的固定拒绝条件，保留调用方分配边界及实际算子形状、任务数量校验。
+- 板端验证包含原图 FP16/FP32 编码、CLI 问答、固定token文本logits及小图features逐位回归；89项默认测试、2项视觉NPU测试和native Attention CPU contract通过。
+
+# v0.6.0
+
+- 新增 Qwen3.5 混合文本主干、静态图片与多图片输入，CLI、终端聊天和 OpenAI 兼容 API 共用图文历史与前缀缓存。
+- 新增 Qwen3.5 MTP 推测解码，以及独立 DFlash 草稿模型的并行起草；共用验证事务、采样、停止条件和流式输出。MTP 与 DFlash 均需显式启用。
+- 新增 NPU GDN prefill、带步长投影输入、视觉 FP16 GEMM/bias/GELU 融合与浮点算子调优；普通推理只读取已有策略缓存。
+- 修复 causal Attention 的 masked-future、CPU softmax 分段与回滚数值边界，使已验证的批量 target 校验及提交后的 logits 与逐 token AR 一致。
+- 同步中英文 README 的 Qwen3.5 性能、PPL、图像输入和调优示例。实验数据与 trace 不再纳入源码及发布附件，本地文件保留；测试必需的输入继续随源码提供。
+- 板端已有 release 构建、全 target Clippy、数值与 CLI/API/TUI 回归记录；最新 DFlash 检查包含 68 项库测试、6 项输入测试和 19 项真实 CLI/API 功能检查。
+
+DFlash 当前验证组合为未旋转的 Qwen3.5-4B C4 与对应草稿，旋转 C7 尚不支持 DFlash；上下文不超过草稿的 4096-token 窗口。两种推测解码当前最多 7 个提案。ARM64 附件适用于 Debian 11 / glibc 2.31 或更新系统，模型单独下载。
+
 # v0.3.1
 
 - 默认ubatch改为128；默认 `tune` 准备decode与当前主块，即 `1,128`，显式修改ubatch时自动跟随。

@@ -2,6 +2,8 @@
 
 `npu` 通过 bindgen 生成现有公共 C ABI 的绑定。Backend 持有 context/domain、几何调优策略和共享工作区；Linear 持有权重和 Backend 引用；Attention 持有 KV 和 Backend 引用。所有对象在专用推理线程中运行，Rust 的析构顺序和所有权负责释放资源。
 
+ViT 使用独立的 `FullAttention`：按当前图像的 patch 数分配临时 K/V 与 Attention scratch，每层完整覆写 K/V，完成图像的 Transformer blocks 后释放。图像 buffer 不受文本 `ctx-size` 或独立的固定 patch 容量约束；图像特征仍可由 Encoder 的 LRU 缓存复用。
+
 `model::checkpoint` 使用 safetensors 与 memmap2 验证 checkpoint 并加载 W4/W8。`model::dense` 共用 Qwen3、Llama 和 Granite 的 CPU 运算与 NPU 调度。Qwen3 执行 Q/K Norm；Llama 和 Granite 直接对投影结果执行 RoPE。Granite 的 embedding、attention、residual 和 logits 缩放由配置提供。相邻同位宽的 QKV、gate/up 合并投影；量化 lm_head 单独分配 domain，生成使用 M1，PPL 使用批量工作区。
 
 `LanguageModel` 定义模型信息、reset、KV reserve、prepare、forward、可取消 forward、KV position 和 stats。新增架构在 `model::load` 注册，并独立实现此接口。模型类管理其 KV 和 scratch，外层生成引擎不依赖 Qwen3 层结构。

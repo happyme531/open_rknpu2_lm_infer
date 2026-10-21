@@ -1,8 +1,0 @@
-{
-  "included_in_primary_results": false,
-  "old_prefill_head_calls": 1,
-  "stopped_legacy_final_process": true,
-  "reason": "Replaced by explicit head-free prefill after user correction",
-  "interrupted_exit_code": -15,
-  "frequency_restored": true
-}

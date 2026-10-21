@@ -10,6 +10,8 @@ The CPU kernels preserve arithmetic from the adjacent native inference demo and 
 
 The Qwen3.5 C++ CPU module in `native/cpu_kernels/` adapts the gated delta loop and NEON helpers from llama.cpp / ggml. The Rust vector SiLU also adapts ggml arithmetic. Their MIT copyright and permission notice is retained in [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md) and must accompany distributions of this code.
 
+The DFlash adapter retains the Z Lab MIT notice in `src/model/dflash/LICENSE` and [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md), which accompanies binary distributions.
+
 The streamed MoE prompt scheduler and adjacent-record staging adapt Strata
 `src/prefill/prefill.cpp` and `src/core/expert_source.cpp`, revision
 `cbfd5b926b794b356195d3cb600191b0c3567540` (https://github.com/Niko1221/Strata).

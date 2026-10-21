@@ -1,4 +1,0 @@
-Waiting for the shared NPU lock
-{"M":16,"N":32,"K":32,"fused":0,"bias_mode":2,"max_abs":0,"relative_l2":0,"guard_ok":true}
-row=1 col=20 got=16 expected=0 raw=19456
-GEMM/LUT output mismatch

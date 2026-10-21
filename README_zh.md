@@ -8,19 +8,34 @@
 ![Rust](https://img.shields.io/badge/rust-1.95-orange)
 ![Platform](https://img.shields.io/badge/platform-RK3588-green)
 
+[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
+[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 </div>
 
 ## 亮点
 
-- 🚀 **比原厂更快**：采用自动调优，异构流水执行，数据流优化，零拷贝等先进策略，平均推理速度比原厂 rknn-llm SDK 高50%以上，上下文越长优势越大，prefill 最高 **2.33×**，decode 最高 **3.56×**。在 3800-token 历史上，Qwen3-4B 生成 128 个 token 的时间从 55.4 秒降到 15.6 秒。
+- 🚀 **比原厂更快**：采用自动调优，异构流水执行，数据流优化，零拷贝等先进策略，平均推理速度比原厂 rknn-llm SDK 高50%以上，上下文越长优势越大，prefill 最高 **2.59×**，decode 最高 **3.56×**。在 3800-token 历史上，Qwen3-4B 生成 128 个 token 的时间从 55.4 秒降到 15.6 秒。
 - 🎯 **比原厂更准**：采用先进的量化算法，Qwen3-4B 和 MiniCPM5-2B 的 WikiText-2 PPL 分别比 rknn-llm W8A8 低 2.64% 和 2.28%。
 - 🔓 **完全开源**：基于自研高性能开源 RKNPU2 算子库 [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/)，整个推理流程无任何原厂闭源库依赖，可随意研究/优化/添加新模型支持。
 - 📦 **混合 W4/W8 量化**：4-bit/8-bit 权重配合 8-bit 动态激活的混合量化，相比原厂W8A8量化占用内存更低。权重 mmap 按需加载，Qwen3-4B 在 4K 上下文下峰值 RSS 约 3.4 GiB。
 - 🧩 **开箱即用**：一个二进制同时提供 CLI、终端聊天 TUI 和 OpenAI 兼容 API，支持流式输出、thinking、function calling 和前缀缓存。
 
-## 性能：对比 rknn-llm 1.3.1
+## 性能
+
+### Qwen3.5-4B
+
+| 测试 | rknn-llm 1.3.1 | open_rknpu2_lm_infer (MTP1) | 性能提升 |
+|---|---:|---:|---:|
+| 视觉编码 448×448 (ms) | 1863 | 1112.38 | +67% |
+| pp512 (tps) | 58.347 | 147.832 | +153.4% |
+| pp1024 | 57.844 | 148.166 | +156.1% |
+| pp3800 | 54.029 | 139.917 | +159.0% |
+| decode128 @512 (tps) | 5.538 | 10.611 | +91.6% |
+| decode128 @1024 | 5.416 | 10.379 | +91.7% |
+| decode128 @3800 | 4.565 | 9.896 | +116.8% |
 
 ### Qwen3-4B
 
@@ -59,6 +74,7 @@
 
 | 模型 | rknn-llm W8A8 | open_rknpu2_lm_infer 混合量化 | PPL 变化（越低越好） |
 |---|---:|---:|---:|
+| Qwen3.5-4B | 8.5197 | 8.5790 | +0.70% |
 | Qwen3-4B | 12.8709 | 12.5317 | -2.64% |
 | Granite-4.2-3B | 15.7448 | 16.0519 | +1.95% |
 | MiniCPM5-2B | 14.1293 | 13.8073 | -2.28% |
@@ -70,16 +86,19 @@
 | qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
+| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
 
 程序支持线性层使用w4a8或w8a8(可以混合使用)per-channel per-token对称量化的 compressed-tensors 格式的模型。因此你也可以根据以上示例模型，尝试加载其他大小的模型，试验不同的混合量化配置和量化算法。
 
-实验性 `qwen3_5` / `qwen3_5_text` 后端已接入混合文本主干和 PPL 评分。checkpoint 与验证范围见 [C7 上板报告](llm_generated_docs/QWEN35_C7_BOARD_VALIDATION.md)；MTP 和多模态执行尚待实现。
-
-Qwen3.5 GDN 在 Hk16/Hv32、Dk128/Dv128、K4 形状上，对实际行数大于 12 的 prefill 窗口使用 NPU；更短窗口和 decode 使用 CPU。NPU 乘法使用 ordinary TF32，canonical state 保持 FP32，可直接接续 CPU decode。路由、精度与包括短窗口性能取舍在内的实测见 [NPU GDN prefill](llm_generated_docs/QWEN35_NPU_GDN_PREFILL.md)。
-
 ## 快速开始
 
-在 RK3588 Linux 板上复制粘贴以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
+你需要一个 Linux 系统的 RK3588 设备。目前版本只支持原厂`rknpu2`内核驱动，且版本必须>=0.9.6。
+使用root权限运行以下命令检查驱动版本:
+```bash
+> cat /sys/kernel/debug/rknpu/version
+RKNPU driver: v0.9.8
+```
+之后，复制粘贴并执行以下命令，下载最新 [Release](https://github.com/happyme531/open_rknpu2_lm_infer/releases/latest) 和 Qwen3-4B 模型后直接进入终端聊天。适用于 Debian 11 / glibc 2.31 或更新的系统，无需编译。
 
 ```bash
 sudo apt install curl jq python3-pip libgomp1 libstdc++6
@@ -95,6 +114,16 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
 
+### 图像输入与MTP
+
+将 `MODEL` 指向包含视觉与 MTP 权重的 Qwen3.5-4B 模型目录。以下使用图文基准中的 K1 配置：
+
+```sh
+./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p '请详细描述这张照片。'
+```
+
+图像按原图分辨率输入模型，除非超出了模型允许的上限。可以动态输入不同分辨率的图片，不过如果对应的视觉token数量没有调优，视觉编码器速度可能会较慢。
+
 ## 跑出完整调优性能
 
 推理程序使用的默认的推理策略并非最优性能。可以针对指定的模型手动调优一次。
@@ -104,18 +133,13 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+# 调优推测解码相关的batch，提升推测解码的速度
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,128
+# 使用指定输入分辨率调优视觉编码器
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
 ```
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
-
-含视觉权重的 Qwen3.5 模型可以单独调优视觉编码器：
-
-```sh
-./bin/open_rknpu2_lm_infer -m MODEL tune --vision
-./bin/open_rknpu2_lm_infer -m MODEL tune --vision --image photo.jpg
-```
-
-第一条命令准备 256×256、384×256、512×512 三档常用输入；也可重复传入 `--image`，按图片实际预处理后的尺寸准备。投影维度从模型配置读取，不加载文本权重。后续推理使用相同缓存和 CPU/NPU 参数；普通推理只读缓存，不在线搜索。ViT 默认使用 FP16 中间张量，FFN 使用 NPU GEMM + bias + 近似 GELU 融合；旧 CPU 近似 GELU 路径已删除。需要张量精度对照时传 `--vision-dtype fp32`，FFN 融合和 FP16 NPU 矩阵乘仍然启用。LayerNorm/softmax 内部用 FP32 累加，merger 保留模型规定的 erf GELU。[融合性能与精度记录](llm_generated_docs/NPU_FFN_GELU_RESEARCH.md)。`run`、`chat`、`serve` 和 `tune` 不获取全局板端测试锁。
 
 ## 架构
 
@@ -124,10 +148,10 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
                  │
    Engine ── 专用推理线程 · 请求队列 · 采样 · 前缀 KV 复用
                  │
-   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5（文本）
+   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5（视觉 + MTP）
         │                         │
    CPU (Rust + C++)          NPU (rk_npu_matmul, C ABI)
-   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · FP16 GQA Attention
+   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · Attention · ViT · GDN
                                   │
                          开源 RKNPU2 内核驱动
 ```
@@ -178,6 +202,13 @@ for chunk in stream:
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+## TODO
+
+- 支持上游的`rocket`内核态驱动。可能需要等到相关的NPU DVFS完善。
+- 目前的Prefill MFU较好情况下可以达到20%左右，仍有改进空间。
+- 支持更多模型，包括非LLM的Transformer模型。
+- 你也可以动手来改进这个项目。欢迎fork和pr！
 
 ## 许可证
 

@@ -1,3 +1,0 @@
-# Preserve captured compiler, test and profiler output byte-for-byte.
-*.log -whitespace
-cpu-profile.txt -whitespace
