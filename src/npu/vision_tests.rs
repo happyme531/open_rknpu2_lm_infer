@@ -139,6 +139,7 @@ fn full_attention_uses_temporary_buffers_for_actual_patch_rows() -> Result<()> {
         tune_cache: std::path::PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        experts: Default::default(),
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;
