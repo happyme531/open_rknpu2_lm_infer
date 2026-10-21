@@ -31,6 +31,7 @@ pub struct Qwen35 {
     pub(super) cpu: Cpu,
     pub(super) backends: Vec<Backend>,
     pub(super) layers: Vec<Layer>,
+    pub(super) paging: Option<std::rc::Rc<crate::model::experts::Paging>>,
     pub(super) embedding: Tensor,
     pub(super) final_norm: Vec<f32>,
     pub(super) head: crate::model::output_head::OutputHead,
@@ -56,8 +57,10 @@ impl Qwen35 {
     pub fn load(options: ModelOptions) -> Result<Self> {
         options.validate_speculation()?;
         let mut model = super::load::load(options)?;
-        if model.options.speculation.kind == crate::model::SpeculativeType::DraftDflash
-            && model.options.speculation.window() > 0
+        if matches!(
+            model.options.speculation.kind,
+            crate::model::SpeculativeType::DraftDflash | crate::model::SpeculativeType::DraftDspark
+        ) && model.options.speculation.window() > 0
         {
             model.load_dflash()?;
         }
@@ -200,10 +203,11 @@ impl Qwen35 {
         self.reserve(self.position + tokens.len())?;
         let result = (|| {
             let mut rows = 0;
-            for chunk in tokens.chunks(self.options.chunk) {
-                self.chunk(chunk, cancelled, None)?;
+            for chunk in tokens.chunks(self.prompt_chunk_rows()) {
+                self.prompt_chunk(chunk, cancelled, None)?;
                 rows = chunk.len();
             }
+            rows = (rows - 1) % self.options.chunk + 1;
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
                 "generation cancelled"
@@ -275,6 +279,9 @@ impl LanguageModel for Qwen35 {
         self.position
     }
     fn reset(&mut self) -> Result<()> {
+        if let Some(paging) = &self.paging {
+            paging.reset();
+        }
         for layer in &mut self.layers {
             match &mut layer.mixer {
                 Mixer::Recurrent { state, .. } => state.reset(),
@@ -458,6 +465,17 @@ impl LanguageModel for Qwen35 {
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<f32>>> {
         self.dflash_logits(anchor, drafts, cancel)
+    }
+    fn adjust_draft_logits(
+        &self,
+        row: usize,
+        previous: u32,
+        logits: &mut [f32],
+    ) -> Result<Option<f64>> {
+        match &self.dflash {
+            Some(draft) => draft.adjust(row, previous, logits),
+            None => Ok(None),
+        }
     }
     fn verify_tokens(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
         Qwen35::verify_tokens(self, tokens, cancel)

@@ -208,6 +208,7 @@ fn main() -> Result<()> {
         tune_cache: args.tune_cache.unwrap_or_default(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        experts: Default::default(),
         speculation: open_rknpu2_lm_infer::model::SpeculativeConfig {
             kind: open_rknpu2_lm_infer::model::SpeculativeType::DraftMtp,
             max_draft: schedule[0],

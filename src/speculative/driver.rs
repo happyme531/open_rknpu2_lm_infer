@@ -85,7 +85,7 @@ pub fn run_round_with_options(
         let mut draft_attempts = 0;
         let mut confidence_stopped = false;
         let start = Instant::now();
-        let block = if plan.draft_tokens() > 0 {
+        let mut block = if plan.draft_tokens() > 0 {
             model.draft_block_logits(anchor, plan.draft_tokens(), cancel)?
         } else {
             None
@@ -98,16 +98,21 @@ pub fn run_round_with_options(
             "incorrect parallel draft logits shape"
         );
         for row in 0..plan.draft_tokens() {
-            let logits = if let Some(values) = &block {
-                &values[row * vocab..(row + 1) * vocab]
+            let previous = *inputs.last().unwrap();
+            let (logits, learned) = if let Some(values) = &mut block {
+                let logits = &mut values[row * vocab..(row + 1) * vocab];
+                let learned = model.adjust_draft_logits(row, previous, logits)?;
+                (&*logits, learned)
             } else {
-                model.draft_logits(*inputs.last().unwrap(), cancel)?
+                (model.draft_logits(previous, cancel)?, None)
             };
             draft_attempts += 1;
             // The stopping decision is made before sampling, independently of
             // the proposed token. q remains the true processed distribution.
             let low = if options.p_min > 0. || options.collect_confidence {
-                let confidence = if options.sampling == DraftSampling::Probabilistic
+                let confidence = if let Some(confidence) = learned {
+                    confidence
+                } else if options.sampling == DraftSampling::Probabilistic
                     && proposal_sampler.greedy()
                 {
                     1.

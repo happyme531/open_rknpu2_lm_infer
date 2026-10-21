@@ -4,6 +4,7 @@ use super::{
 };
 use crate::npu::{Backend, FloatBackend, FloatLinear};
 use anyhow::{Result, ensure};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Decoder projections share orchestration across integer target weights and
@@ -14,9 +15,17 @@ pub(crate) enum Linear {
         linear: FloatLinear,
         n: usize,
     },
+    Host {
+        weight: super::checkpoint::Tensor,
+        pool: Arc<rayon::ThreadPool>,
+    },
     SplitK {
         parts: Vec<(Linear, usize, usize)>,
         k: usize,
+        n: usize,
+    },
+    SplitN {
+        parts: Vec<Linear>,
         n: usize,
     },
 }
@@ -29,8 +38,40 @@ impl Linear {
     fn n(&self) -> usize {
         match self {
             Self::Quantized(l) => l.n(),
-            Self::Floating { n, .. } | Self::SplitK { n, .. } => *n,
+            Self::Floating { n, .. } | Self::SplitK { n, .. } | Self::SplitN { n, .. } => *n,
+            Self::Host { weight, .. } => weight.shape[0],
         }
+    }
+    pub(crate) fn load(
+        backend: &Backend,
+        loader: &Arc<QuantLoader>,
+        cpu: &Cpu,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        if !loader.quantized(name) {
+            let weight = loader.store.get(&format!("{name}.weight"))?;
+            weight.require_shape(&[n, k], name)?;
+            ensure!(
+                weight.floating(),
+                "protected linear must be floating: {name}"
+            );
+            return Ok(Self::Host {
+                weight,
+                pool: cpu.pool.clone(),
+            });
+        }
+        let matrix = cpu.pool.install(|| loader.load(name, n, k))?;
+        let reload = loader.clone();
+        let pool = cpu.pool.clone();
+        let owned = name.to_owned();
+        Ok(backend
+            .load(
+                matrix,
+                Some(Box::new(move || pool.install(|| reload.load(&owned, n, k)))),
+            )?
+            .into())
     }
     pub(crate) fn floating(
         backend: &FloatBackend,
@@ -42,6 +83,23 @@ impl Linear {
         let w = store.get(&format!("{name}.weight"))?;
         w.require_shape(&[n, k], name)?;
         let weight = w.floats()?;
+        if n > 65504 {
+            let mut parts = Vec::new();
+            for first in (0..n).step_by(32768) {
+                let last = (first + 32768).min(n);
+                let width = last - first;
+                parts.push(Self::Floating {
+                    linear: backend.load(
+                        &weight[first * k..last * k],
+                        &vec![0.; width],
+                        k,
+                        width,
+                    )?,
+                    n: width,
+                });
+            }
+            return Ok(Self::SplitN { parts, n });
+        }
         if k > 4096 {
             // Bound native FP16 K without modifying or requantizing weights.
             // Each public Linear returns FP16-rounded partials, summed in FP32.
@@ -72,6 +130,41 @@ impl Linear {
     pub(crate) fn run(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<()> {
         match self {
             Self::Quantized(l) => l.run(input, output, rows),
+            Self::SplitN { parts, n } => {
+                ensure!(
+                    output.len() == rows * n,
+                    "invalid N-partitioned projection shape"
+                );
+                let mut first = 0;
+                for part in parts {
+                    let width = part.n();
+                    let mut partial = vec![0.; rows * width];
+                    part.run(input, &mut partial, rows)?;
+                    for row in 0..rows {
+                        output[row * n + first..row * n + first + width]
+                            .copy_from_slice(&partial[row * width..(row + 1) * width]);
+                    }
+                    first += width;
+                }
+                Ok(())
+            }
+            Self::Host { weight, pool } => {
+                let (n, k) = (weight.shape[0], weight.shape[1]);
+                ensure!(
+                    input.len() == rows * k && output.len() == rows * n,
+                    "host projection shape mismatch"
+                );
+                pool.install(|| {
+                    output.par_iter_mut().enumerate().for_each(|(i, y)| {
+                        *y = super::cpu::dense_dot(
+                            weight,
+                            i % n,
+                            &input[(i / n) * k..(i / n + 1) * k],
+                        );
+                    })
+                });
+                Ok(())
+            }
             Self::SplitK { parts, k, n } => {
                 ensure!(
                     input.len() == rows * k && output.len() == rows * n,
@@ -103,7 +196,10 @@ impl Linear {
     fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
         match self {
             Self::Quantized(l) => l.run_swiglu(input, output, rows),
-            Self::Floating { .. } | Self::SplitK { .. } => Ok(false),
+            Self::Floating { .. }
+            | Self::SplitK { .. }
+            | Self::SplitN { .. }
+            | Self::Host { .. } => Ok(false),
         }
     }
 }
@@ -150,6 +246,16 @@ impl Projection {
             parts: Vec::new(),
             width: 0,
         };
+        if modules.iter().any(|(name, _)| !loader.quantized(name)) {
+            for (name, n) in modules {
+                result.parts.push((
+                    Linear::load(backend, loader, cpu, &name, n, k)?,
+                    result.width,
+                ));
+                result.width += n;
+            }
+            return Ok(result);
+        }
         let mut first = 0;
         while first < modules.len() {
             let bits = loader.bits(&modules[first].0)?;

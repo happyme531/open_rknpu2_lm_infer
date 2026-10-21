@@ -47,24 +47,28 @@ pub(super) struct Layer {
     pub post_norm: Vec<f32>,
     pub inputs: Projection,
     pub output: Linear,
-    pub gate_up: Projection,
-    pub down: Linear,
+    pub ffn: FeedForward,
     pub mixer: Mixer,
+}
+
+pub(super) enum FeedForward {
+    Dense { gate_up: Projection, down: Linear },
+    Routed(Box<super::moe::Routed>),
 }
 
 pub(super) struct Buffers {
     pub hidden: Vec<f32>,
     pub normalized: Vec<f32>,
-    projected: Vec<f32>,
+    pub(super) projected: Vec<f32>,
     pub(super) mixed: Vec<f32>,
     query: Vec<f32>,
     pub(super) key: Vec<f32>,
     pub(super) value: Vec<f32>,
     gate: Vec<f32>,
     pub(super) norm_temp: Vec<f32>,
-    attended: Vec<f32>,
-    gate_up: Vec<f32>,
-    middle: Vec<f32>,
+    pub(super) attended: Vec<f32>,
+    pub(super) gate_up: Vec<f32>,
+    pub(super) middle: Vec<f32>,
     pub(super) scatter: Vec<f32>,
     pub recurrent: Scratch,
 }
@@ -75,6 +79,9 @@ impl Buffers {
         let kv = c.num_key_value_heads * c.head_dim;
         let mixed = (2 * q + 2 * kv)
             .max(c.gdn.conv_width() + c.gdn.value_width() + 2 * c.gdn.value_heads());
+        let f = c
+            .intermediate_size
+            .max(c.moe.as_ref().map_or(0, |m| m.shared_intermediate));
         let zero = |width| vec![0.0; rows * width];
         Self {
             hidden: zero(c.hidden_size),
@@ -87,9 +94,9 @@ impl Buffers {
             gate: zero(q),
             norm_temp: zero(q.max(kv)),
             attended: zero(q.max(c.gdn.value_width())),
-            gate_up: zero(2 * c.intermediate_size),
-            middle: zero(c.intermediate_size),
-            scatter: zero(mixed.max(2 * c.intermediate_size)),
+            gate_up: zero(2 * f),
+            middle: zero(f),
+            scatter: zero(mixed.max(2 * f)),
             recurrent: Scratch::default(),
         }
     }
@@ -118,6 +125,16 @@ impl Buffers {
 
 impl Layer {
     pub fn forward(
+        &mut self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+    ) -> Result<()> {
+        self.mix(w, e, timings)?;
+        self.feed_forward(w, e, timings)
+    }
+
+    pub(super) fn mix(
         &mut self,
         w: &mut Buffers,
         e: &Execution<'_>,
@@ -169,15 +186,42 @@ impl Layer {
             )
         })?;
         trace.save(position, index, "post", &w.normalized[..rows * h])?;
+        Ok(())
+    }
+
+    pub(super) fn feed_forward(
+        &mut self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+    ) -> Result<()> {
+        let Execution {
+            config: c,
+            cpu,
+            rows,
+            position,
+            index,
+            trace,
+            ..
+        } = *e;
+        let h = c.hidden_size;
+        if let FeedForward::Routed(moe) = &mut self.ffn {
+            moe.forward(w, e, timings)?;
+            trace.save(position, index, "ffn", &w.projected[..rows * h])?;
+            cpu.add(&mut w.hidden[..rows * h], &w.projected[..rows * h]);
+            return trace.save(position, index, "output", &w.hidden[..rows * h]);
+        }
+        let FeedForward::Dense { gate_up, down } = &self.ffn else {
+            unreachable!()
+        };
         let f = c.intermediate_size;
         let fused = !trace.enabled()
             && timings.measure(Phase::Linear, || {
-                self.gate_up
-                    .run_swiglu(&w.normalized[..rows * h], &mut w.middle[..rows * f], rows)
+                gate_up.run_swiglu(&w.normalized[..rows * h], &mut w.middle[..rows * f], rows)
             })?;
         if !fused {
             timings.measure(Phase::Linear, || {
-                self.gate_up.run(
+                gate_up.run(
                     &w.normalized[..rows * h],
                     &mut w.gate_up[..rows * 2 * f],
                     rows,
@@ -190,8 +234,7 @@ impl Layer {
         }
         trace.save(position, index, "middle", &w.middle[..rows * f])?;
         timings.measure(Phase::Linear, || {
-            self.down
-                .run(&w.middle[..rows * f], &mut w.projected[..rows * h], rows)
+            down.run(&w.middle[..rows * f], &mut w.projected[..rows * h], rows)
         })?;
         timings.measure(Phase::Cpu, || {
             cpu.add(&mut w.hidden[..rows * h], &w.projected[..rows * h])

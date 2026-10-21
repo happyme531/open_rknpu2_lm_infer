@@ -14,6 +14,13 @@ pub enum LayerType {
 }
 
 #[derive(Debug, Clone)]
+pub struct MoeConfig {
+    pub experts: usize,
+    pub top_k: usize,
+    pub shared_intermediate: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -34,6 +41,7 @@ pub struct Config {
     /// Quantization is resolved explicitly, independently of tensor storage.
     pub quantization: Option<Value>,
     pub text_prefix: &'static str,
+    pub moe: Option<MoeConfig>,
 }
 
 fn dimension(config: &Value, name: &str) -> Result<usize> {
@@ -54,9 +62,9 @@ fn flag(config: &Value, name: &str, default: bool) -> Result<bool> {
 impl Config {
     pub fn parse(root: &Value) -> Result<Self> {
         let nested = match root["model_type"].as_str() {
-            Some("qwen3_5") => true,
-            Some("qwen3_5_text") => false,
-            other => anyhow::bail!("expected dense Qwen3.5 configuration, got {other:?}"),
+            Some("qwen3_5" | "qwen3_5_moe" | "minicpmv4_7") => true,
+            Some("qwen3_5_text" | "qwen3_5_moe_text") => false,
+            other => anyhow::bail!("expected Qwen3.5/MiniCPM-V 4.7 configuration, got {other:?}"),
         };
         let text = if nested {
             root.get("text_config")
@@ -68,7 +76,7 @@ impl Config {
         ensure!(
             text["model_type"]
                 .as_str()
-                .is_none_or(|s| s == "qwen3_5_text"),
+                .is_none_or(|s| matches!(s, "qwen3_5_text" | "qwen3_5_moe_text")),
             "unsupported Qwen3.5 text model type"
         );
         ensure!(
@@ -77,12 +85,32 @@ impl Config {
                 && !flag(text, "mlp_bias", false)?
                 && flag(text, "attn_output_gate", true)?
                 && !flag(text, "use_sliding_window", false)?
-                && text["num_experts"].is_null()
                 && text["mlp_only_layers"].as_array().is_none_or(Vec::is_empty),
-            "Qwen3.5 requires dense SiLU, attention output gate and no bias/sliding window"
+            "Qwen3.5 requires SiLU, attention output gate and no bias/sliding window"
         );
         let hidden_size = dimension(text, "hidden_size")?;
-        let intermediate_size = dimension(text, "intermediate_size")?;
+        let moe = if !text["num_experts"].is_null() {
+            let m = MoeConfig {
+                experts: dimension(text, "num_experts")?,
+                top_k: dimension(text, "num_experts_per_tok")?,
+                shared_intermediate: dimension(text, "shared_expert_intermediate_size")?,
+            };
+            ensure!(
+                m.top_k <= m.experts && m.top_k <= 8,
+                "invalid routed expert count"
+            );
+            Some(m)
+        } else {
+            None
+        };
+        let intermediate_size = dimension(
+            text,
+            if moe.is_some() {
+                "moe_intermediate_size"
+            } else {
+                "intermediate_size"
+            },
+        )?;
         let vocab_size = dimension(text, "vocab_size")?;
         ensure!(
             vocab_size <= u32::MAX as usize,
@@ -175,6 +203,7 @@ impl Config {
             )?,
             eos_tokens,
             quantization: outer_quant.or(inner_quant).cloned(),
+            moe,
             text_prefix: if nested {
                 "model.language_model"
             } else {
@@ -196,6 +225,28 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minicpmv47_hybrid_moe_configuration() {
+        let raw = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/minicpmv47/config.json"
+        ))
+        .unwrap();
+        let c = Config::parse(&raw).unwrap();
+        assert_eq!(c.hidden_size, 2048);
+        assert_eq!(c.intermediate_size, 512);
+        assert_eq!(c.layers.len(), 40);
+        assert_eq!(
+            c.layers
+                .iter()
+                .filter(|&&l| l == LayerType::FullAttention)
+                .count(),
+            10
+        );
+        let m = c.moe.unwrap();
+        assert_eq!((m.experts, m.top_k, m.shared_intermediate), (256, 8, 512));
+        assert_eq!(c.text_prefix, "model.language_model");
+    }
 
     fn official() -> Value {
         serde_json::from_str(include_str!(

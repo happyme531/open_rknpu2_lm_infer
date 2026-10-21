@@ -55,9 +55,10 @@ impl Qwen35 {
                 features.push((span.start, feature));
             }
             let mut rows = 0;
-            for offset in (start..input.tokens.len()).step_by(self.options.chunk) {
-                let end = (offset + self.options.chunk).min(input.tokens.len());
-                self.chunk(
+            let prompt_chunk = self.prompt_chunk_rows();
+            for offset in (start..input.tokens.len()).step_by(prompt_chunk) {
+                let end = (offset + prompt_chunk).min(input.tokens.len());
+                self.prompt_chunk(
                     &input.tokens[offset..end],
                     Some(cancel),
                     Some(EmbeddedChunk {
@@ -65,7 +66,7 @@ impl Qwen35 {
                         features: &features,
                     }),
                 )?;
-                rows = end - offset;
+                rows = (end - offset - 1) % self.options.chunk + 1;
             }
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
             self.next_rope_position = input.next_position;

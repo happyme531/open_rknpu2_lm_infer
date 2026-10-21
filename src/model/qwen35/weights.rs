@@ -60,12 +60,46 @@ impl Config {
         for name in ["input_layernorm", "post_attention_layernorm"] {
             add(format!("{prefix}.{name}.weight"), vec![h], false);
         }
-        for (name, n, k) in [
-            ("gate_proj", self.intermediate_size, h),
-            ("up_proj", self.intermediate_size, h),
-            ("down_proj", h, self.intermediate_size),
-        ] {
-            add(format!("{prefix}.mlp.{name}.weight"), vec![n, k], true);
+        if let Some(m) = &self.moe {
+            add(
+                format!("{prefix}.mlp.gate.weight"),
+                vec![m.experts, h],
+                false,
+            );
+            add(
+                format!("{prefix}.mlp.shared_expert_gate.weight"),
+                vec![1, h],
+                false,
+            );
+            add(
+                format!("{prefix}.mlp.experts.gate_up_proj"),
+                vec![m.experts, 2 * self.intermediate_size, h],
+                true,
+            );
+            add(
+                format!("{prefix}.mlp.experts.down_proj"),
+                vec![m.experts, h, self.intermediate_size],
+                true,
+            );
+            for (name, n, k) in [
+                ("gate_proj", m.shared_intermediate, h),
+                ("up_proj", m.shared_intermediate, h),
+                ("down_proj", h, m.shared_intermediate),
+            ] {
+                add(
+                    format!("{prefix}.mlp.shared_expert.{name}.weight"),
+                    vec![n, k],
+                    true,
+                );
+            }
+        } else {
+            for (name, n, k) in [
+                ("gate_proj", self.intermediate_size, h),
+                ("up_proj", self.intermediate_size, h),
+                ("down_proj", h, self.intermediate_size),
+            ] {
+                add(format!("{prefix}.mlp.{name}.weight"), vec![n, k], true);
+            }
         }
         match kind {
             LayerType::FullAttention => {

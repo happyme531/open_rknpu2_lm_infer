@@ -74,26 +74,48 @@ pub struct ModelArgs {
         help = "ViT intermediate tensor dtype; NPU matmul remains FP16"
     )]
     pub vision_dtype: VisionDtype,
+    #[arg(long, global = true, value_enum, default_value = "resident")]
+    pub expert_storage: crate::model::experts::Storage,
+    #[arg(
+        long,
+        global = true,
+        required_if_eq("expert_storage", "stream"),
+        value_name = "DIR",
+        help = "Directory for prepared native expert weight records on disk"
+    )]
+    pub expert_store: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = crate::model::experts::DEFAULT_CACHE_PERCENT,
+        value_parser = crate::model::experts::parse_cache_percent,
+        help = "Percentage of routed experts kept in NPU cache per layer (0 < P <= 100; at least top-k)"
+    )]
+    pub expert_cache_percent: f64,
+    #[arg(long, global = true)]
+    pub no_expert_prefetch: bool,
+    #[arg(long, global = true, help = "Allow the OS page cache for expert reads")]
+    pub expert_buffered_io: bool,
     #[arg(
         long,
         global = true,
         value_enum,
         default_value = "none",
-        help = "Qwen3.5 speculative decoding: none, draft-mtp or draft-dflash"
+        help = "Speculative decoder: none, draft-mtp, draft-dflash or draft-dspark"
     )]
     pub spec_type: SpeculativeType,
     #[arg(
         long,
         visible_alias = "model-draft",
         global = true,
-        help = "DFlash safetensors draft model directory; also accepts -md"
+        help = "DFlash/DSpark draft model directory; also accepts -md"
     )]
     pub spec_draft_model: Option<PathBuf>,
     #[arg(
         long,
         global = true,
         default_value_t = 3,
-        help = "Maximum proposals (0..7); DFlash 3/7 corresponds to block 4/8; 0 disables"
+        help = "Maximum proposals (0..7, DSpark up to 15); 0 disables"
     )]
     pub spec_draft_n_max: usize,
     #[arg(
@@ -141,10 +163,14 @@ impl ModelArgs {
     }
 
     pub fn options(&self) -> Result<ModelOptions> {
-        anyhow::ensure!(
-            self.spec_draft_n_max <= 7,
-            "spec-draft-n-max must be in 0..7"
-        );
+        let speculation = SpeculativeConfig {
+            kind: self.spec_type,
+            model: self.spec_draft_model.clone(),
+            max_draft: self.spec_draft_n_max,
+            p_min: self.spec_draft_p_min,
+            sampling: self.spec_draft_sampling,
+        };
+        speculation.validate(self.chunk)?;
         let path = self
             .model
             .clone()
@@ -174,15 +200,15 @@ impl ModelArgs {
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,
-            speculation: SpeculativeConfig {
-                kind: self.spec_type,
-                model: self.spec_draft_model.clone(),
-                max_draft: self.spec_draft_n_max,
-                p_min: self.spec_draft_p_min,
-                sampling: self.spec_draft_sampling,
+            experts: crate::model::experts::Options {
+                storage: self.expert_storage,
+                cache: self.expert_store.clone(),
+                cache_percent: self.expert_cache_percent,
+                prefetch: !self.no_expert_prefetch,
+                direct: !self.expert_buffered_io,
             },
+            speculation,
         };
-        options.validate_speculation()?;
         Ok(options)
     }
 }
@@ -633,6 +659,48 @@ mod tests {
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
     }
+    #[test]
+    fn dspark_and_expert_paging_options_reach_the_model() {
+        let cli = parse(&[
+            "infer",
+            "-m",
+            "target",
+            "run",
+            "--spec-type",
+            "draft-dspark",
+            "-md",
+            "draft",
+            "--spec-draft-n-max",
+            "15",
+            "--expert-storage",
+            "stream",
+            "--expert-store",
+            "records",
+            "--expert-cache-percent",
+            "25",
+        ]);
+        let options = cli.model.options().unwrap();
+        assert_eq!(options.speculation.kind, SpeculativeType::DraftDspark);
+        assert_eq!(options.speculation.window(), 15);
+        assert_eq!(
+            options.experts.storage,
+            crate::model::experts::Storage::Stream
+        );
+        assert_eq!(options.experts.cache_percent, 25.);
+        assert_eq!(options.experts.slots(256, 8).unwrap(), 64);
+        assert!(options.experts.prefetch && options.experts.direct);
+        assert_eq!(options.experts.cache, Some(PathBuf::from("records")));
+    }
+
+    #[test]
+    fn streaming_requires_an_expert_store_directory() {
+        for args in [
+            ["infer", "-m", "target", "--expert-storage", "stream", "run"],
+            ["infer", "-m", "target", "run", "--expert-storage", "stream"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn dflash_model_aliases_and_block_lengths_use_the_shared_speculative_options() {
@@ -799,6 +867,25 @@ mod tests {
             args.extend(flags);
             assert!(parse(&args).model.options().is_err(), "{args:?}");
         }
+        let cli = parse(&[
+            "infer",
+            "-m",
+            "model",
+            "-c",
+            "0",
+            "run",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "8",
+        ]);
+        assert!(
+            cli.model
+                .options()
+                .unwrap_err()
+                .to_string()
+                .contains("0..7")
+        );
         for command in [
             vec!["bench"],
             vec!["tune"],
@@ -839,7 +926,7 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
         options.path = dir.path().to_owned();
         let error = crate::model::load(options).err().unwrap();
-        assert!(error.to_string().contains("only for Qwen3.5"));
+        assert!(error.to_string().contains("Qwen3.5 or MiniCPM-V 4.7"));
     }
 
     #[test]

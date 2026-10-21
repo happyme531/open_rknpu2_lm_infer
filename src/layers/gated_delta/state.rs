@@ -80,6 +80,12 @@ impl Scratch {
             ..Self::default()
         }
     }
+    pub fn with_compensated_npu(backend: crate::npu::Backend) -> Self {
+        Self {
+            prefill: Some(crate::npu::GatedDelta::new(backend).compensated()),
+            ..Default::default()
+        }
+    }
     pub fn prepare(&mut self, rows: &[usize]) -> Result<()> {
         if let Some(prefill) = &mut self.prefill {
             prefill.retain_workspaces(rows);
@@ -102,7 +108,8 @@ impl Scratch {
     }
     pub fn backend_stats(&self) -> serde_json::Value {
         let mut stats = serde_json::json!({
-            "gdn_backend":if self.prefill.is_some() { "npu-tf32-prefill/cpu-fp32-decode" } else { "cpu-fp32-cpp-neon" },
+            "gdn_backend":match self.prefill.as_ref() {Some(p) if p.is_compensated()=>"npu-compensated-tf32-prefill/cpu-fp32-decode",
+                Some(_)=>"npu-tf32-prefill/cpu-fp32-decode",None=>"cpu-fp32-cpp-neon"},
             "gdn_cpu_max_rows":crate::npu::GatedDelta::CPU_MAX_ROWS,"gdn_cpu_calls":self.cpu_calls,"gdn_cpu_tokens":self.cpu_tokens,
             "gdn_layer_prepare_ms":self.prepare_ms,"gdn_buffers_ms":self.mixer.buffers_ms,
             "gdn_gates_ms":self.mixer.gates_ms,"gdn_output_norm_ms":self.mixer.output_norm_ms,

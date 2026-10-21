@@ -13,6 +13,7 @@ pub struct GatedDelta {
     elapsed_us: f64,
     hardware_us: f64,
     cpu_work_us: [f64; 4],
+    compensated: bool,
 }
 impl GatedDelta {
     pub const CPU_MAX_ROWS: usize = 12;
@@ -34,7 +35,16 @@ impl GatedDelta {
             elapsed_us: 0.,
             hardware_us: 0.,
             cpu_work_us: [0.; 4],
+            compensated: false,
         }
+    }
+    pub fn compensated(mut self) -> Self {
+        self.work.clear();
+        self.compensated = true;
+        self
+    }
+    pub fn is_compensated(&self) -> bool {
+        self.compensated
     }
     pub fn prepare(&mut self, rows: usize) -> Result<()> {
         if rows <= Self::CPU_MAX_ROWS || self.work.contains_key(&rows) {
@@ -48,7 +58,11 @@ impl GatedDelta {
         let mut cfg = rk_npu_gdn_config::default();
         unsafe { rk_npu_gdn_config_init(&mut cfg, rows as i32) };
         cfg.chunk_size = rows.next_power_of_two().clamp(16, 64) as i32;
-        cfg.precision = RK_NPU_GDN_TF32;
+        cfg.precision = if self.compensated {
+            RK_NPU_GDN_COMPENSATED_TF32
+        } else {
+            RK_NPU_GDN_TF32
+        };
         cfg.cpu_threads = device.options.threads as i32;
         cfg.core_mask = device.options.npu_mask;
         // The checkpoint repeats each key head over adjacent value heads.

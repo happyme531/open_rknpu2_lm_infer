@@ -22,7 +22,12 @@ impl DFlash {
     pub fn load(options: &ModelOptions, path: &Path) -> Result<Self> {
         let c = Config::load(path, options.context)?;
         let store = TensorStore::open(path)?;
-        let devices = vec![Backend::new(options, 1)?, Backend::new(options, 2)?];
+        // The streaming target reserves domain 1 for cold expert staging.
+        let domain = if c.dspark() { 2 } else { 1 };
+        let devices = vec![
+            Backend::new(options, domain)?,
+            Backend::new(options, domain + 1)?,
+        ];
         let floating: Vec<_> = devices
             .iter()
             .cloned()
@@ -84,6 +89,11 @@ impl DFlash {
         let fc = Linear::floating(&floating[0], &store, "fc", h, c.context_width())?;
         let hidden_norm = vector(&store, "hidden_norm", h)?;
         let final_norm = vector(&store, "norm", h)?;
+        let markov = if c.dspark() {
+            Some(super::markov::Markov::load(&c, &store, &floating[0])?)
+        } else {
+            None
+        };
         let rope = MRope::new(
             c.head_dim,
             c.head_dim,
@@ -104,6 +114,7 @@ impl DFlash {
             context: options.context,
             chunk: options.chunk,
             position: 0,
+            markov,
         })
     }
 }

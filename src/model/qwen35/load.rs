@@ -1,6 +1,6 @@
 use super::{
     config::{Config, LayerType},
-    decoder::{Buffers, Layer, Mixer},
+    decoder::{Buffers, FeedForward, Layer, Mixer},
     head,
     runtime::Qwen35,
 };
@@ -9,11 +9,11 @@ use crate::model::trace::Trace;
 use crate::{
     model::{
         ModelInfo, ModelOptions,
-        checkpoint::{QuantLoader, TensorStore},
+        checkpoint::QuantLoader,
         cpu::Cpu,
-        projection::Projection,
+        projection::{Linear, Projection},
     },
-    npu::{Backend, Linear},
+    npu::Backend,
 };
 use anyhow::{Result, ensure};
 use serde_json::Value;
@@ -25,27 +25,30 @@ fn vector(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
     tensor.floats()
 }
 
-fn linear(
-    backend: &Backend,
-    loader: &Arc<QuantLoader>,
-    cpu: &Cpu,
-    name: String,
-    n: usize,
-    k: usize,
-) -> Result<Linear> {
-    let matrix = cpu.pool.install(|| loader.load(&name, n, k))?;
-    let reload = loader.clone();
-    let pool = cpu.pool.clone();
-    backend.load(
-        matrix,
-        Some(Box::new(move || pool.install(|| reload.load(&name, n, k)))),
-    )
-}
-
 pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
     let start = Instant::now();
     let raw: Value = serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     let config = Config::parse(&raw)?;
+    let expert_slots = config
+        .moe
+        .as_ref()
+        .map(|m| options.experts.slots(m.experts, m.top_k))
+        .transpose()?
+        .unwrap_or(0);
+    if options.experts.storage == crate::model::experts::Storage::Stream
+        && let Some(m) = &config.moe
+    {
+        eprintln!(
+            "expert cache: {}% -> {expert_slots}/{} routed experts per layer ({:.3}% effective)",
+            options.experts.cache_percent,
+            m.experts,
+            100. * expert_slots as f64 / m.experts as f64
+        );
+    }
+    ensure!(
+        config.moe.is_none() || [1, 3, 7].contains(&options.npu_mask),
+        "MoE requires NPU mask 1/3/7"
+    );
     config.validate_context(options.context)?;
     ensure!(
         options.chunk > 0 && options.chunk <= options.context,
@@ -56,11 +59,56 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         "Qwen3.5 native attention requires D divisible by 32 and Hkv<=32"
     );
     let cpu = Cpu::new(options.threads)?;
-    let quant_config = serde_json::json!({"quantization_config": config.quantization});
-    let loader = Arc::new(QuantLoader::new(
-        TensorStore::open(&options.path)?,
-        &quant_config,
-    )?);
+    let mut quant_config = raw.clone();
+    quant_config["quantization_config"] = config.quantization.clone().unwrap_or(Value::Null);
+    let loader = Arc::new(QuantLoader::open(&options.path, &quant_config)?);
+    let expert_store = if let Some(m) = &config.moe {
+        if let Some(directory) = &options.experts.cache {
+            Some(crate::model::experts::prepare::open(
+                directory,
+                crate::model::experts::store::Geometry {
+                    native_version: crate::npu::Moe::blob_version(),
+                    layers: config.layers.len(),
+                    experts: m.experts,
+                    hidden: config.hidden_size,
+                    intermediate: config.intermediate_size,
+                    down_bits: 4,
+                },
+                &options,
+                || loader.source_stamps(),
+                |layer, expert| {
+                    let result = cpu.pool.install(|| {
+                        loader.expert(
+                            &format!("{}.layers.{layer}.mlp.experts", config.text_prefix),
+                            expert,
+                            config.hidden_size,
+                            config.intermediate_size,
+                        )
+                    })?;
+                    if expert + 1 == m.experts {
+                        loader.store.release_pages()?;
+                    }
+                    Ok(result)
+                },
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let paging = if options.experts.storage == crate::model::experts::Storage::Stream {
+        let store = expert_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("streaming requires a MoE checkpoint and --expert-store")
+        })?;
+        Some(crate::model::experts::Paging::new(
+            &options,
+            store.clone(),
+            expert_slots,
+        )?)
+    } else {
+        None
+    };
     let prefix = config.text_prefix;
     let embedding = loader.store.get(&format!("{prefix}.embed_tokens.weight"))?;
     embedding.require_shape(&[config.vocab_size, config.hidden_size], "embedding")?;
@@ -130,12 +178,24 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         let mut estimate = 0usize;
         for (name, n, k) in inputs
             .iter()
-            .chain(gu.iter())
+            .chain(gu.iter().filter(|_| config.moe.is_none()))
             .map(|(name, n)| (name, *n, h))
-            .chain([(&out, h, out_k), (&down, h, f)])
+            .chain([(&out, h, out_k)])
+            .chain(config.moe.is_none().then_some((&down, h, f)))
         {
+            if !loader.quantized(name) {
+                continue;
+            }
             let bits = loader.bits(name)? as usize;
             estimate += n.div_ceil(64) * 64 * k.div_ceil(32) * 32 * bits / 8 + n * 8 + 65536;
+        }
+        if let Some(m) = &config.moe {
+            let experts = if paging.is_some() {
+                expert_slots
+            } else {
+                m.experts
+            };
+            estimate += experts * h * f * 3 / 2 + experts * h * 4 + m.shared_intermediate * h * 3;
         }
         let kv = if *kind == LayerType::FullAttention {
             kv_bytes
@@ -153,6 +213,10 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                 "Qwen3.5 exceeds available weight domains"
             );
             backends.push(Backend::new(&options, 15 - backends.len() as u32)?);
+            ensure!(
+                paging.is_none() || backends.len() < 13,
+                "no IOMMU domain for cold expert staging"
+            );
             reserved_kv = 0;
         }
         let backend = backends.last().unwrap();
@@ -183,7 +247,11 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                 )?;
                 Mixer::Recurrent {
                     weights,
-                    state: Box::new(LayerState::new(config.gdn, config.conv_kernel, 8)?),
+                    state: Box::new(LayerState::new(
+                        config.gdn,
+                        config.conv_kernel,
+                        8.max(options.speculation.window() + 1),
+                    )?),
                 }
             }
             LayerType::FullAttention => Mixer::Attention {
@@ -209,9 +277,27 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             input_norm: vector(&loader, &format!("{p}.input_layernorm.weight"), h)?,
             post_norm: vector(&loader, &format!("{p}.post_attention_layernorm.weight"), h)?,
             inputs: Projection::load(backend, &loader, &cpu, inputs, h)?,
-            output: linear(backend, &loader, &cpu, out, h, out_k)?.into(),
-            gate_up: Projection::load(backend, &loader, &cpu, gu, h)?,
-            down: linear(backend, &loader, &cpu, down, h, f)?.into(),
+            output: Linear::load(backend, &loader, &cpu, &out, h, out_k)?,
+            ffn: if config.moe.is_some() {
+                FeedForward::Routed(Box::new(super::moe::Routed::load(
+                    backend,
+                    &loader,
+                    &cpu,
+                    &config,
+                    &p,
+                    i,
+                    super::moe::Storage {
+                        options: &options,
+                        store: expert_store.as_ref(),
+                        paging: paging.as_ref(),
+                    },
+                )?))
+            } else {
+                FeedForward::Dense {
+                    gate_up: Projection::load(backend, &loader, &cpu, gu, h)?,
+                    down: Linear::load(backend, &loader, &cpu, &down, h, f)?,
+                }
+            },
             mixer,
         });
         reserved_kv += kv;
@@ -230,7 +316,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         config.tie_word_embeddings,
     )?;
     let mut work = Buffers::new(&config, options.chunk);
-    if crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
+    if config.moe.is_none() && crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
         work.recurrent =
             crate::layers::gated_delta::Scratch::with_npu(backends.last().unwrap().clone());
     }
@@ -241,7 +327,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned(),
-        architecture: "qwen3_5".into(),
+        architecture: raw["model_type"].as_str().unwrap_or("qwen3_5").into(),
         context: options.context,
         vocab_size: config.vocab_size,
         eos_tokens: crate::model::metadata::eos_tokens(
@@ -262,6 +348,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         cpu,
         backends,
         layers,
+        paging,
         embedding,
         final_norm,
         head,

@@ -6,6 +6,7 @@ pub mod checkpoint;
 pub(crate) mod cpu;
 pub mod dense;
 pub mod dflash;
+pub mod experts;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
@@ -45,6 +46,7 @@ pub struct ModelOptions {
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
+    pub experts: experts::Options,
     pub speculation: SpeculativeConfig,
 }
 impl ModelOptions {
@@ -139,6 +141,16 @@ pub trait LanguageModel {
     ) -> Result<Option<Vec<f32>>> {
         Ok(None)
     }
+    /// Optional sequential correction to a parallel draft row. Returns a
+    /// learned acceptance probability when the drafter supplies one.
+    fn adjust_draft_logits(
+        &self,
+        _row: usize,
+        _previous: u32,
+        _logits: &mut [f32],
+    ) -> Result<Option<f64>> {
+        Ok(None)
+    }
     fn verify_tokens(
         &mut self,
         _tokens: &[u32],
@@ -180,19 +192,31 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     anyhow::ensure!(
+        options.experts.storage != experts::Storage::Stream
+            || matches!(
+                config["model_type"].as_str(),
+                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7")
+            ),
+        "expert streaming requires a MoE checkpoint"
+    );
+    anyhow::ensure!(
         spec.window() == 0
             || matches!(
                 config["model_type"].as_str(),
-                Some("qwen3_5" | "qwen3_5_text")
+                Some(
+                    "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7"
+                )
             ),
-        "speculative decoding is supported only for Qwen3.5 checkpoints"
+        "speculative decoding requires a Qwen3.5 or MiniCPM-V 4.7 checkpoint"
     );
     crate::npu::configure_cpu(&mut options)?;
     let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
         Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
-        Some("qwen3_5" | "qwen3_5_text") => Box::new(qwen35::Qwen35::load(options)?),
+        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7") => {
+            Box::new(qwen35::Qwen35::load(options)?)
+        }
         other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text"
+            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, minicpmv4_7"
         ),
     };
     if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {

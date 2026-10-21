@@ -17,6 +17,7 @@ struct Model {
     sampling: crate::sampling::DraftSampling,
     target_gap: f32,
     parallel: bool,
+    draft_adjust: Vec<(u32, u32, f64)>,
 }
 impl Model {
     fn new(window: usize, reject_at: usize, eos_after: usize) -> Self {
@@ -41,6 +42,7 @@ impl Model {
             sampling: Default::default(),
             target_gap: 20.,
             parallel: false,
+            draft_adjust: Vec::new(),
         }
     }
     fn row(&self, position: usize) -> Vec<f32> {
@@ -116,6 +118,23 @@ impl LanguageModel for Model {
         }
         Ok(Some(logits))
     }
+    fn adjust_draft_logits(
+        &self,
+        row: usize,
+        previous: u32,
+        logits: &mut [f32],
+    ) -> Result<Option<f64>> {
+        let Some(&(expected, token, confidence)) = self.draft_adjust.get(row) else {
+            return Ok(None);
+        };
+        ensure!(
+            previous == expected,
+            "parallel draft correction did not receive the preceding proposal"
+        );
+        logits.fill(-10.);
+        logits[token as usize] = 10.;
+        Ok(Some(confidence))
+    }
     fn verify_tokens(&mut self, tokens: &[u32], _: &AtomicBool) -> Result<&[f32]> {
         ensure!(self.pending.is_none(), "duplicate transaction");
         self.logits = (1..=tokens.len())
@@ -136,6 +155,27 @@ impl LanguageModel for Model {
         self.draft_step = 0;
         Ok(())
     }
+}
+
+#[test]
+fn parallel_corrections_use_previous_proposal_and_learned_confidence() -> Result<()> {
+    let mut model = Model::new(3, 0, 100);
+    model.parallel = true;
+    model.draft_adjust = vec![(3, 4, 0.95), (4, 1, 0.2), (1, 2, 0.99)];
+    model.p_min = 0.5;
+    model.forward(&[1, 2])?;
+    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[1, 2, 3])?;
+    let round =
+        crate::speculative::run_round(&mut model, &mut sampler, 3, 8, &AtomicBool::new(false))?;
+    assert_eq!(round.inputs, [3, 4]);
+    assert_eq!(round.output, [4, 1]);
+    assert_eq!(round.accepted, 1);
+    assert_eq!(round.draft_confidence, [0.95, 0.2]);
+    assert_eq!(round.draft_attempts, 2);
+    assert!(round.confidence_stopped);
+    model.finish_verification(2)?;
+    assert_eq!(model.tokens, [1, 2, 3, 4]);
+    Ok(())
 }
 
 #[test]

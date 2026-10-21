@@ -7,6 +7,16 @@ description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"
 license = "AGPL-3.0-only"
 autoexamples = false
 
+[[example]]
+name = "minicpmv47_check"
+path = "tests/tools/minicpmv47_check.rs"
+test = false
+
+[[example]]
+name = "minicpmv47_bench"
+path = "tests/tools/minicpmv47_bench.rs"
+test = false
+
 # Standalone test and benchmark tools. Example targets keep them separately
 # runnable without executing model/device programs during the default tests.
 [[example]]

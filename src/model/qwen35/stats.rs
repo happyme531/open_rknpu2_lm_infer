@@ -31,7 +31,14 @@ impl Qwen35 {
             }
         }
         let fields = json!({
-            "position":self.position,"layers":self.layers.len(),"architecture":"qwen3_5",
+            "position":self.position,"layers":self.layers.len(),"architecture":self.info.architecture,
+            "routed_experts":self.config.moe.as_ref().map(|m| m.experts),
+            "experts_per_token":self.config.moe.as_ref().map(|m| m.top_k),
+            "expert_storage":self.config.moe.as_ref().map(|_| if self.paging.is_some() {"stream"} else {"resident"}),
+            "prefill_logical_chunk":self.prompt_chunk_rows(),
+            "expert_cache_policy":self.paging.as_ref().map(|_| "per-layer LRU; requested and predicted protection; prompt-tail seed"),
+            "expert_paging":self.paging.as_ref().map(|p|p.stats()),
+            "expert_layers":self.layers.iter().filter_map(|l| match &l.ffn {super::decoder::FeedForward::Routed(m)=>Some(m.statistics()),_=>None}).collect::<Vec<_>>(),
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "gdn_state_bytes":state_bytes,"gdn_convolution_bytes":conv_bytes,"gdn_update_log_bytes":log_bytes,
             "gdn_verification_state_bytes":verification_state_bytes,
@@ -56,7 +63,7 @@ impl Qwen35 {
             "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some() || self.dflash.is_some(),
             "mtp_draft_tokens":self.mtp.as_ref().map_or(0,|m|m.max_draft),
             "spec_draft_n_max":crate::model::LanguageModel::speculation_window(self),
-            "spec_type":if self.dflash.is_some() {"draft-dflash"} else if self.mtp.is_some() {"draft-mtp"} else {"none"},
+            "spec_type":if self.dflash.is_some() {self.options.speculation.kind.as_str()} else if self.mtp.is_some() {"draft-mtp"} else {"none"},
             "spec_draft_model":self.options.speculation.model,
             "dflash":self.dflash.as_ref().map(|d|d.stats()),
             "spec_draft_p_min":self.options.speculation.p_min,"spec_draft_keep_low_confidence":false,

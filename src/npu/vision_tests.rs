@@ -16,6 +16,7 @@ fn fp16_linear_and_noncausal_attention_match_cpu() -> Result<()> {
         tune_cache: std::path::PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        experts: Default::default(),
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;

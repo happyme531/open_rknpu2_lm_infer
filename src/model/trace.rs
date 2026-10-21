@@ -1,13 +1,25 @@
 use anyhow::{Context, Result};
 use std::{io::Write, path::PathBuf};
 
-pub(crate) struct Trace(Option<PathBuf>);
+pub(crate) struct Trace {
+    directory: Option<PathBuf>,
+    #[cfg(test)]
+    position: Option<usize>,
+}
 
 impl Trace {
     #[cfg(test)]
     pub fn in_directory(path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&path)?;
-        Ok(Self(Some(path)))
+        Ok(Self {
+            directory: Some(path),
+            position: None,
+        })
+    }
+    #[cfg(test)]
+    pub fn at_position(mut self, position: usize) -> Self {
+        self.position = Some(position);
+        self
     }
     pub fn from_environment() -> Result<Self> {
         let directory = std::env::var_os("OPEN_RKNPU2_TRACE_DIR")
@@ -16,16 +28,24 @@ impl Trace {
         if let Some(path) = &directory {
             std::fs::create_dir_all(path)?;
         }
-        Ok(Self(directory))
+        Ok(Self {
+            directory,
+            #[cfg(test)]
+            position: None,
+        })
     }
     pub fn enabled(&self) -> bool {
-        self.0.is_some()
+        self.directory.is_some()
     }
     pub fn path(&self) -> Option<&std::path::Path> {
-        self.0.as_deref()
+        self.directory.as_deref()
     }
     pub fn save(&self, position: usize, layer: i32, stage: &str, values: &[f32]) -> Result<()> {
-        let Some(directory) = &self.0 else {
+        #[cfg(test)]
+        if self.position.is_some_and(|p| p != position) {
+            return Ok(());
+        }
+        let Some(directory) = &self.directory else {
             return Ok(());
         };
         let path = directory.join(format!("p{position}-l{layer}-{stage}.f32"));

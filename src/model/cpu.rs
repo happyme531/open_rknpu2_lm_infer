@@ -151,7 +151,7 @@ fn swiglu_block(gates: &[f32], ups: &[f32], y: &mut [f32]) {
     }
 }
 
-fn dense_dot(weight: &Tensor, row: usize, input: &[f32]) -> f32 {
+pub(crate) fn dense_dot(weight: &Tensor, row: usize, input: &[f32]) -> f32 {
     let base = row * input.len();
     let mut sum = 0.0;
     let mut i = 0;

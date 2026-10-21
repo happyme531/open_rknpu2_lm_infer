@@ -26,6 +26,8 @@ mod gated_delta;
 pub use gated_delta::GatedDelta;
 mod floating;
 pub use floating::{FloatBackend, FloatLinear};
+mod moe;
+pub use moe::Moe;
 mod policy;
 #[cfg(test)]
 mod vision_tests;
@@ -116,6 +118,23 @@ pub struct QuantMatrix {
     pub codes: Vec<i8>,
     pub scales: Vec<f32>,
 }
+impl QuantMatrix {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            [4, 8].contains(&self.bits),
+            "linear weights must use 4 or 8 bits"
+        );
+        ensure!(
+            self.k > 0 && self.n > 0 && self.k <= i32::MAX as usize && self.n <= i32::MAX as usize,
+            "invalid linear dimensions"
+        );
+        ensure!(
+            self.k.checked_mul(self.n) == Some(self.codes.len()) && self.scales.len() == self.n,
+            "linear weight shape mismatch"
+        );
+        Ok(())
+    }
+}
 pub type Reload = Box<dyn Fn() -> Result<QuantMatrix>>;
 type Key = (u32, usize, usize, usize);
 type WorkKey = (Key, usize);
@@ -186,6 +205,7 @@ struct Material {
 }
 struct BackendInner {
     work: BTreeMap<WorkKey, Work>,
+    moe_work: BTreeMap<moe::Key, moe::Work>,
     attention: Option<AttentionWork>,
     material: BTreeMap<Key, Material>,
     w8_partitions: BTreeMap<(usize, usize), usize>,
@@ -301,6 +321,7 @@ impl Backend {
         }
         Ok(Self(Rc::new(RefCell::new(BackendInner {
             work: BTreeMap::new(),
+            moe_work: BTreeMap::new(),
             attention: None,
             material: BTreeMap::new(),
             w8_partitions: BTreeMap::new(),
@@ -323,21 +344,7 @@ impl Backend {
     }
 
     pub fn load(&self, mut matrix: QuantMatrix, reload: Option<Reload>) -> Result<Linear> {
-        ensure!(
-            [4, 8].contains(&matrix.bits),
-            "linear weights must use 4 or 8 bits"
-        );
-        ensure!(
-            matrix.k > 0
-                && matrix.n > 0
-                && matrix.k <= i32::MAX as usize
-                && matrix.n <= i32::MAX as usize,
-            "invalid linear dimensions"
-        );
-        ensure!(
-            matrix.codes.len() == matrix.k * matrix.n && matrix.scales.len() == matrix.n,
-            "linear weight shape mismatch"
-        );
+        matrix.validate()?;
         let mut b = self.0.borrow_mut();
         let mut w4 = None;
         let mut w8 = None;
@@ -592,7 +599,8 @@ impl Backend {
             .work
             .values()
             .map(|w| w.bytes + (w.input.capacity() + w.output.capacity()) as u64 * 4)
-            .sum();
+            .sum::<u64>()
+            + b.moe_work.values().map(|w| w.bytes).sum::<u64>();
         let material: usize = b
             .material
             .values()
@@ -1033,6 +1041,29 @@ impl Linear {
 mod tests {
     use super::*;
 
+    #[test]
+    fn quantized_weight_buffers_must_match_declared_dimensions() {
+        for bits in [4, 8] {
+            let mut matrix = QuantMatrix {
+                bits,
+                k: 64,
+                n: 128,
+                codes: vec![0; 64 * 128],
+                scales: vec![1.; 128],
+            };
+            assert!(matrix.validate().is_ok());
+            matrix.codes.pop();
+            assert!(matrix.validate().is_err());
+            matrix.codes.push(0);
+            matrix.scales.clear();
+            assert!(matrix.validate().is_err());
+            matrix.scales.resize(129, 1.);
+            assert!(matrix.validate().is_err());
+            matrix.k = usize::MAX;
+            assert!(matrix.validate().is_err());
+        }
+    }
+
     fn options(cache: &std::path::Path) -> Result<ModelOptions> {
         let mut options = ModelOptions {
             path: Default::default(),
@@ -1046,6 +1077,7 @@ mod tests {
             tune_cache: cache.into(),
             attention_tile: 256,
             vision_dtype: Default::default(),
+            experts: Default::default(),
             speculation: Default::default(),
         };
         configure_cpu(&mut options)?;

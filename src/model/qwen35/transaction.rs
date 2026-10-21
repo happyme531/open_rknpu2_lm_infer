@@ -27,8 +27,9 @@ impl Qwen35 {
         );
         self.check_input(tokens)?;
         ensure!(
-            tokens.len() <= 8 && tokens.len() <= self.options.chunk,
-            "verification requires at most min(8, ubatch) real rows"
+            tokens.len() <= 8.max(self.options.speculation.window() + 1)
+                && tokens.len() <= self.options.chunk,
+            "verification exceeds the reserved speculative window or ubatch"
         );
         self.reserve(self.position + tokens.len())?;
         self.round = Some(Round {

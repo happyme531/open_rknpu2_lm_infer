@@ -17,6 +17,7 @@ fn floating_profiles_preserve_weights_and_reload_without_search() -> Result<()> 
         tune_cache: cache.path().into(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        experts: Default::default(),
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;
@@ -96,6 +97,7 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
             tune_cache: Default::default(),
             attention_tile: 512,
             vision_dtype: Default::default(),
+            experts: Default::default(),
             speculation: Default::default(),
         };
         configure_cpu(&mut options)?;

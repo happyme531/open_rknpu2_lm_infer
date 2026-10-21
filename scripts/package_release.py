@@ -32,8 +32,12 @@ def main():
         binary = staging / f"{prefix}-linux-aarch64"
         (binary / "bin").mkdir(parents=True)
         shutil.copy2(root / "target/release/open_rknpu2_lm_infer", binary / "bin")
-        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock"]:
-            shutil.copy2(root / name, binary / name)
+        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock",
+                     "src/model/experts/Strata-LICENSE", "src/model/experts/Omni-LICENSE",
+                     "src/model/dflash/DeepSpec-LICENSE"]:
+            destination = binary / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / name, destination)
         docs = subprocess.check_output(
             ["git", "ls-files", "-z", "--", "llm_generated_docs"], cwd=root,
         ).decode().split("\0")

@@ -109,6 +109,7 @@ fn main() -> Result<()> {
         tune_cache: args.report.with_extension("cache"),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        experts: Default::default(),
         speculation: Default::default(),
     })?;
     let mut checks = Vec::new();
