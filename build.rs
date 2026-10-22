@@ -2,6 +2,10 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RK_NPU_MATMUL_ROOT");
+    println!("cargo:rerun-if-env-changed=RK_NPU_ENABLE_TRACE");
+    println!("cargo:rerun-if-env-changed=RK_NPU_PERFETTO_ROOT");
+    println!("cargo:rustc-check-cfg=cfg(rknpu_trace)");
+    let trace = env::var("RK_NPU_ENABLE_TRACE").is_ok_and(|v| v == "1" || v == "ON");
     let root = env::var_os("RK_NPU_MATMUL_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -13,20 +17,31 @@ fn main() {
     for path in ["CMakeLists.txt", "include", "src"] {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
-    let output = cmake::Config::new(&root)
+    let perfetto = env::var_os("RK_NPU_PERFETTO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("third_party/perfetto-v58.2"));
+    let mut native = cmake::Config::new(&root);
+    native
         .profile("Release")
         .define("BUILD_TESTING", "OFF")
-        .define("RK_NPU_ENABLE_TRACE", "OFF")
-        .build_target("rk_npu_matmul_static")
-        .build();
+        .define("RK_NPU_ENABLE_TRACE", if trace { "ON" } else { "OFF" });
+    if trace {
+        native.define("RK_NPU_PERFETTO_ROOT", &perfetto);
+    }
+    let output = native.build_target("rk_npu_matmul_static").build();
     let cpu_root =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("native/cpu_kernels");
     println!("cargo:rerun-if-changed={}", cpu_root.display());
-    let cpu_output = cmake::Config::new(cpu_root)
-        .out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
+    println!("cargo:rerun-if-changed=native/trace_bridge.cpp");
+    let mut cpu = cmake::Config::new(cpu_root);
+    cpu.out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
         .profile("Release")
-        .build_target("rknpu2_cpu_kernels")
-        .build();
+        .define("RK_NPU_ENABLE_TRACE", if trace { "ON" } else { "OFF" });
+    if trace {
+        cpu.define("RK_NPU_TRACE_ROOT", &root)
+            .define("RK_NPU_PERFETTO_ROOT", &perfetto);
+    }
+    let cpu_output = cpu.build_target("rknpu2_cpu_kernels").build();
     println!(
         "cargo:rustc-link-search=native={}",
         cpu_output.join("build").display()
@@ -37,6 +52,14 @@ fn main() {
         output.join("build").display()
     );
     println!("cargo:rustc-link-lib=static=rk_npu_matmul");
+    if trace {
+        println!("cargo:rustc-cfg=rknpu_trace");
+        println!("cargo:rustc-link-lib=dylib=rk_npu_trace");
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            output.join("build").display()
+        );
+    }
     for library in ["stdc++", "gomp", "pthread", "m", "dl"] {
         println!("cargo:rustc-link-lib={library}");
     }
@@ -50,6 +73,7 @@ fn main() {
         .header(include.join("rk_npu_quant_matmul.h").to_string_lossy())
         .header(include.join("rk_npu_w4a8_tune.h").to_string_lossy())
         .header(include.join("rk_npu_attention_f16.h").to_string_lossy())
+        .header(include.join("rk_npu_mla_f16.h").to_string_lossy())
         .header(include.join("rk_npu_mm_tune.h").to_string_lossy())
         .header(include.join("rk_npu_mm_gelu.h").to_string_lossy())
         .header(include.join("rk_npu_gdn.h").to_string_lossy())

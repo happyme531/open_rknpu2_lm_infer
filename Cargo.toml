@@ -8,6 +8,11 @@ license = "AGPL-3.0-only"
 autoexamples = false
 
 [[example]]
+name = "ling3tiny_check"
+path = "tests/tools/ling3tiny_check.rs"
+test = false
+
+[[example]]
 name = "minicpmv47_check"
 path = "tests/tools/minicpmv47_check.rs"
 test = false

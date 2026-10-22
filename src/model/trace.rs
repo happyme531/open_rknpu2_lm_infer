@@ -1,5 +1,94 @@
 use anyhow::{Context, Result};
+use std::ffi::CStr;
 use std::{io::Write, path::PathBuf};
+
+#[cfg(rknpu_trace)]
+unsafe extern "C" {
+    fn rknpu2_trace_start(path: *const std::ffi::c_char) -> i32;
+    fn rknpu2_trace_stop() -> i32;
+    fn rknpu2_trace_begin(name: *const std::ffi::c_char, layer: i32, rows: i32, position: i32);
+    fn rknpu2_trace_end();
+}
+
+/// Perfetto span in the NPU library's existing `llm` category.
+pub(crate) struct Span;
+impl Span {
+    #[inline]
+    pub fn new(name: &'static CStr, layer: i32, rows: usize, position: usize) -> Self {
+        #[cfg(rknpu_trace)]
+        unsafe {
+            rknpu2_trace_begin(name.as_ptr(), layer, rows as i32, position as i32);
+        }
+        #[cfg(not(rknpu_trace))]
+        let _ = (name, layer, rows, position);
+        Self
+    }
+}
+impl Drop for Span {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(rknpu_trace)]
+        unsafe {
+            rknpu2_trace_end();
+        }
+    }
+}
+#[inline]
+pub(crate) fn measure<T>(name: &'static CStr, operation: impl FnOnce() -> T) -> T {
+    let _span = Span::new(name, -1, 0, 0);
+    operation()
+}
+
+/// One native Perfetto recording per measured benchmark repetition.
+pub(crate) struct Recording {
+    active: bool,
+}
+impl Recording {
+    pub fn for_sample(case: usize, repetition: usize) -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os("OPEN_RKNPU2_PROFILE_TRACE") else {
+            return Ok(None);
+        };
+        #[cfg(not(rknpu_trace))]
+        {
+            let _ = (path, case, repetition);
+            anyhow::bail!("Perfetto requires RK_NPU_ENABLE_TRACE=ON at build time");
+        }
+        #[cfg(rknpu_trace)]
+        {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            let path =
+                PathBuf::from(path).with_extension(format!("case{case}.rep{repetition}.pftrace"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let path = CString::new(path.as_os_str().as_bytes())?;
+            anyhow::ensure!(
+                unsafe { rknpu2_trace_start(path.as_ptr()) } == 0,
+                "start Perfetto recording failed"
+            );
+            Ok(Some(Self { active: true }))
+        }
+    }
+    pub fn finish(mut self) -> Result<()> {
+        self.active = false;
+        #[cfg(rknpu_trace)]
+        anyhow::ensure!(
+            unsafe { rknpu2_trace_stop() } == 0,
+            "finish Perfetto recording failed"
+        );
+        Ok(())
+    }
+}
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if self.active {
+            #[cfg(rknpu_trace)]
+            unsafe {
+                rknpu2_trace_stop();
+            }
+        }
+    }
+}
 
 pub(crate) struct Trace {
     directory: Option<PathBuf>,

@@ -26,8 +26,12 @@ mod gated_delta;
 pub use gated_delta::GatedDelta;
 mod floating;
 pub use floating::{FloatBackend, FloatLinear};
+mod tf32;
+pub use tf32::{Tf32Backend, Tf32Linear};
 mod moe;
 pub use moe::Moe;
+mod mla;
+pub use mla::Mla;
 mod policy;
 #[cfg(test)]
 mod vision_tests;
@@ -938,7 +942,7 @@ impl BackendInner {
             fastest.base.config.k_tile = kt as i32;
             fastest.base.config.m_tile = m.min(64) as i32;
             fastest.base.config.n_tile = (n.div_ceil(64) * 64).min(1024) as i32;
-            fastest.base.config.npu_core_mask = self.options.npu_mask;
+            fastest.base.config.npu_core_mask = policy::w4_active_mask(self.options.npu_mask, n);
             fastest.base.config.cpu_threads = self.options.threads as i32;
             fastest.base.config.pipeline = RK_NPU_W4A8_PIPELINED as i32;
             fastest.base.cpu_core_mask = self.options.cpu_mask;

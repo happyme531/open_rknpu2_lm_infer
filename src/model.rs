@@ -7,6 +7,7 @@ pub(crate) mod cpu;
 pub mod dense;
 pub mod dflash;
 pub mod experts;
+pub mod ling3tiny;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
@@ -195,7 +196,7 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
         options.experts.storage != experts::Storage::Stream
             || matches!(
                 config["model_type"].as_str(),
-                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7")
+                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7" | "bailing_hybrid")
             ),
         "expert streaming requires a MoE checkpoint"
     );
@@ -212,11 +213,12 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
     crate::npu::configure_cpu(&mut options)?;
     let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
         Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
+        Some("bailing_hybrid") => Box::new(ling3tiny::Ling3Tiny::load(options)?),
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7") => {
             Box::new(qwen35::Qwen35::load(options)?)
         }
         other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, minicpmv4_7"
+            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, minicpmv4_7, bailing_hybrid"
         ),
     };
     if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {

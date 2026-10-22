@@ -58,6 +58,7 @@ pub(super) fn measure_phases(
     let before = model.stats();
     let mut pp = 0.0;
     if prompt > 0 {
+        let _span = crate::model::trace::Span::new(c"llm.prefill", -1, prompt, depth);
         let start = Instant::now();
         model.prefill(&tokens[depth..depth + prompt])?;
         pp = start.elapsed().as_secs_f64() * 1000.0;
@@ -72,6 +73,7 @@ pub(super) fn measure_phases(
     );
     let mut tg = 0.0;
     if generate > 0 {
+        let _span = crate::model::trace::Span::new(c"llm.decode", -1, generate, depth + prompt);
         let start = Instant::now();
         for &token in &tokens[depth + prompt..depth + prompt + generate] {
             model.forward(&[token])?;

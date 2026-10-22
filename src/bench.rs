@@ -89,7 +89,7 @@ pub fn run(
         .collect();
     let head_free_check = phases::verify_head_free(model.as_mut(), &tokens, chunk)?;
     let mut results = Vec::new();
-    for &case in cases {
+    for (case_index, &case) in cases.iter().enumerate() {
         let Case {
             prompt,
             generate,
@@ -103,7 +103,11 @@ pub fn run(
         let mut pg = Vec::new();
         let mut stage_samples = Vec::new();
         for repetition in 0..repetitions {
+            let recording = crate::model::trace::Recording::for_sample(case_index, repetition)?;
             let measurement = measure_phases(model.as_mut(), &tokens, case)?;
+            if let Some(recording) = recording {
+                recording.finish()?;
+            }
             let (prefill, decode) = (measurement.prefill, measurement.decode);
             eprintln!(
                 "bench: sample {}/{repetitions}, prefill {prefill:.3} ms, decode {decode:.3} ms",

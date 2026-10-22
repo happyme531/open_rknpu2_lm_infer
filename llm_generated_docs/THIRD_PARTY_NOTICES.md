@@ -36,6 +36,15 @@ organization of `ggml_compute_forward_gated_delta_net_one_chunk` from
 The adapter uses safetensors head ordering, rectangular state
 dimensions, FP32 state and compact replay.
 
+`native/cpu_kernels/kda.cpp` and `src/ops/kda.rs` adapt the same operator's
+KDA branch: per-key-channel exponential decay, delta update and transposed
+FP32 state. The Ling decoder follows the supplied inclusionAI
+`Ling-3.0-tiny/modeling_bailing_moe_v3.py` for KDA gate activation,
+adjacent-pair RoPE and bias-corrected group-limited sigmoid routing.
+That reference is Copyright 2025 Antgroup and The HuggingFace Inc. team,
+licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
 The four-accumulator NEON reduction in `native/cpu_kernels/vec.h` follows
 `ggml-cpu/vec.cpp` and `simd-mappings.h` at the same revision. The NEON
 SiLU/exp polynomial in `src/ops/activation.rs` adapts
