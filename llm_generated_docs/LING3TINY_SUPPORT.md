@@ -15,6 +15,13 @@ q_a/q_b/kv_a/g_proj 使用公共 NPU FP16 Linear，MoE router 使用公共 raw M
 浮点投影仍沿用公共 CPU 路径。首层使用 dense FFN，其余层使用 routed/shared experts。
 专家权重支持 resident 与 `--expert-storage stream --expert-store DIR`。
 
+KDA 的 Q/K/V/F/G 通过公共 `Projection` 按位宽合并，卷积、forget gate 和
+输出 gate 读取合并结果的 strided view。批量 L2 norm、decay/beta 和
+RMSNorm+sigmoid 按 head 并行，保持每个 head 的 FP32 求和顺序；输出门控
+原地完成。单 token 卷积直接调用同一 NEON 内核。Router 复用选择 scratch，
+组内 top-2 使用线性扫描，最终 top-k 保持分数降序及相同分数时 expert ID
+升序。MLA RoPE 预计算频率，同一位置的 Q heads 与共享 K 复用 sin/cos。
+
 | 部件 | 实现 |
 |---|---|
 | KDA | `native/cpu_kernels/kda.cpp`，ggml KDA recurrence，OpenMP/NEON，FP32 state |
@@ -275,3 +282,39 @@ sampling 和 stats；decode 开头懒创建的 FP16 M1 workspace 仍在计时内
 
 迁移后的 CPU 热点、MoE 既有计时细分及原始 trace，见
 [当前 CPU profile](LING3TINY_CPU_PROFILE_20261022.md)。
+
+## KDA 数据流与 CPU 路径优化，2026-10-23
+
+当前实现合并 KDA Q/K/V/F/G 投影，使用带 stride 的卷积/门控输入；批量 Norm/门控按 head 并行，M1 卷积直接执行，router 复用选择 scratch，MLA RoPE 共享角度。C++ KDA recurrence、beta 的保护浮点投影及输入值检查保持原有实现。
+
+主板 zt-firefly，CPU4–7 四线程 @2.4 GHz、NPU mask7 @1 GHz、DDR @2.112 GHz；同一 QQQ W4A8 mixed checkpoint，resident、ubatch128、context640，MT19937 seed42 的 640 个固定 token，连续 pp512→tg128。Prefill 不含输出头，decode 含输出头；完整调用排除加载、prepare、tokenization、sampling 和 stats。
+
+A1 在修改前运行并冻结旧二进制；完成修改和调优后依次运行 B1、B2、A2。每组一次 warmup、三次测量，每个版本保留全部六个样本。表中速度按中位耗时计算。
+
+| 阶段 | Baseline ms | 当前 ms | Baseline tok/s | 当前 tok/s | 吞吐变化 |
+|---|---:|---:|---:|---:|---:|
+| Prefill512 | 3280.167897 | 2932.179850 | 156.0896 | 174.6141 | +11.8679% |
+| Decode128 @512 | 6514.575136 | 6054.465383 | 19.6482 | 21.1414 | +7.5995% |
+
+| 配置/阶段 | 六个原始耗时 ms |
+|---|---|
+| baseline prefill | 3284.293687, 3280.195720, 3284.094768, 3280.140074, 3274.188836, 3274.307254 |
+| baseline decode | 6504.767599, 6668.249331, 6496.898338, 6526.861452, 6516.262157, 6512.888115 |
+| optimized prefill | 2944.461790, 2956.744024, 2943.320777, 2904.149760, 2921.038923, 2913.459290 |
+| optimized decode | 6071.075126, 6061.720096, 6067.831462, 6045.649068, 6047.210670, 6042.430487 |
+
+新增融合形状显式调优 M1/128：12 次搜索、122 次缓存命中、12 次 miss。四组正式测速均为 374 cache hits，miss/search/fallback/weight reload 均为零；head-free 检查通过，prefill head_ms=0。基线与当前版本分别使用独立调优缓存。
+
+workspace payload 从 322047708 增至 398154660 bytes（+72.58 MiB）；峰值 RSS 从 4691648–4691804 KiB 增至 4719272–4719648 KiB，增加约 27 MiB。
+
+验证：fmt、全 targets release Clippy `-D warnings` 通过；完整测试 118 passed、22 ignored。137-token 固定 prompt 加 3 个 continuation 的四行 logits（628736 个 FP32 值），当前 resident/streaming 与基线逐位一致；chunk1/3/7、head-free、取消后 reset/replay 也逐位一致。浮点投影/量化投影两种小型 fixture 对独立 NumPy 参考 NRMSE 分别为 2.50357e-5 / 1.83774e-5，均 4/4 top-1 一致。
+
+WikiText-2 原有 8×512 窗口、2040 targets 协议的 PPL 为 **11.97287615259297**；所有逐 token NLL 与 `results/ling-tf32-ppl-tuned.json` 完全一致。全部 11 个定频 runner 均 exit_code=0、restore_errors=[]。
+
+证据目录：`results/ling-review-20261023/`。`comparison.json` 汇总性能；`{a1,b1,b2,a2}.json` 保留原始测速；`baseline-fixed.json`、`optimized-fixed.json`、`stream.json` 和对应 `.f32` 保留 logits 对照；`ppl.json` 保留逐 token NLL。`baseline.sh`、`after.sh`、`quality.sh` 记录本次完整命令，`sources-before.tar.gz` 和 `changes.patch` 保存本次修改范围。
+
+板端冻结二进制为 `/tmp/ling-review-20261023/{baseline,optimized}`，检查器为同目录 `{baseline-check,optimized-check}`；调优缓存为 `{tune,tune-optimized}`。正式输出也已更新到 `/tmp/ling3tiny-target-20261022/release/`。
+
+优化后的分阶段 trace、MoE 内部明细及后续方向见 [2026-10-23 阶段分析](LING3TINY_TRACE_20261023.md)。
+
+KDA 四行融合与等价输入扫描的性能及验证见 [KDA CPU 优化](LING3TINY_KDA_CPU_20261023.md)：本次配对 prefill 吞吐 +9.77%，decode +0.62%，真实 logits 与 2040 个 NLL 保持一致。

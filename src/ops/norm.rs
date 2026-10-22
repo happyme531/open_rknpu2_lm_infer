@@ -1,5 +1,5 @@
 //! FP32 normalization with a fixed scalar reduction order.
-use super::activation::silu_norm;
+use super::activation::{sigmoid, silu_norm};
 use anyhow::{Result, ensure};
 use rayon::{ThreadPool, prelude::*};
 
@@ -8,13 +8,71 @@ pub fn l2_normalize(values: &mut [f32], width: usize) -> Result<()> {
         width > 0 && values.len().is_multiple_of(width),
         "L2 norm shape mismatch"
     );
-    for row in values.chunks_mut(width) {
-        let scale = (row.iter().map(|v| v * v).sum::<f32>() + 1e-6)
+    values.chunks_mut(width).for_each(l2_row);
+    Ok(())
+}
+
+fn l2_row(row: &mut [f32]) {
+    let scale = (row.iter().map(|v| v * v).sum::<f32>() + 1e-6)
+        .sqrt()
+        .recip();
+    for v in row {
+        *v *= scale;
+    }
+}
+
+/// Parallelize independent heads while retaining each head's reduction order.
+pub fn l2_normalize_parallel(pool: &ThreadPool, values: &mut [f32], width: usize) -> Result<()> {
+    ensure!(
+        width > 0 && values.len().is_multiple_of(width),
+        "L2 norm shape mismatch"
+    );
+    pool.install(|| values.par_chunks_mut(width).for_each(l2_row));
+    Ok(())
+}
+
+/// In-place weighted RMSNorm followed by sigmoid gating. The gate may be a
+/// strided view of a fused projection; a single token runs without dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn sigmoid_gated_norm_in_place(
+    pool: &ThreadPool,
+    values: &mut [f32],
+    gate: &[f32],
+    gate_stride: usize,
+    token_width: usize,
+    weight: &[f32],
+    epsilon: f32,
+) -> Result<()> {
+    let width = weight.len();
+    ensure!(
+        width > 0
+            && token_width > 0
+            && token_width.is_multiple_of(width)
+            && values.len().is_multiple_of(token_width)
+            && gate_stride >= token_width
+            && epsilon.is_finite()
+            && epsilon > 0.,
+        "sigmoid gated norm shape/epsilon mismatch"
+    );
+    let rows = values.len() / token_width;
+    ensure!(
+        gate.len() == rows.saturating_sub(1) * gate_stride + usize::from(rows > 0) * token_width,
+        "sigmoid gated norm gate shape mismatch"
+    );
+    let heads = token_width / width;
+    let apply = |(index, row): (usize, &mut [f32])| {
+        let start = (index / heads) * gate_stride + (index % heads) * width;
+        let scale = (row.iter().map(|v| v * v).sum::<f32>() / width as f32 + epsilon)
             .sqrt()
             .recip();
-        for v in row {
-            *v *= scale;
+        for ((x, w), g) in row.iter_mut().zip(weight).zip(&gate[start..start + width]) {
+            *x = ((*x * scale) * w) * sigmoid(*g);
         }
+    };
+    if rows <= 1 {
+        values.chunks_mut(width).enumerate().for_each(apply);
+    } else {
+        pool.install(|| values.par_chunks_mut(width).enumerate().for_each(apply));
     }
     Ok(())
 }
@@ -101,6 +159,55 @@ pub fn gated_norm_parallel_strided(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parallel_l2_and_strided_sigmoid_norm_preserve_scalar_bits() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for rows in [1, 3, 128] {
+            let (width, token_width, stride) = (128, 2048, 5 * 2048);
+            let input: Vec<f32> = (0..rows * token_width)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect();
+            let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i as f32 * 0.13).cos()).collect();
+            let mut expected = input.clone();
+            let mut actual = input.clone();
+            super::l2_normalize(&mut expected, width).unwrap();
+            super::l2_normalize_parallel(&pool, &mut actual, width).unwrap();
+            assert_eq!(actual, expected);
+            let gates: Vec<f32> = (0..input.len())
+                .map(|i| [-1000., -80., -1., -0., 0., 0.5, 80., 1000.][i % 8])
+                .collect();
+            let mut strided = vec![f32::NAN; (rows - 1) * stride + token_width];
+            for t in 0..rows {
+                strided[t * stride..t * stride + token_width]
+                    .copy_from_slice(&gates[t * token_width..(t + 1) * token_width]);
+            }
+            super::rms_norm(&input, &weight, 1e-6, false, &mut expected).unwrap();
+            for (x, &g) in expected.iter_mut().zip(&gates) {
+                *x *= super::sigmoid(g);
+            }
+            actual.copy_from_slice(&input);
+            super::sigmoid_gated_norm_in_place(
+                &pool,
+                &mut actual,
+                &strided,
+                stride,
+                token_width,
+                &weight,
+                1e-6,
+            )
+            .unwrap();
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+    }
+
     #[test]
     fn fused_strided_gates_preserve_normalization_bits() {
         let pool = rayon::ThreadPoolBuilder::new()

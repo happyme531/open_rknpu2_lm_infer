@@ -95,12 +95,16 @@ impl ConvState {
                 && self.channels.checked_mul(self.kernel) == Some(weights.len()),
             "convolution shape mismatch"
         );
-        pool.install(|| {
-            output
-                .par_chunks_mut(self.channels)
-                .enumerate()
-                .for_each(|(t, out)| kernel::row(self, input, stride, weights, t, out));
-        });
+        if rows == 1 {
+            kernel::row(self, input, stride, weights, 0, output);
+        } else {
+            pool.install(|| {
+                output
+                    .par_chunks_mut(self.channels)
+                    .enumerate()
+                    .for_each(|(t, out)| kernel::row(self, input, stride, weights, t, out));
+            });
+        }
         self.append_strided(input, stride, rows);
         Ok(())
     }
@@ -136,5 +140,41 @@ impl ConvState {
                 *value = input[(rows - keep + j) * stride + c];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn strided_decode_matches_batch_bits_and_history() -> Result<()> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        for channels in [5, 2048] {
+            let (rows, stride) = (9, channels * 5);
+            let weights: Vec<_> = (0..channels * 4)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect();
+            let input: Vec<_> = (0..(rows - 1) * stride + channels)
+                .map(|i| (i as f32 * 0.013).cos())
+                .collect();
+            let mut full = ConvState::new(channels, 4)?;
+            full.append(&vec![0.3; channels * 3])?;
+            let mut split = full.clone();
+            let mut expected = vec![0.; rows * channels];
+            let mut actual = expected.clone();
+            full.run_parallel_strided(&pool, &input, stride, &weights, &mut expected)?;
+            for t in 0..rows {
+                split.run_parallel_strided(
+                    &pool,
+                    &input[t * stride..t * stride + channels],
+                    stride,
+                    &weights,
+                    &mut actual[t * channels..(t + 1) * channels],
+                )?;
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(split, full);
+        }
+        Ok(())
     }
 }

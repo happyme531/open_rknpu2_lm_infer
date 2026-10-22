@@ -1,22 +1,20 @@
 use super::{config::Config, load::Loader};
 use crate::model::trace;
 use crate::{
-    model::projection::Linear,
+    model::projection::{Linear, Projection},
     npu::{FloatLinear, Mla},
-    ops::{activation::sigmoid, causal_conv::ConvState, kda, norm},
+    ops::{causal_conv::ConvState, kda, norm, rope::InterleavedRope},
 };
 use anyhow::Result;
 
 struct Convolution {
-    projection: Linear,
     weights: Vec<f32>,
     state: ConvState,
 }
 pub(super) struct Kda {
+    inputs: Projection,
     conv: Vec<Convolution>,
-    forget: Linear,
     beta: Linear,
-    gate: Linear,
     output: Linear,
     a: Vec<f32>,
     dt: Vec<f32>,
@@ -24,6 +22,7 @@ pub(super) struct Kda {
     state: kda::State,
 }
 pub(super) struct Latent {
+    rope: InterleavedRope,
     q_a: FloatLinear,
     q_b: FloatLinear,
     kv_a: FloatLinear,
@@ -38,22 +37,13 @@ pub(super) enum Mixer {
     Mla(Box<Latent>),
 }
 
-pub(super) fn rotate_interleaved(values: &mut [f32], position: usize, theta: f32) {
-    for (i, pair) in values.chunks_exact_mut(2).enumerate() {
-        let angle = position as f32 * theta.powf(-((2 * i) as f32) / 64.);
-        let (s, c) = angle.sin_cos();
-        let (a, b) = (pair[0], pair[1]);
-        pair[0] = a * c - b * s;
-        pair[1] = b * c + a * s;
-    }
-}
-
 impl Mixer {
     pub fn load(l: &Loader<'_>, p: &str, index: usize) -> Result<Self> {
         let c = l.config;
         if c.mla(index) {
             let weights = l.matrix(&format!("{p}.kv_b_proj"), 4096, 512)?;
             Ok(Self::Mla(Box::new(Latent {
+                rope: InterleavedRope::new(64, c.rope_theta)?,
                 q_a: l.fp16(&format!("{p}.q_a_proj"), 256, c.hidden)?,
                 q_b: l.fp16(&format!("{p}.q_b_proj"), 3072, 256)?,
                 kv_a: l.fp16(&format!("{p}.kv_a_proj_with_mqa"), 576, c.hidden)?,
@@ -69,16 +59,23 @@ impl Mixer {
                 let w = l.weights.store.get(&format!("{p}.{name}_conv1d.weight"))?;
                 w.require_shape(&[2048, 1, c.conv], "KDA convolution")?;
                 conv.push(Convolution {
-                    projection: l.linear(&format!("{p}.{name}_proj"), 2048, c.hidden)?,
                     weights: w.floats()?,
                     state: ConvState::new(2048, c.conv)?,
                 });
             }
             Ok(Self::Kda(Box::new(Kda {
+                inputs: Projection::load(
+                    l.backend,
+                    l.weights,
+                    l.cpu,
+                    ["q", "k", "v", "f", "g"]
+                        .into_iter()
+                        .map(|name| (format!("{p}.{name}_proj"), 2048))
+                        .collect(),
+                    c.hidden,
+                )?,
                 conv,
-                forget: l.linear(&format!("{p}.f_proj"), 2048, c.hidden)?,
                 beta: l.linear(&format!("{p}.b_proj"), 16, c.hidden)?,
-                gate: l.linear(&format!("{p}.g_proj"), 2048, c.hidden)?,
                 output: l.linear(&format!("{p}.o_proj"), c.hidden, 2048)?,
                 a: l.vector(&format!("{p}.A_log"), 16)?
                     .into_iter()
@@ -136,39 +133,54 @@ impl Mixer {
         let mut attended = vec![0.; rows * 2048];
         let (output, output_phase) = match self {
             Self::Kda(k) => {
+                let stride = 5 * 2048;
+                let mut projected = vec![0.; rows * stride];
+                let mut scratch = vec![0.; rows * k.inputs.scratch_width()];
+                trace::measure(c"ling.kda_input_projection", || {
+                    k.inputs.run(input, &mut projected, rows, &mut scratch)
+                })?;
                 let mut qkv = Vec::new();
-                for conv in &mut k.conv {
-                    let mut projected = vec![0.; rows * 2048];
-                    trace::measure(c"ling.kda_qkv_projection", || {
-                        conv.projection.run(input, &mut projected, rows)
-                    })?;
+                for (index, conv) in k.conv.iter_mut().enumerate() {
                     let mut values = vec![0.; rows * 2048];
+                    let first = index * 2048;
                     trace::measure(c"ling.kda_convolution", || {
-                        conv.state
-                            .run_parallel(&cpu.pool, &projected, &conv.weights, &mut values)
+                        conv.state.run_parallel_strided(
+                            &cpu.pool,
+                            &projected[first..(rows - 1) * stride + first + 2048],
+                            stride,
+                            &conv.weights,
+                            &mut values,
+                        )
                     })?;
                     qkv.push(values);
                 }
                 trace::measure(c"ling.kda_qk_norm_gates", || -> Result<()> {
-                    norm::l2_normalize(&mut qkv[0], 128)?;
-                    norm::l2_normalize(&mut qkv[1], 128)
+                    for values in &mut qkv[..2] {
+                        if rows == 1 {
+                            norm::l2_normalize(values, 128)?;
+                        } else {
+                            norm::l2_normalize_parallel(&cpu.pool, values, 128)?;
+                        }
+                    }
+                    Ok(())
                 })?;
                 let mut decay = vec![0.; rows * 2048];
                 let mut beta = vec![0.; rows * 16];
-                trace::measure(c"ling.kda_f_g_projection", || {
-                    k.forget.run(input, &mut decay, rows)
-                })?;
                 trace::measure(c"ling.kda_beta_projection", || {
                     k.beta.run(input, &mut beta, rows)
                 })?;
                 trace::measure(c"ling.kda_qk_norm_gates", || {
-                    for (i, x) in decay.iter_mut().enumerate() {
-                        *x = c.lower_bound * sigmoid((*x + k.dt[i % 2048]) * k.a[(i / 128) % 16]);
-                    }
-                    for b in &mut beta {
-                        *b = sigmoid(*b);
-                    }
-                });
+                    kda::activate_gates(
+                        &cpu.pool,
+                        &projected[3 * 2048..(rows - 1) * stride + 4 * 2048],
+                        stride,
+                        &k.a,
+                        &k.dt,
+                        c.lower_bound,
+                        &mut beta,
+                        &mut decay,
+                    )
+                })?;
                 trace::measure(c"ling.kda_recurrence", || {
                     k.state.run(
                         &qkv[0],
@@ -180,17 +192,16 @@ impl Mixer {
                         cpu.pool.current_num_threads(),
                     )
                 })?;
-                let mut gated = vec![0.; rows * 2048];
-                trace::measure(c"ling.kda_f_g_projection", || {
-                    k.gate.run(input, &mut gated, rows)
-                })?;
-                let mut normalized = vec![0.; rows * 2048];
-                trace::measure(c"ling.kda_output_norm_gate", || -> Result<()> {
-                    norm::rms_norm(&attended, &k.norm, c.epsilon, false, &mut normalized)?;
-                    for ((out, x), gate) in attended.iter_mut().zip(normalized).zip(gated) {
-                        *out = x * sigmoid(gate);
-                    }
-                    Ok(())
+                trace::measure(c"ling.kda_output_norm_gate", || {
+                    norm::sigmoid_gated_norm_in_place(
+                        &cpu.pool,
+                        &mut attended,
+                        &projected[4 * 2048..],
+                        stride,
+                        2048,
+                        &k.norm,
+                        c.epsilon,
+                    )
                 })?;
                 (&k.output, c"ling.kda_output_projection")
             }
@@ -226,14 +237,12 @@ impl Mixer {
                         )?;
                         rope[r * 64..(r + 1) * 64]
                             .copy_from_slice(&kv[r * 576 + 512..(r + 1) * 576]);
-                        rotate_interleaved(
+                        m.rope.apply(
+                            &mut q[r * 3072..(r + 1) * 3072],
                             &mut rope[r * 64..(r + 1) * 64],
+                            192,
                             position + r,
-                            c.rope_theta,
-                        );
-                        for head in q[r * 3072..(r + 1) * 3072].chunks_mut(192) {
-                            rotate_interleaved(&mut head[128..], position + r, c.rope_theta);
-                        }
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -256,7 +265,10 @@ mod tests {
     fn interleaved_rope_rotates_adjacent_pairs_at_nonzero_position() {
         let mut x: Vec<_> = (0..64).map(|i| (i as f32 * 0.13).sin()).collect();
         let before = x.clone();
-        rotate_interleaved(&mut x, 37, 6_000_000.);
+        InterleavedRope::new(64, 6_000_000.)
+            .unwrap()
+            .apply(&mut [], &mut x, 192, 37)
+            .unwrap();
         for i in 0..32 {
             let angle = 37_f64 * 6_000_000_f64.powf(-(i as f64) / 32.);
             let (s, c) = angle.sin_cos();

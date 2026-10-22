@@ -42,11 +42,21 @@ inline void mad(size_t n, float * x, const float * key, float delta) {
     for (; i < n; ++i) x[i] += delta * key[i];
 }
 
+inline float decay_at(float decay, size_t) { return decay; }
+inline float decay_at(const float * decay, size_t i) { return decay[i]; }
+#if defined(__aarch64__)
+inline float decay_lanes(float decay, size_t) { return decay; }
+inline float32x4_t decay_lanes(const float * decay, size_t i) { return vld1q_f32(decay + i); }
+inline float32x4_t apply_decay(float32x4_t state, float decay) { return vmulq_n_f32(state, decay); }
+inline float32x4_t apply_decay(float32x4_t state, float32x4_t decay) { return vmulq_f32(state, decay); }
+#endif
+
 // The same arithmetic and reduction as ggml, merging decay+dot and mad+dot
-// while each state row is in registers. No FP16 state or relaxed FP flags.
-template<bool output>
+// while each state row is in registers. Decay is scalar for GDN and per-key
+// channel for KDA. No FP16 state or relaxed FP flags.
+template<bool output, class Decay>
 inline float update_row(size_t n, float * state, const float * key,
-                        float decay, float beta, float value, const float * query) {
+                        Decay decay, float beta, float value, const float * query) {
     size_t i = 0;
     float predicted = 0;
 #if defined(__aarch64__)
@@ -54,7 +64,7 @@ inline float update_row(size_t n, float * state, const float * key,
     for (; i + 16 <= n; i += 16) {
         for (int j = 0; j < 4; ++j) {
             const size_t at = i + 4*j;
-            const float32x4_t s = vmulq_n_f32(vld1q_f32(state + at), decay);
+            const float32x4_t s = apply_decay(vld1q_f32(state + at), decay_lanes(decay, at));
             vst1q_f32(state + at, s);
             sum[j] = vfmaq_f32(sum[j], s, vld1q_f32(key + at));
         }
@@ -62,7 +72,7 @@ inline float update_row(size_t n, float * state, const float * key,
     predicted = vaddvq_f32(vaddq_f32(vaddq_f32(sum[0], sum[2]), vaddq_f32(sum[1], sum[3])));
 #endif
     for (; i < n; ++i) {
-        state[i] *= decay;
+        state[i] *= decay_at(decay, i);
         predicted += state[i] * key[i];
     }
     const float delta = (value - predicted) * beta;

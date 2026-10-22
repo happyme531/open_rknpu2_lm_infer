@@ -4,6 +4,7 @@
 // Full license: ../../llm_generated_docs/THIRD_PARTY_NOTICES.md.
 #include "kda.h"
 #include "vec.h"
+#include "block.h"
 #include <vector>
 
 extern "C" void rknpu2_kda_run(const rknpu2_kda_params * p) {
@@ -12,7 +13,7 @@ extern "C" void rknpu2_kda_run(const rknpu2_kda_params * p) {
     const float scaling = 1.0f / std::sqrt(static_cast<float>(d));
     #pragma omp parallel num_threads(p->threads)
     {
-        std::vector<float> decay(d), delta(d);
+        std::vector<float> decay(d);
         #pragma omp for schedule(static)
         for (size_t h = 0; h < p->heads; ++h) {
             float * state = p->state + h*d*d;
@@ -21,16 +22,18 @@ extern "C" void rknpu2_kda_run(const rknpu2_kda_params * p) {
                 const float * key = p->key + at;
                 const float * query = p->query + at;
                 for (size_t k = 0; k < d; ++k) decay[k] = std::exp(p->log_decay[at+k]);
-                for (size_t v = 0; v < d; ++v) {
-                    float * row = state + v*d;
-                    for (size_t k = 0; k < d; ++k) row[k] *= decay[k];
-                    delta[v] = (p->value[at+v] - dot(d, row, key)) * p->beta[t*p->heads+h];
+                const float beta = p->beta[t*p->heads+h];
+                size_t v = 0;
+#if defined(__aarch64__)
+                if (d == 128) {
+                    for (; v + 4 <= d; v += 4)
+                        update_block<4, true>(state + v*d, key, decay.data(), beta,
+                            p->value + at + v, query, p->output + at + v, scaling);
                 }
-                for (size_t v = 0; v < d; ++v) {
-                    float * row = state + v*d;
-                    mad(d, row, key, delta[v]);
-                    p->output[at+v] = dot(d, row, query) * scaling;
-                }
+#endif
+                for (; v < d; ++v)
+                    p->output[at+v] = update_row<true>(d, state + v*d, key,
+                        decay.data(), beta, p->value[at+v], query) * scaling;
             }
         }
     }

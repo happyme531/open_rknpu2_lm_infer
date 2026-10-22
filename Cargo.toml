@@ -8,6 +8,11 @@ license = "AGPL-3.0-only"
 autoexamples = false
 
 [[example]]
+name = "kda_check_cost"
+path = "tests/tools/kda_check_cost.rs"
+test = false
+
+[[example]]
 name = "ling3tiny_check"
 path = "tests/tools/ling3tiny_check.rs"
 test = false

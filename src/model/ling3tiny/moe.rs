@@ -54,49 +54,107 @@ pub(super) enum FeedForward {
 }
 pub(super) struct Routed {
     router: Tf32Linear,
+    routing: RoutingScratch,
     bias: Vec<f32>,
     bank: Bank,
     shared: Dense,
 }
 
-/// Bias affects group/expert selection; contribution weights use unbiased sigmoid.
-pub(super) fn routes(logits: &[f32], bias: &[f32], c: &Config) -> Result<(Vec<i32>, Vec<f32>)> {
-    ensure!(
-        logits.len() == c.experts
-            && bias.len() == c.experts
-            && logits.iter().all(|x| x.is_finite()),
-        "Ling router shape/value mismatch"
-    );
-    let scores: Vec<_> = logits.iter().map(|&x| sigmoid(x)).collect();
-    let selected: Vec<_> = scores.iter().zip(bias).map(|(s, b)| s + b).collect();
-    let width = c.experts / c.groups;
-    let mut group_scores = Vec::new();
-    for group in selected.chunks_exact(width) {
-        let mut indices: Vec<_> = (0..width).collect();
-        indices.sort_unstable_by(|&a, &b| group[b].total_cmp(&group[a]).then(a.cmp(&b)));
-        group_scores.push(group[indices[0]] + group[indices[1]]);
+struct RoutingScratch {
+    scores: Vec<f32>,
+    selected: Vec<f32>,
+    group_scores: Vec<f32>,
+    groups: Vec<usize>,
+    enabled: Vec<bool>,
+    candidates: Vec<usize>,
+}
+impl RoutingScratch {
+    fn new(c: &Config) -> Self {
+        Self {
+            scores: vec![0.; c.experts],
+            selected: vec![0.; c.experts],
+            group_scores: vec![0.; c.groups],
+            groups: (0..c.groups).collect(),
+            enabled: vec![false; c.groups],
+            candidates: Vec::with_capacity(c.experts),
+        }
     }
-    let mut groups: Vec<_> = (0..c.groups).collect();
-    groups.sort_unstable_by(|&a, &b| group_scores[b].total_cmp(&group_scores[a]).then(a.cmp(&b)));
-    groups.truncate(c.top_groups);
-    let mut ids: Vec<_> = (0..c.experts)
-        .filter(|id| groups.contains(&(id / width)))
-        .collect();
-    ids.sort_unstable_by(|&a, &b| selected[b].total_cmp(&selected[a]).then(a.cmp(&b)));
-    ids.truncate(c.top);
-    let sum = ids.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
-    let weights = ids
-        .iter()
-        .map(|&i| {
-            let weight = if c.top > 1 {
-                scores[i] / sum
+    /// Bias affects selection; contribution weights use unbiased sigmoid.
+    fn routes(
+        &mut self,
+        logits: &[f32],
+        bias: &[f32],
+        c: &Config,
+        ids: &mut [i32],
+        weights: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            logits.len() == c.experts
+                && bias.len() == c.experts
+                && ids.len() == c.top
+                && weights.len() == c.top
+                && logits.iter().all(|x| x.is_finite()),
+            "Ling router shape/value mismatch"
+        );
+        for (i, (&logit, &bias)) in logits.iter().zip(bias).enumerate() {
+            self.scores[i] = sigmoid(logit);
+            self.selected[i] = self.scores[i] + bias;
+        }
+        let width = c.experts / c.groups;
+        for (group, score) in self
+            .selected
+            .chunks_exact(width)
+            .zip(&mut self.group_scores)
+        {
+            let (mut first, mut second) = (group[0], group[1]);
+            if second.total_cmp(&first).is_gt() {
+                std::mem::swap(&mut first, &mut second);
+            }
+            for &value in &group[2..] {
+                if value.total_cmp(&first).is_gt() {
+                    second = first;
+                    first = value;
+                } else if value.total_cmp(&second).is_gt() {
+                    second = value;
+                }
+            }
+            *score = first + second;
+        }
+        if c.top_groups < c.groups {
+            self.groups.select_nth_unstable_by(c.top_groups, |&a, &b| {
+                self.group_scores[b]
+                    .total_cmp(&self.group_scores[a])
+                    .then(a.cmp(&b))
+            });
+        }
+        self.enabled.fill(false);
+        for &group in &self.groups[..c.top_groups] {
+            self.enabled[group] = true;
+        }
+        self.candidates.clear();
+        self.candidates
+            .extend((0..c.experts).filter(|id| self.enabled[id / width]));
+        let compare = |&a: &usize, &b: &usize| {
+            self.selected[b]
+                .total_cmp(&self.selected[a])
+                .then(a.cmp(&b))
+        };
+        if c.top < self.candidates.len() {
+            self.candidates.select_nth_unstable_by(c.top, compare);
+        }
+        let chosen = &mut self.candidates[..c.top];
+        chosen.sort_unstable_by(compare);
+        let sum = chosen.iter().map(|&i| self.scores[i]).sum::<f32>() + 1e-20;
+        for ((id, weight), &expert) in ids.iter_mut().zip(weights).zip(chosen.iter()) {
+            *id = expert as i32;
+            *weight = (if c.top > 1 {
+                self.scores[expert] / sum
             } else {
-                scores[i]
-            };
-            weight * c.routing_scale
-        })
-        .collect();
-    Ok((ids.into_iter().map(|i| i as i32).collect(), weights))
+                self.scores[expert]
+            }) * c.routing_scale;
+        }
+        Ok(())
+    }
 }
 impl FeedForward {
     pub fn load(
@@ -147,6 +205,7 @@ impl FeedForward {
         );
         Ok(Self::Routed(Box::new(Routed {
             router: l.router.load(&router.floats()?, c.hidden, c.experts)?,
+            routing: RoutingScratch::new(c),
             bias: l.vector(&format!("{p}.gate.expert_bias"), c.experts)?,
             bank,
             shared: Dense::load(l, &format!("{p}.shared_experts"), c.shared_intermediate)?,
@@ -171,12 +230,14 @@ impl FeedForward {
                     r.router.run(input, &mut logits, rows)
                 })?;
                 let (ids, weights) = trace::measure(c"ling.moe_router", || -> Result<_> {
-                    let mut ids = Vec::with_capacity(rows * c.top);
-                    let mut weights = Vec::with_capacity(rows * c.top);
-                    for row in logits.chunks_exact(c.experts) {
-                        let (i, w) = routes(row, &r.bias, c)?;
-                        ids.extend(i);
-                        weights.extend(w);
+                    let mut ids = vec![0; rows * c.top];
+                    let mut weights = vec![0.; rows * c.top];
+                    for ((row, ids), weights) in logits
+                        .chunks_exact(c.experts)
+                        .zip(ids.chunks_mut(c.top))
+                        .zip(weights.chunks_mut(c.top))
+                    {
+                        r.routing.routes(row, &r.bias, c, ids, weights)?;
                     }
                     Ok((ids, weights))
                 })?;
@@ -203,6 +264,73 @@ impl FeedForward {
 mod tests {
     use super::*;
     #[test]
+    fn selection_matches_sorted_oracle_with_ties_and_reused_scratch() -> Result<()> {
+        let mut c = Config::parse(&super::super::config::official())?;
+        for (experts, groups, top_groups, top) in [(128, 8, 4, 8), (8, 4, 4, 1), (8, 4, 2, 4)] {
+            c.experts = experts;
+            c.groups = groups;
+            c.top_groups = top_groups;
+            c.top = top;
+            let mut scratch = RoutingScratch::new(&c);
+            for step in 0..100 {
+                let logits: Vec<_> = (0..experts)
+                    .map(|i| {
+                        if step % 10 == 0 {
+                            0.
+                        } else {
+                            ((i * 17 + step * 31) % 29) as f32 * 0.25 - 3.5
+                        }
+                    })
+                    .collect();
+                let bias: Vec<_> = (0..experts)
+                    .map(|i| {
+                        if step % 10 == 0 {
+                            0.
+                        } else {
+                            ((i * 13 + step * 7) % 11) as f32 * 0.125 - 0.625
+                        }
+                    })
+                    .collect();
+                let scores: Vec<_> = logits.iter().map(|&x| sigmoid(x)).collect();
+                let selected: Vec<_> = scores.iter().zip(&bias).map(|(x, b)| x + b).collect();
+                let width = experts / groups;
+                let group_scores: Vec<_> = selected
+                    .chunks(width)
+                    .map(|g| {
+                        let mut sorted = g.to_vec();
+                        sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+                        sorted[0] + sorted[1]
+                    })
+                    .collect();
+                let mut groups: Vec<_> = (0..c.groups).collect();
+                groups.sort_unstable_by(|&a, &b| {
+                    group_scores[b].total_cmp(&group_scores[a]).then(a.cmp(&b))
+                });
+                groups.truncate(top_groups);
+                let mut reference: Vec<_> = (0..experts)
+                    .filter(|i| groups.contains(&(i / width)))
+                    .collect();
+                reference
+                    .sort_unstable_by(|&a, &b| selected[b].total_cmp(&selected[a]).then(a.cmp(&b)));
+                reference.truncate(top);
+                let sum = reference.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
+                let expected: Vec<_> = reference
+                    .iter()
+                    .map(|&i| (if top > 1 { scores[i] / sum } else { scores[i] }) * c.routing_scale)
+                    .collect();
+                let mut ids = vec![0; top];
+                let mut weights = vec![0.; top];
+                scratch.routes(&logits, &bias, &c, &mut ids, &mut weights)?;
+                assert_eq!(
+                    ids,
+                    reference.into_iter().map(|i| i as i32).collect::<Vec<_>>()
+                );
+                assert_eq!(weights, expected);
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn group_bias_selects_experts_but_weights_use_original_sigmoid() -> Result<()> {
         let mut c = Config::parse(&super::super::config::official())?;
         c.experts = 8;
@@ -211,7 +339,9 @@ mod tests {
         c.top = 3;
         let logits = [3., 2., -2., -1., 0., 0.5, 4., 3.5];
         let bias = [0., 0., 3., 3., 4., 4., 0., 0.];
-        let (ids, weights) = routes(&logits, &bias, &c)?;
+        let mut ids = vec![0; c.top];
+        let mut weights = vec![0.; c.top];
+        RoutingScratch::new(&c).routes(&logits, &bias, &c, &mut ids, &mut weights)?;
         assert_eq!(ids, [5, 4, 3]);
         let sum = sigmoid(0.5) + sigmoid(0.) + sigmoid(-1.);
         for (actual, value) in weights.iter().zip([0.5, 0., -1.]) {
