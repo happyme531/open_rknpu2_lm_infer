@@ -266,6 +266,7 @@ impl LanguageModel for Ling3Tiny {
             "attention_backend":"native-npu-mla-absorbed-stable-softmax","attention_cache_payload_bytes":kv_bytes,
             "mla_projection_backend":"native-npu-fp16","router_projection_backend":"native-npu-tf32",
             "kda_backend":"cpu-fp32","kv_dtype":"float16","expert_storage":if self.paging.is_some() {"stream"} else {"resident"},
+            "joint_moe_shared_layers":self.layers.iter().filter(|l| l.ffn.joint_shared()).count(),
             "expert_paging":self.paging.as_ref().map(|p| p.stats()),"lm_head_weight_bits":self.head.bits(),
             "tuning_enabled":self.options.tune,"tuning_search_enabled":self.options.tune_search,
             "trace_directory":self.trace.path()});

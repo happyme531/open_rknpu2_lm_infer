@@ -49,11 +49,14 @@ def query(processor, sql, trace):
                     "ling.kda_recurrence": 18 * factor,
                     "ling.kda_convolution": 54 * factor,
                     "ling.mla_core": 6 * factor,
-                    "ling.moe_routed_experts": 23 * factor,
                     "ling.output_head": 0 if factor == 4 else 128}
         for stage, count in expected.items():
             if calls.get(stage, 0) != count:
                 raise ValueError(f"{trace}: {phase}/{stage} calls {calls.get(stage)} != {count}")
+        separate = calls.get("ling.moe_routed_experts", 0)
+        joint = calls.get("ling.moe_routed_shared_experts", 0)
+        if separate + joint != 23 * factor or calls.get("ling.shared_expert_ffn", 0) != separate:
+            raise ValueError(f"{trace}: incomplete or repeated routed/shared FFN calls")
         moe = next(r for r in data["moe"] if r["phase"] == phase)
         if moe["calls"] != 23 * factor:
             raise ValueError(f"{trace}: incomplete MoE timings")
@@ -64,6 +67,7 @@ def summarize(primary, detail, control):
     result = {}
     groups = {
         "routed_experts": ["ling.moe_routed_experts"],
+        "routed_shared_experts": ["ling.moe_routed_shared_experts"],
         "shared_expert": ["ling.shared_expert_ffn"],
         "kda_recurrence": ["ling.kda_recurrence"],
         "kda_projection": ["ling.kda_input_projection", "ling.kda_output_projection"],

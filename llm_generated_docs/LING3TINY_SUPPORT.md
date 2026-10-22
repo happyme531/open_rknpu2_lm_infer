@@ -318,3 +318,84 @@ WikiText-2 原有 8×512 窗口、2040 targets 协议的 PPL 为 **11.9728761525
 优化后的分阶段 trace、MoE 内部明细及后续方向见 [2026-10-23 阶段分析](LING3TINY_TRACE_20261023.md)。
 
 KDA 四行融合与等价输入扫描的性能及验证见 [KDA CPU 优化](LING3TINY_KDA_CPU_20261023.md)：本次配对 prefill 吞吐 +9.77%，decode +0.62%，真实 logits 与 2040 个 NLL 保持一致。
+
+## 算子库更新与 resident MoE 联合调度，2026-10-23
+
+本轮核对提交图并 fetch 远端时，`origin/main` 仍为 `0fd946e`。较新的本地生产线是 `perf/moe-ffn`：`7d653da` 合并 `b917811` 的 MoE/trace 与 `6df8ec8` 的 W4A8 FFN 优化，随后为 `c96930f` 的 FP32 middle 优化和 `7a996a2` 的 routed W4/shared W8 联合调度。本次在 `7a996a2` 上补齐集成所需的 cache-slot API 和 gather 修复，算子库最终指向 `4e57e12b2fb865b65dfe38ed59e10e7a82a5f62e`。
+
+```text
+* 4e57e12 (HEAD -> perf/moe-ffn) feat: support cached routed W4 with jointly scheduled shared W8
+* 7a996a2 (local-main/perf/moe-ffn) perf: jointly schedule routed W4 and shared W8 FFNs (2026-10-23 03:34 +0800)
+* c96930f perf: fuse MoE CPU SwiGLU and Down packing (2026-10-23 02:56 +0800)
+*   7d653da Merge latest MoE library changes from Ling worktree
+|\
+| * b917811 (feat/minicpmv47-moe-w4) perf: expose MoE stage timings in configurable traces
+| * 0fd946e (origin/main, origin/feat/minicpmv47-moe-w4, origin/HEAD) feat: add all-W4 MoE and expert slot banks (2026-10-21 10:23 +0800)
+| * f7ba205 fix: cap INT4 task width at 8128 (2026-10-21 10:23 +0800)
+* | 6df8ec8 perf: fuse W4A8 CPU epilogue and FFN scales (2026-10-22 17:34 +0800)
+|/
+* 332fa0d fix: honor caller-sized Attention capacity (2026-10-21 04:30 +0800)
+```
+
+符合条件的 resident 层使用同一 MoE 调用执行 routed W4 和 shared W8：共享输入量化、调度和输出 combine，删除对应的独立 shared FFN 调用与中间输出加法。条件为 shared gate/up/down 均 W8、shared/routed intermediate 相同；当前真实模型的 23 个 MoE 层全部命中，`joint_moe_shared_layers=23`。protected floating 或其他 shared 格式沿用各自原有投影；没有通过捕获运行错误切换执行方式。streaming 仍按专家分批执行，保持 shared 每个 token 独立计算一次，避免在 assignment 批次中重复贡献。
+
+算子库新增 `rk_npu_moe_w4_slots_create`，将常驻 shared W8 与可导入 routed W4 slots 放入同一权重对象。routed blob 保持 version 2，现有 expert store 可直接使用；shared 不可作为 routed slot 导入/导出。Rust workspace key 区分是否带 shared。新增 trace 阶段 `ling.moe_routed_shared_experts`，汇总脚本同时兼容联合与独立阶段。
+
+新增测试还发现原 gather 固定合并 5 行：H2048/M5 会超过既有 7680-channel copy 限制，返回 PARAM。已按该字节上限合并连续行，并拆分更宽的单行；未放宽底层 copy 的合法范围。H2048 的批量/逐行对照和 H8128 独立 oracle 已通过。
+
+### 三版本配对性能
+
+zt-firefly，CPU4–7 四线程 @2.4 GHz、NPU mask7 @1 GHz、DDR @2.112 GHz，trace 关闭。同一 Ling-3.0-tiny QQQ W4A8 mixed checkpoint、已有 expert store 与 tune cache，resident、context640、ubatch128，MT19937 seed42 的固定 token，连续 pp512→tg128。Prefill 不含输出头；decode 每个 token 含输出头。完整调用排除加载、prepare、tokenization、sampling 与 stats。
+
+A=更新前（outer `518c0d4` + native `b917811`，已包含本轮 KDA 优化）；B=只升级算子库（outer `518c0d4` + native `7a996a2`，未接入 shared）；C=本节联合调度实现。执行顺序 A1→B1→C1→C2→B2→A2，每组一次 warmup、三次测量，每个版本六个样本，全部保留。以中位耗时计算吞吐。
+
+| 版本 | Prefill512 ms | Prefill tok/s | Decode128 @512 ms | Decode tok/s | pp512+tg128 ms |
+|---|---:|---:|---:|---:|---:|
+| A 更新前 | 2628.367532 | 194.7977 | 5989.699242 | 21.3700 | 8609.993049 |
+| B 只升级库 | 2538.412046 | 201.7009 | 5982.728177 | 21.3949 | 8519.931979 |
+| C 联合调度接入 | 2523.735343 | 202.8739 | 5656.338061 | 22.6295 | 8176.479006 |
+
+相对 A，C 的 prefill/decode 吞吐分别 **+4.15% / +5.89%**，组合吞吐 +5.30%。相对 B，接入本身为 **+0.58% / +5.77%**，组合吞吐 +4.20%。接入收益主要在 decode；prefill 的增量很小。各组 prefill 有漂移，未删除较慢样本。这是含新 FP32 数值行为的整模型版本对比，不能单凭这些数据归因到某一个内部阶段。
+
+| 版本/阶段 | 六个原始耗时 ms |
+|---|---|
+| A 更新前 prefill | 2646.148189, 2662.428348, 2660.563409, 2605.203807, 2610.586875, 2586.783664 |
+| A 更新前 decode | 5981.710102, 6000.236997, 5994.677178, 5986.924000, 5980.995509, 5992.474485 |
+| B 只升级库 prefill | 2576.380952, 2568.894943, 2575.550566, 2506.011415, 2500.789060, 2507.929148 |
+| B 只升级库 decode | 6002.038645, 6006.762244, 6010.377205, 5944.592143, 5963.417710, 5953.725798 |
+| C 联合调度接入 prefill | 2545.524570, 2567.484133, 2567.309423, 2501.946115, 2477.276936, 2498.449864 |
+| C 联合调度接入 decode | 5656.412583, 5656.263539, 5658.872239, 5649.074743, 5660.913348, 5650.967974 |
+
+A/B 每组 374 cache hits，C 每组 350；全部正式测速的 miss、在线搜索、strategy fallback、weight reload 均为 0。六组 head-free continuation 检查逐位一致，prefill head_ms=0。C 的普通 W8 linear 数量从 47 降为 1，shared 权重由 mixed MoE 持有。
+
+B→C 的设备 weight payload 为 3961225216→3960989696 bytes，workspace payload 为 398230104→397002552 bytes；设备 payload 不等于进程 RSS。峰值 RSS 为 4719432–4719476→4737036–4737216 KiB（约增加 17 MiB），测后 RSS 为 4500956–4501260→4505516–4506512 KiB。模型加载约 13.1–13.3 秒，不计入上表。
+
+### 验证结果与数值边界
+
+fmt、all-target release Clippy `-D warnings`、119 项常规测试通过，22 项 ignored。新增 mixed slot 测试对照独立打包权重，覆盖 slot 置换、重复路由、非单位 route 总和、M1/5/128、1/2/3 NPU 核，结果逐位相同，并对照单行调用；H8128 的独立整数/浮点 oracle 通过。W8 normal/native、mixed K512+64、NPU-middle 回归及公共 C header 编译也通过。
+
+**模型数值一致性检查未通过，不能称为无损替换。** 137 个固定 token 加 3 个 continuation 的 4 行 logits（628736 个 FP32 值）：C 相对 A 的 NRMSE 为 0.02220324，相对 B 为 0.02159579，top-1 均 4/4 相同；C 的 chunk1/3/7 相对 chunk128 的 NRMSE 为 0.02331670。head-free 和取消后 reset/replay 仍逐位一致。streaming 的基准 logits 与 B 逐位一致，分块误差仍为 0.02174686，因此当前 resident/streaming 不再逐位一致。
+
+这些报告保留 `--max-nrmse 0`，`fixed` 和 `stream` 命令均以 1 退出；分块误差也超过工具默认 0.01 门槛，未提高阈值掩盖失败。库的 degree-7 FP32 SwiGLU 与原 CPU exp 数值规则不同；上层稠密 FFN 仍按 M≥32 选择 fused 路径，小分块使用原激活。该路径差异与分块现象吻合，尚未逐层隔离所有误差来源。联合 shared W8 还采用库的 middle/量化规则，不能假设与原独立 W8 FFN 逐位相同。
+
+同一 WikiText-2 8×512 窗口、score_start257、2040 targets 的 PPL：
+
+| 版本 | PPL |
+|---|---:|
+| A 更新前 | 11.972876152593 |
+| B 只升级库 | 11.963005828261 |
+| C 联合调度接入 | 11.975940817067 |
+
+C 相对 A 为 +0.0256%，相对 B 为 +0.1081%。逐 token NLL 不再相同；这只是短窗口质量检查，不能外推完整基准或称为质量等价。后续若要求跨分块和存储模式一致，需要统一各路径的激活与量化数值规则。
+
+所有本轮时钟 runner 的 restore_errors 均为空。最终 native 回归、六组测速和 PPL 的退出码均为 0；模型固定输入的严格比较失败如上，原始失败结果保留。
+
+最终证据为 `results/ling-moe-joint-20261023/`：`comparison.json`、`{a1,b1,c1,c2,b2,a2}.json`、`fixed.json`、`stream.json`、`ppl.json` 及 `.f32`、clock/log 文件。`run.sh`、`paired.sh`、`extra-native-after.sh` 与 `summarize.py` 保留命令和汇总方式。最终 native 回归日志为 `native.log`、`native-wide.log`、`native-cpu.log`、`native-npu.log`、`native-split.log`。中间版本升级结果分别保留在 `results/ling-native-update-20261023/`（c96930f）和 `results/ling-native-final-20261023/`（7a996a2，未接入）。
+
+冻结二进制 SHA-256：
+
+```text
+cec5dda606e3faa35a114390aa2278a278a88f703d84a0d61382d9326948fb42  /tmp/ling-kda-optimized
+05d58841704d13fe278677faba148d72ff5293e419fa1a545723c14ff8a2c497  /tmp/ling-native-7a996a2
+ca5b936725e8471839cd6e37bee17984aa2ca63d079c843597ff6d3e582fea37  /tmp/ling-moe-joint
+```

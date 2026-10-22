@@ -2,6 +2,7 @@ use super::{config::Config, load::Loader};
 use crate::model::trace;
 use crate::{
     model::{
+        checkpoint::concatenate,
         cpu::Cpu,
         experts::{Paged, Paging, store::Store},
         projection::{Linear, Projection},
@@ -57,7 +58,7 @@ pub(super) struct Routed {
     routing: RoutingScratch,
     bias: Vec<f32>,
     bank: Bank,
-    shared: Dense,
+    shared: Option<Dense>,
 }
 
 struct RoutingScratch {
@@ -169,6 +170,27 @@ impl FeedForward {
             return Ok(Self::Dense(Dense::load(l, p, c.dense_intermediate)?));
         }
         let layer = index - c.dense_layers;
+        let shared_names =
+            ["gate_proj", "up_proj", "down_proj"].map(|name| format!("{p}.shared_experts.{name}"));
+        let mut joint = paging.is_none() && c.shared_intermediate == c.intermediate;
+        for name in &shared_names {
+            if joint {
+                joint = l.weights.quantized(name) && l.weights.bits(name)? == 8;
+            }
+        }
+        let shared_weights = if joint {
+            Some(l.cpu.pool.install(|| -> Result<_> {
+                Ok((
+                    concatenate(vec![
+                        l.weights.load(&shared_names[0], c.intermediate, c.hidden)?,
+                        l.weights.load(&shared_names[1], c.intermediate, c.hidden)?,
+                    ])?,
+                    l.weights.load(&shared_names[2], c.hidden, c.intermediate)?,
+                ))
+            })?)
+        } else {
+            None
+        };
         let bank = if let Some(paging) = paging {
             Bank::Paged(Box::new(Paged::new(
                 l.backend,
@@ -177,9 +199,18 @@ impl FeedForward {
                 paging.clone(),
             )?))
         } else if let Some(store) = store {
-            let mut bank = l
-                .backend
-                .moe_packed(c.hidden, c.intermediate, c.experts, c.top)?;
+            let mut bank = if let Some((g, d)) = &shared_weights {
+                l.backend.moe_packed_with_shared(
+                    c.hidden,
+                    c.intermediate,
+                    c.experts,
+                    c.top,
+                    (g, d),
+                )?
+            } else {
+                l.backend
+                    .moe_packed(c.hidden, c.intermediate, c.experts, c.top)?
+            };
             for expert in 0..c.experts {
                 bank.import(expert, store.read(layer, expert)?.as_bytes())?;
             }
@@ -195,7 +226,12 @@ impl FeedForward {
                 gate.push(g);
                 down.push(d);
             }
-            Bank::Resident(l.backend.load_moe(&gate, &down, c.top)?)
+            Bank::Resident(if let Some((g, d)) = &shared_weights {
+                l.backend
+                    .load_moe_with_shared(&gate, &down, c.top, (g, d))?
+            } else {
+                l.backend.load_moe(&gate, &down, c.top)?
+            })
         };
         let router = l.weights.store.get(&format!("{p}.gate.weight"))?;
         router.require_shape(&[c.experts, c.hidden], "Ling router")?;
@@ -208,7 +244,15 @@ impl FeedForward {
             routing: RoutingScratch::new(c),
             bias: l.vector(&format!("{p}.gate.expert_bias"), c.experts)?,
             bank,
-            shared: Dense::load(l, &format!("{p}.shared_experts"), c.shared_intermediate)?,
+            shared: if joint {
+                None
+            } else {
+                Some(Dense::load(
+                    l,
+                    &format!("{p}.shared_experts"),
+                    c.shared_intermediate,
+                )?)
+            },
         })))
     }
     pub fn run(
@@ -241,22 +285,33 @@ impl FeedForward {
                     }
                     Ok((ids, weights))
                 })?;
-                trace::measure(c"ling.moe_routed_experts", || match &mut r.bank {
+                let stage = if r.shared.is_none() {
+                    c"ling.moe_routed_shared_experts"
+                } else {
+                    c"ling.moe_routed_experts"
+                };
+                trace::measure(stage, || match &mut r.bank {
                     Bank::Resident(b) => b.run(input, &ids, &weights, &mut out, rows),
                     Bank::Paged(b) => {
                         let request = b.request(&ids, position, rows);
                         b.run(input, &ids, &weights, &mut out, request)
                     }
                 })?;
-                trace::measure(c"ling.shared_expert_ffn", || -> Result<()> {
-                    let mut shared = vec![0.; rows * c.hidden];
-                    r.shared.run(input, &mut shared, rows, cpu)?;
-                    cpu.add(&mut out, &shared);
-                    Ok(())
-                })?;
+                if let Some(ffn) = &r.shared {
+                    trace::measure(c"ling.shared_expert_ffn", || -> Result<()> {
+                        let mut shared = vec![0.; rows * c.hidden];
+                        ffn.run(input, &mut shared, rows, cpu)?;
+                        cpu.add(&mut out, &shared);
+                        Ok(())
+                    })?;
+                }
             }
         }
         Ok(out)
+    }
+
+    pub fn joint_shared(&self) -> bool {
+        matches!(self, Self::Routed(r) if r.shared.is_none())
     }
 }
 
