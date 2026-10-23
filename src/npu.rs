@@ -163,11 +163,11 @@ fn bucket(rows: usize) -> Result<usize> {
 
 struct Work {
     w4: Option<Handle<rk_npu_w4a8_workspace>>,
+    w4_swiglu: Option<Handle<rk_npu_w4a8_workspace>>,
     w8: Option<Handle<rk_npu_matmul_workspace>>,
     input: Vec<f32>,
     output: Vec<f32>,
     bytes: u64,
-    w4_reduce: rk_npu_w4a8_reduce_backend,
 }
 struct AttentionWork {
     workspace: Handle<rk_npu_attention_f16_workspace>,
@@ -646,6 +646,7 @@ impl Backend {
         json!({"backend": "open-rknpu2", "loaded_w4": b.loaded_w4, "loaded_w8": b.loaded_w8,
             "weight_payload_bytes": b.weight_bytes, "workspace_payload_bytes": workspace,
             "tuning_material_bytes": material, "workspace_count": b.work.len(),
+            "swiglu_workspace_count": b.work.values().filter(|w| w.w4_swiglu.is_some()).count(),
             "attention_cpu_staging_bytes": staging, "tune_cache_hits": b.cache_hits,
             "tune_cache_misses": b.cache_misses, "npu_core_mask": b.options.npu_mask,
             "tune_calls": b.tune_calls, "strategy_fallbacks": b.fallbacks.len(),
@@ -944,11 +945,11 @@ impl BackendInner {
             let (bits, k, n, _) = key;
             let mut work = Work {
                 w4: None,
+                w4_swiglu: None,
                 w8: None,
                 input: vec![0.0; m * k],
                 output: vec![0.0; m * n],
                 bytes: 0,
-                w4_reduce: RK_NPU_W4A8_REDUCE_CPU,
             };
             if bits == 4 {
                 let strategy = self.w4_strategy(key, m)?;
@@ -964,7 +965,6 @@ impl BackendInner {
                     "W4 memory query",
                 )?;
                 work.bytes = info.workspace_bytes;
-                work.w4_reduce = info.effective_reduce_backend;
                 work.w4 = Some(Handle::new(
                     unsafe {
                         rk_npu_w4a8_workspace_create_ex(
@@ -994,6 +994,52 @@ impl BackendInner {
         }
         Ok(self.work.get_mut(&wk).unwrap())
     }
+
+    fn get_swiglu_work(&mut self, key: Key, m: usize) -> Result<&mut Work> {
+        let mut strategy = self.w4_strategy(key, m)?;
+        let threads = if m == 1 {
+            1
+        } else {
+            self.options.threads as i32
+        };
+        if strategy.base.config.cpu_threads == threads
+            && strategy.execution.reduce_backend == RK_NPU_W4A8_REDUCE_CPU
+        {
+            return self.get_work(key, m);
+        }
+        // Ordinary GEMM tuning excludes the activation. Keep its workspace
+        // unchanged; only the fused call uses the measured SwiGLU CPU policy.
+        strategy.base.config.cpu_threads = threads;
+        strategy.execution.reduce_backend = RK_NPU_W4A8_REDUCE_CPU;
+        let domain = self.domain.raw;
+        let work = self.get_work(key, m)?;
+        if work.w4_swiglu.is_none() {
+            let mut info = rk_npu_w4a8_memory_info_ex::default();
+            check(
+                unsafe {
+                    rk_npu_w4a8_memory_query_ex(
+                        &strategy.base.config,
+                        &strategy.execution,
+                        &mut info,
+                    )
+                },
+                "W4 SwiGLU memory query",
+            )?;
+            work.w4_swiglu = Some(Handle::new(
+                unsafe {
+                    rk_npu_w4a8_workspace_create_ex(
+                        domain,
+                        &strategy.base.config,
+                        &strategy.execution,
+                    )
+                },
+                rk_npu_w4a8_workspace_free,
+                "W4 SwiGLU workspace",
+            )?);
+            work.bytes += info.workspace_bytes;
+        }
+        Ok(work)
+    }
 }
 
 impl Linear {
@@ -1007,18 +1053,9 @@ impl Linear {
         self.run_npu(input, output, rows, false)
     }
     pub fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
-        let mut b = self.owner.0.borrow_mut();
-        if self.w4.is_none() || rows < 32 || b.options.threads < 2 || !self.n().is_multiple_of(64) {
+        if self.w4.is_none() || !self.n().is_multiple_of(64) {
             return Ok(false);
         }
-        let m = bucket(rows)?;
-        let reduce = b.get_work(self.key, m)?.w4_reduce;
-        if reduce != RK_NPU_W4A8_REDUCE_CPU
-            || b.w4_strategies[&(self.key, m)].base.config.cpu_threads < 2
-        {
-            return Ok(false);
-        }
-        drop(b);
         self.run_npu(input, output, rows, true)?;
         Ok(true)
     }
@@ -1030,7 +1067,11 @@ impl Linear {
             "linear input/output shape mismatch"
         );
         let mut b = self.owner.0.borrow_mut();
-        let work = b.get_work(self.key, m)?;
+        let work = if swiglu {
+            b.get_swiglu_work(self.key, m)?
+        } else {
+            b.get_work(self.key, m)?
+        };
         let (a, c) = if m != rows {
             work.input[..rows * self.k()].copy_from_slice(&input[..rows * self.k()]);
             work.input[rows * self.k()..].fill(0.0);
@@ -1039,7 +1080,12 @@ impl Linear {
             (input.as_ptr(), output.as_mut_ptr())
         };
         if let Some(weights) = &self.w4 {
-            let raw = work.w4.as_ref().unwrap().raw;
+            let ordinary = work.w4.as_ref().unwrap();
+            let raw = if swiglu {
+                work.w4_swiglu.as_ref().unwrap_or(ordinary).raw
+            } else {
+                ordinary.raw
+            };
             let rc = unsafe {
                 if swiglu {
                     rk_npu_w4a8_run_swiglu_f32(raw, weights.raw, a, c, ptr::null_mut())
@@ -1191,12 +1237,21 @@ mod tests {
                 Some(Box::new(|| bail!("cache-only path reloaded weights"))),
             )?;
             for rows in [
-                1, 2, 3, 5, 9, 17, 32, 33, 65, 127, 128, 129, 191, 192, 193, 255, 256,
+                1, 2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 65, 127, 128, 129, 191, 192, 193, 255, 256,
             ] {
+                if bits == 4 && rows == 8 {
+                    // Model a plain-GEMM cache entry selecting one CPU worker.
+                    let mut b = backend.0.borrow_mut();
+                    let mut strategy = b.w4_strategy(linear.key, rows)?;
+                    strategy.base.config.cpu_threads = 1;
+                    b.w4_strategies.insert((linear.key, rows), strategy);
+                    // The earlier ragged M5 case also uses bucket8.
+                    b.work.remove(&(linear.key, rows));
+                }
                 let mut output = vec![0.0; rows * 256];
                 linear.run(&input, &mut output, rows)?;
                 compare(&output, &reference[..rows * 256], 2e-5);
-                if bits == 4 && rows >= 32 {
+                if bits == 4 {
                     let mut middle = vec![0.0; rows * 128];
                     assert!(linear.run_swiglu(&input, &mut middle, rows)?);
                     let expected: Vec<_> = (0..rows)
@@ -1207,11 +1262,30 @@ mod tests {
                         })
                         .collect();
                     compare(&middle, &expected, 3e-5);
+                    let bytes = backend.stats()["workspace_payload_bytes"].clone();
+                    let first = middle.clone();
+                    assert!(linear.run_swiglu(&input, &mut middle, rows)?);
+                    assert_eq!(middle, first);
+                    assert_eq!(backend.stats()["workspace_payload_bytes"], bytes);
+                    linear.run(&input, &mut output, rows)?;
+                    compare(&output, &reference[..rows * 256], 2e-5);
+                    if rows == 8 {
+                        assert_eq!(
+                            backend.0.borrow().w4_strategies[&(linear.key, rows)]
+                                .base
+                                .config
+                                .cpu_threads,
+                            1,
+                        );
+                    }
+                } else {
+                    assert!(!linear.run_swiglu(&input, &mut output, rows)?);
                 }
             }
         }
         backend.retain_workspaces(&[1, 64])?;
         assert_eq!(backend.stats()["workspace_count"], 4);
+        assert_eq!(backend.stats()["swiglu_workspace_count"], 1);
         let lookups = backend.tune_operations();
         backend.prepare(3)?;
         backend.retain_workspaces(&[1, 64])?;
