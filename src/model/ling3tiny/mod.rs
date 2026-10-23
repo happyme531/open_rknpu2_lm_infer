@@ -135,7 +135,9 @@ impl Ling3Tiny {
         if let Some(p) = &self.paging {
             p.forward_marker(self.position, rows, false);
         }
-        self.last_hidden = hidden[(rows - 1) * h..].to_vec();
+        self.last_hidden.clear();
+        self.last_hidden
+            .extend_from_slice(&hidden[(rows - 1) * h..]);
         self.position += rows;
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
@@ -152,9 +154,8 @@ impl Ling3Tiny {
             &mut input,
         )?;
         self.logits.resize(self.config.vocab, 0.);
-        self.head.prepare(1)?;
         self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
-        ensure!(
+        debug_assert!(
             self.logits.iter().all(|x| x.is_finite()),
             "nonfinite Ling logits"
         );

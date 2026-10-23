@@ -207,7 +207,7 @@ impl Mixer {
             }
             Self::Mla(m) => {
                 let mut qa = vec![0.; rows * 256];
-                let mut qn = qa.clone();
+                let mut qn = vec![0.; rows * 256];
                 trace::measure(c"ling.mla_q_a_projection", || {
                     m.q_a.run(input, &mut qa, rows)
                 })?;

@@ -117,6 +117,8 @@ impl State {
         self.values.len() * 4
     }
 
+    /// Q/K are normalized, log_decay is nonpositive and beta is in [0, 1].
+    /// Value diagnostics are enabled in debug builds; shapes protect the C ABI.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &mut self,
@@ -141,7 +143,7 @@ impl State {
                 && beta.len() == rows * self.heads,
             "KDA buffer shape mismatch"
         );
-        ensure!(
+        debug_assert!(
             valid_inputs(query, key, value, log_decay, beta),
             "invalid KDA inputs"
         );
@@ -346,7 +348,7 @@ mod tests {
         assert!(state.run(&x, &x, &x, &x, &[0.5], &mut out, 1).is_err());
         assert!(
             state
-                .run(&x, &x, &x, &[1.; 8], &[0.5; 2], &mut out, 1)
+                .run(&x, &x, &x, &x[..7], &[0.5; 2], &mut out, 1)
                 .is_err()
         );
         assert!(state.run(&x, &x, &x, &x, &[0.5; 2], &mut out, 0).is_err());

@@ -369,9 +369,14 @@ pub(super) fn parse_request(
         ));
     }
     let max_tokens = if v.get("max_completion_tokens").is_some_and(|x| !x.is_null()) {
-        integer(&v, "max_completion_tokens", 256, 1)?
+        integer(
+            &v,
+            "max_completion_tokens",
+            crate::sampling::DEFAULT_MAX_TOKENS,
+            1,
+        )?
     } else {
-        integer(&v, "max_tokens", 256, 1)?
+        integer(&v, "max_tokens", crate::sampling::DEFAULT_MAX_TOKENS, 1)?
     };
     if max_tokens > context {
         return Err(ApiError::invalid(

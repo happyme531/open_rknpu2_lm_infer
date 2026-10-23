@@ -1,5 +1,12 @@
 use super::*;
 
+fn greedy() -> SamplingParams {
+    SamplingParams {
+        temperature: 0.,
+        ..Default::default()
+    }
+}
+
 /// A history-length oracle with controllable proposal rejection. It implements
 /// real pending transactions, so emitting/committing too far fails the test.
 struct Model {
@@ -164,7 +171,7 @@ fn parallel_corrections_use_previous_proposal_and_learned_confidence() -> Result
     model.draft_adjust = vec![(3, 4, 0.95), (4, 1, 0.2), (1, 2, 0.99)];
     model.p_min = 0.5;
     model.forward(&[1, 2])?;
-    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[1, 2, 3])?;
+    let mut sampler = Sampler::new(greedy(), 5, &[1, 2, 3])?;
     let round =
         crate::speculative::run_round(&mut model, &mut sampler, 3, 8, &AtomicBool::new(false))?;
     assert_eq!(round.inputs, [3, 4]);
@@ -191,7 +198,7 @@ fn confidence_truncation_preserves_greedy_commit_and_budget_boundaries() -> Resu
                         .collect();
                     let anchor =
                         model.forward(&[4])?.iter().position(|x| *x == 10.).unwrap() as u32;
-                    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[4, anchor])?;
+                    let mut sampler = Sampler::new(greedy(), 5, &[4, anchor])?;
                     let round = run_round_with_options(
                         &mut model,
                         &mut sampler,
@@ -265,7 +272,7 @@ fn run(
     max_tokens: usize,
     stop: Vec<String>,
 ) -> Result<(GenerationResult, String)> {
-    run_with_sampling(model, codec, max_tokens, stop, SamplingParams::default())
+    run_with_sampling(model, codec, max_tokens, stop, greedy())
 }
 fn run_with_sampling(
     model: &mut Model,
@@ -433,7 +440,7 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
-            sampling: SamplingParams::default(),
+            sampling: greedy(),
             max_tokens: 8,
             stop: vec![],
         },

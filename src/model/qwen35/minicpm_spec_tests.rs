@@ -15,7 +15,14 @@ fn generate(model: &mut Qwen35, prompt: &[u32], limit: usize) -> Result<(Vec<u32
     model.reset()?;
     model.reserve(prompt.len() + limit)?;
     model.prepare(prompt.len())?;
-    let mut sampler = Sampler::new(SamplingParams::default(), model.info().vocab_size, prompt)?;
+    let mut sampler = Sampler::new(
+        SamplingParams {
+            temperature: 0.,
+            ..Default::default()
+        },
+        model.info().vocab_size,
+        prompt,
+    )?;
     let begin = Instant::now();
     let first = sampler.sample(model.forward(prompt)?)?;
     let prefill_ms = begin.elapsed().as_secs_f64() * 1000.;

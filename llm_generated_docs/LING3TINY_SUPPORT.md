@@ -399,3 +399,56 @@ cec5dda606e3faa35a114390aa2278a278a88f703d84a0d61382d9326948fb42  /tmp/ling-kda-
 05d58841704d13fe278677faba148d72ff5293e419fa1a545723c14ff8a2c497  /tmp/ling-native-7a996a2
 ca5b936725e8471839cd6e37bee17984aa2ca63d079c843597ff6d3e582fea37  /tmp/ling-moe-joint
 ```
+
+## Chat / serve 采样与默认参数（2026-10-23）
+
+模型裁剪和交付命名已签名提交为 `540ce85`。采样器对有限 top-k 使用部分选择，只排序保留的 k 个候选；temperature0 的贪心路径合并为一次扫描，保持相同分数时优先选择较小 token ID。CLI、HTTP 和 MTP 测速工具的默认温度统一为 1，CLI `--n-predict` 与 HTTP 输出上限默认 2048。显式 temperature0 的贪心行为保留。
+
+主板 zt-firefly、Ling QQQ W4A8 mixed checkpoint，CPU4–7/4线程 @2.4 GHz，NPU mask7 @1 GHz，DDR @2.112 GHz，context4096、ubatch128、resident experts，trace关闭。配对项目复用原 expert store 和 `tune-optimized` 缓存，seed42，关闭 thinking，同一48-token聊天 prompt生成128个token；decode分子为首token之后的127个，含模型和采样/文本处理。bench 使用相同深度48、128个固定随机token，1次warmup、2次采样，不含采样。TUI 通过真实PTY运行；HTTP同时测试非流式和SSE。
+
+固定温度0.6、top_k20、top_p0.95，排除默认值变化的影响：
+
+| 路径 | 优化前 decode tok/s | 优化后 decode tok/s |
+|---|---:|---:|
+| bench | 23.0978 | 23.0712 |
+| CLI run | 19.2536 | 22.4228 |
+| 终端 chat | 19.7300 | 22.3884 |
+| serve 非流式 | 19.8118 | 22.4340 |
+| serve SSE | 19.7012 | 22.4065 |
+
+bench 原始两次速度为 23.1092/23.0864 → 23.0876/23.0548 tok/s；其他行各为一次128-token冒烟测速。这里未复现10 tok/s，测得的默认chat差距主要来自原采样器对157184个logits全量排序后再保留20个的额外工作；终端刷新与HTTP/SSE没有造成速度减半。单位测试对完整排序参考逐位核对概率及固定seed抽样，覆盖同分候选、惩罚项、k=0/1/20/词表边界。配对CLI/HTTP文本、同参数的新版CLI/API/SSE文本均一致。
+
+新默认温度1的结果：
+
+| 路径 | decode tok/s | 配置 |
+|---|---:|---|
+| chat，128个输出token | 22.3100 | 原store/cache，top_k20、top_p0.95 |
+| chat，未指定store/cache/温度/生成上限 | 20.4923 | 直接加载权重，默认2048上限，实际输出43个token |
+| serve，非流式 / SSE | 18.3591 / 18.9868 | 默认top_k0、top_p1，完整词表采样，128个输出token |
+| serve，非流式 / SSE | 22.4541 / 22.3853 | top_k20、top_p0.95，128个输出token |
+| serve，未指定温度和生成上限 | 18.4570 | 默认2048上限，实际输出62个token |
+
+未指定store/cache的chat与未指定HTTP生成上限的请求使用39-token短prompt；其余新默认项目沿用48-token prompt。HTTP默认完整词表分布比有限top-k耗时更高；对比chat时需显式使用相同top-k/top-p。默认加载路径的cache hits/misses为0/164，使用已有缓存的项目为110/54，所有项目 `tune_calls=0`。服务正常退出，所有频率设置已恢复。
+
+默认完整版本128项自动测试通过、22项ignored；Ling专用版本93项通过、11项ignored，二者all-targets release Clippy `-D warnings`通过。新产物为 `dist/ling3tiny-named/ling3tiny`（8,399,672字节），仅注册Ling3tiny；原始日志、PTY输出、统计与配对汇总位于 `results/chat-perf-20261023/`，最终汇总为 `comparison.json`。
+
+### 最新专用版 prefill512 复测
+
+同一 `ling3tiny-named/ling3tiny`、模型与定频配置，context640、ubatch128、resident、已有store/cache，`bench -p 512 -n 0 -r 3`：1次warmup后，head-free prefill512平均 **204.4029 ± 1.0859 tok/s**，三次分别为203.3101、204.4168、205.4817 tok/s，耗时2518.320142、2504.686015、2491.705814 ms。计时不含输出头、加载和prepare。Head-free continuation logits逐位一致，23层joint MoE启用，cache hits182、miss0、tune_calls0、strategy fallback0，频率设置恢复正常。原始记录为 `results/chat-perf-20261023/latest-pp512.json` 与对应clock/log文件。
+
+### Release 热路径清理
+
+KDA的Q/K/V、decay/beta值域扫描，Ling与其他解码器的logits/router扫描，以及采样器逐元素finite检查改为debug断言，release不执行这些数值诊断。加载阶段的权重/配置检查、请求参数与token范围检查、FFI缓冲区尺寸/线程数检查、取消和设备错误处理保留。计算公式及数值精度不变。
+
+输出头直接调用可惰性准备workspace的Linear，移除每步重复的全backend `prepare`；浮点Linear只在出错时格式化M/K/N信息。生成循环复用logits和事件缓冲区，以切片借用speculative输出并用栈数组保存单token；Ling复用last_hidden缓冲区，MLA移除零缓冲区的无用clone。浮点投影的重复尺寸检查由实际FloatLinear入口统一完成。
+
+与已包含采样优化及1/2048默认值的冻结版本比较，继续使用上面的主板/模型/频率/store/cache配置，context640、ubatch128，连续pp512→tg128，ABBA顺序，每组1次warmup和3次采样，每个版本共6个样本。下表用中位耗时换算速度，排除加载、prepare、tokenization和sampling，prefill不含输出头、decode含输出头。
+
+| 阶段 | 清理前中位 ms / tok/s | 清理后中位 ms / tok/s |
+|---|---:|---:|
+| Prefill512 | 2547.9560 / 200.9454 | 2538.0804 / 201.7273 |
+| Decode128 @512 | 5660.6999 / 22.6120 | 5611.7375 / 22.8093 |
+
+性能基本稳定，prefill/decode分别改善约0.39%/0.87%。137-token输入加3个continuation的628736个FP32 logits逐字节一致；四组head-free检查均逐位一致，在线调优、cache miss和strategy fallback均为0。默认完整版本128项、Ling专用版93项自动测试通过，all-targets release Clippy `-D warnings`通过。
+
+最终release的7项HTTP短问答、多轮记忆/更名与SSE测试通过，同题CLI/HTTP/SSE输出一致；真实终端chat在温度1、top_k20、seed42、128-token测试中为22.2355 tok/s。频率设置恢复正常，`tune_calls=0`。`dist/ling3tiny-named/ling3tiny`已更新为清理版，8,375,096字节；原始记录与六样本汇总位于 `results/hotpath-cleanup-20261023/`，最终汇总为 `comparison.json`。

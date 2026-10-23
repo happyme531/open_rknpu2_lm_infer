@@ -93,9 +93,12 @@ impl RoutingScratch {
             logits.len() == c.experts
                 && bias.len() == c.experts
                 && ids.len() == c.top
-                && weights.len() == c.top
-                && logits.iter().all(|x| x.is_finite()),
-            "Ling router shape/value mismatch"
+                && weights.len() == c.top,
+            "Ling router shape mismatch"
+        );
+        debug_assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "nonfinite Ling router logits"
         );
         for (i, (&logit, &bias)) in logits.iter().zip(bias).enumerate() {
             self.scores[i] = sigmoid(logit);

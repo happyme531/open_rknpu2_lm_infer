@@ -11,6 +11,8 @@ HTTP 与 SSE 使用 axum/tokio。标准 OpenAI SDK 可以设置本服务的 `/v1
 
 支持流式与非流式输出、标准 choices/usage、SSE `[DONE]`、`stream_options.include_usage`、`max_tokens` / `max_completion_tokens`、temperature、top_p、top_k、min_p、seed、repeat_penalty、presence_penalty、frequency_penalty 和最多4个 stop。`messages` 接受 system/developer/user/assistant/tool，developer 转为 Qwen3 的 system 指令；文本内容可用 string 或 text parts。`enable_thinking` 和 `chat_template_kwargs.enable_thinking` 控制 Qwen3 thinking，API 默认开启；reasoning 输出到 `reasoning_content`。
 
+CLI `run`、`chat` 与 HTTP API 的默认温度均为 `1`，默认生成上限为 `2048`（CLI `--n-predict`，HTTP `max_tokens` / `max_completion_tokens`）。`temperature:0` 选择贪心采样。CLI 默认 `top_k=20`、`top_p=0.95`；HTTP 默认 `top_k=0`、`top_p=1`，即完整词表采样。比较速度或输出时应显式使用相同的采样参数。
+
 `usage.prompt_tokens_details.cached_tokens` 记录当前请求实际复用的 KV 前缀。发生 context 超限时在排队前返回400；请求队列满时返回503。关闭流式连接会取消对应推理。
 
 ## Function tools

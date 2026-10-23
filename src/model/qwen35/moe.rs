@@ -41,9 +41,10 @@ pub(super) struct Routed {
 }
 
 pub(super) fn routes(logits: &[f32], top: usize) -> Result<(Vec<i32>, Vec<f32>)> {
-    ensure!(
-        top > 0 && top <= logits.len() && logits.iter().all(|v| v.is_finite()),
-        "invalid router logits"
+    ensure!(top > 0 && top <= logits.len(), "invalid router top-k");
+    debug_assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "nonfinite router logits"
     );
     let mut ids: Vec<usize> = (0..logits.len()).collect();
     ids.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
@@ -296,6 +297,8 @@ mod tests {
         assert_eq!(ids, [2, 3]);
         assert!((weights[0] - 1. / (1. + (-1f32).exp())).abs() < 1e-6);
         assert!((weights.iter().sum::<f32>() - 1.).abs() < 1e-6);
-        assert!(routes(&[f32::NAN], 1).is_err());
+        assert!(routes(&[], 1).is_err());
+        assert!(routes(&[0.], 0).is_err());
+        assert!(routes(&[0.], 2).is_err());
     }
 }
