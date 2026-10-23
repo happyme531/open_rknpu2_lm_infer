@@ -28,6 +28,7 @@ fn vector(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
 pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
     let start = Instant::now();
     let raw: Value = serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+    crate::model::registry::require(&raw)?;
     let config = Config::parse(&raw)?;
     let expert_slots = config
         .moe
@@ -362,11 +363,13 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         head_ms: 0.0,
         phases: Default::default(),
         mtp_available,
+        #[cfg(feature = "vision")]
         vision: None,
         next_rope_position: 0,
         round: None,
         mtp: None,
         features: Default::default(),
+        #[cfg(feature = "draft-dflash")]
         dflash: None,
     })
 }

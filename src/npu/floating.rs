@@ -1,6 +1,7 @@
 //! Static floating Linear through the public FP16/BF16 MM ABI. Ordinary calls
 //! load shape profiles; explicit preparation can search complete host calls.
 use super::*;
+#[cfg(feature = "vision")]
 #[path = "floating_gelu.rs"]
 mod gelu;
 #[cfg(test)]
@@ -8,6 +9,7 @@ mod gelu;
 mod tests;
 
 struct FloatWork {
+    #[cfg(feature = "vision")]
     gelu: Option<Handle<rk_npu_mm_gelu_workspace>>,
     workspace: Handle<rk_npu_mm_tuned_workspace>,
     strategy: rk_npu_mm_strategy,
@@ -205,6 +207,7 @@ impl FloatBackend {
         works.insert(
             (k, n),
             FloatWork {
+                #[cfg(feature = "vision")]
                 gelu: None,
                 workspace: Handle::new(raw, rk_npu_mm_tuned_workspace_free, "floating workspace")?,
                 strategy,
@@ -312,6 +315,7 @@ impl FloatLinear {
         self.run_typed(input, output, rows)
     }
     /// Fused NPU GEMM, channel bias and tanh GELU; direct FP16 collection.
+    #[cfg(feature = "vision")]
     pub fn run_half_gelu(
         &self,
         pool: &rayon::ThreadPool,
@@ -322,6 +326,7 @@ impl FloatLinear {
         self.with_gelu_view(input, rows, |view| gelu::collect_half(pool, view, output))
     }
     /// FP32 activation storage keeps the same fused NPU FFN operation.
+    #[cfg(feature = "vision")]
     pub fn run_gelu(
         &self,
         pool: &rayon::ThreadPool,
@@ -332,6 +337,7 @@ impl FloatLinear {
         let input = crate::ops::vision_half::narrow(input);
         self.with_gelu_view(&input, rows, |view| gelu::collect_float(pool, view, output))
     }
+    #[cfg(feature = "vision")]
     fn with_gelu_view(
         &self,
         input: &[u16],

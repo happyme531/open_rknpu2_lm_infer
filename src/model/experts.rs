@@ -1,10 +1,16 @@
 //! Model-independent file storage and scheduling for packed expert weights.
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 mod io;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 mod paged;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 pub(crate) mod prepare;
 pub mod store;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 mod timeline;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 mod window;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 pub(crate) use paged::{Paged, Paging};
 
 use anyhow::{Result, ensure};

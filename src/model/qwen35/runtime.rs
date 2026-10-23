@@ -45,18 +45,22 @@ pub struct Qwen35 {
     pub(super) head_ms: f64,
     pub(super) phases: Timings,
     pub(super) mtp_available: bool,
+    #[cfg(feature = "vision")]
     pub(super) vision: Option<super::vision::Encoder>,
     pub(super) next_rope_position: usize,
     pub(super) round: Option<super::transaction::Round>,
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
+    #[cfg(feature = "draft-dflash")]
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
 }
 
 impl Qwen35 {
     pub fn load(options: ModelOptions) -> Result<Self> {
         options.validate_speculation()?;
+        #[allow(unused_mut)]
         let mut model = super::load::load(options)?;
+        #[cfg(feature = "draft-dflash")]
         if matches!(
             model.options.speculation.kind,
             crate::model::SpeculativeType::DraftDflash | crate::model::SpeculativeType::DraftDspark
@@ -294,6 +298,7 @@ impl LanguageModel for Qwen35 {
         if let Some(mtp) = &mut self.mtp {
             mtp.reset()?;
         }
+        #[cfg(feature = "draft-dflash")]
         if let Some(draft) = &mut self.dflash {
             draft.reset()?;
         }
@@ -356,6 +361,7 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.work.recurrent.prepare(&rows)?;
+        #[cfg(feature = "draft-dflash")]
         if let Some(draft) = &self.dflash {
             draft.prepare(&rows, self.options.speculation.window())?;
         }
@@ -403,7 +409,7 @@ impl LanguageModel for Qwen35 {
             return Ok(());
         }
         ensure!(
-            self.dflash.is_none(),
+            !self.has_dflash(),
             "MTP and DFlash cannot be enabled together"
         );
         ensure!(
@@ -428,7 +434,7 @@ impl LanguageModel for Qwen35 {
         Ok(())
     }
     fn speculation_window(&self) -> usize {
-        if self.dflash.is_some() {
+        if self.has_dflash() {
             self.options.speculation.window()
         } else {
             self.mtp.as_ref().map_or(0, |m| m.max_draft)
@@ -458,6 +464,7 @@ impl LanguageModel for Qwen35 {
         self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
         Ok(&self.logits)
     }
+    #[cfg(feature = "draft-dflash")]
     fn draft_block_logits(
         &mut self,
         anchor: u32,
@@ -466,6 +473,7 @@ impl LanguageModel for Qwen35 {
     ) -> Result<Option<Vec<f32>>> {
         self.dflash_logits(anchor, drafts, cancel)
     }
+    #[cfg(feature = "draft-dflash")]
     fn adjust_draft_logits(
         &self,
         row: usize,

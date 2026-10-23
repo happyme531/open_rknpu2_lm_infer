@@ -58,7 +58,7 @@ pub(super) fn routes(logits: &[f32], top: usize) -> Result<(Vec<i32>, Vec<f32>)>
 }
 
 impl Routed {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "model-minicpmv47"))]
     pub(super) fn export(&self, expert: usize) -> Result<Vec<u8>> {
         match &self.experts {
             Bank::Resident(m) => m.export(expert),

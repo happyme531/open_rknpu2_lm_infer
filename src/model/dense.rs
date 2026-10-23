@@ -100,6 +100,7 @@ impl Dense {
         let trace = Trace::from_environment()?;
         let config: Value =
             serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+        super::registry::require(&config)?;
         let architecture = config["model_type"]
             .as_str()
             .context("missing model_type")?;

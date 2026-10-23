@@ -7,6 +7,7 @@ impl Qwen35 {
         if let Some(mtp) = &self.mtp {
             backends.push(mtp.backend.clone());
         }
+        #[cfg(feature = "draft-dflash")]
         if let Some(draft) = &self.dflash {
             backends.extend_from_slice(draft.backends());
         }
@@ -30,6 +31,20 @@ impl Qwen35 {
                 }
             }
         }
+        #[cfg(feature = "vision")]
+        let vision = (
+            self.vision.is_some(),
+            self.vision.as_ref().map_or(0, |v| v.calls),
+            self.vision.as_ref().map_or(0, |v| v.hits),
+            self.vision.as_ref().map_or(0.0, |v| v.elapsed_ms),
+            self.vision.as_ref().map_or(0, |v| v.cache_bytes()),
+        );
+        #[cfg(not(feature = "vision"))]
+        let vision = (false, 0, 0, 0.0, 0);
+        #[cfg(feature = "draft-dflash")]
+        let draft = self.dflash.as_ref().map(|d| d.stats());
+        #[cfg(not(feature = "draft-dflash"))]
+        let draft: Option<Value> = None;
         let fields = json!({
             "position":self.position,"layers":self.layers.len(),"architecture":self.info.architecture,
             "routed_experts":self.config.moe.as_ref().map(|m| m.experts),
@@ -46,10 +61,10 @@ impl Qwen35 {
             "mapped_weight_bytes":self.loader.store.mapped_bytes(),
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
             "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
-            "multimodal_enabled":self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":self.vision.is_some(),"next_rope_position":self.next_rope_position,
-            "vision_encoder_calls":self.vision.as_ref().map_or(0,|v|v.calls),"vision_cache_hits":self.vision.as_ref().map_or(0,|v|v.hits),
+            "multimodal_enabled":cfg!(feature = "vision") && self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":vision.0,"next_rope_position":self.next_rope_position,
+            "vision_encoder_calls":vision.1,"vision_cache_hits":vision.2,
             "vision_dtype":self.options.vision_dtype.as_str(),
-            "vision_encoder_ms":self.vision.as_ref().map_or(0.0,|v|v.elapsed_ms),"vision_feature_cache_bytes":self.vision.as_ref().map_or(0,|v|v.cache_bytes()),
+            "vision_encoder_ms":vision.3,"vision_feature_cache_bytes":vision.4,
             "prefix_truncate":"reset/recompute for shorter nonzero prefixes",
             "trace_directory":self.trace.path(),"attention_tile":self.options.attention_tile,
             "tuning_enabled":self.options.tune,"tuning_search_enabled":self.options.tune_search,"tune_cache":self.options.tune_cache,
@@ -60,12 +75,12 @@ impl Qwen35 {
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
         let speculative = json!({
-            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some() || self.dflash.is_some(),
+            "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some() || self.has_dflash(),
             "mtp_draft_tokens":self.mtp.as_ref().map_or(0,|m|m.max_draft),
             "spec_draft_n_max":crate::model::LanguageModel::speculation_window(self),
-            "spec_type":if self.dflash.is_some() {self.options.speculation.kind.as_str()} else if self.mtp.is_some() {"draft-mtp"} else {"none"},
+            "spec_type":if self.has_dflash() {self.options.speculation.kind.as_str()} else if self.mtp.is_some() {"draft-mtp"} else {"none"},
             "spec_draft_model":self.options.speculation.model,
-            "dflash":self.dflash.as_ref().map(|d|d.stats()),
+            "dflash":draft,
             "spec_draft_p_min":self.options.speculation.p_min,"spec_draft_keep_low_confidence":false,
             "spec_draft_sampling":self.options.speculation.sampling.as_str(),"spec_draft_confidence_top_k":10,
             "mtp_decoder_ms":self.mtp.as_ref().map_or(0.,|m|m.elapsed_ms),

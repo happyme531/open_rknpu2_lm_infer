@@ -50,6 +50,14 @@ impl SpeculativeConfig {
         }
     }
     pub(crate) fn validate(&self, chunk: usize) -> Result<()> {
+        ensure!(
+            cfg!(feature = "draft-dflash")
+                || !matches!(
+                    self.kind,
+                    SpeculativeType::DraftDflash | SpeculativeType::DraftDspark
+                ),
+            "DFlash/DSpark support is not included in this build (enable draft-dflash)"
+        );
         let max = if self.kind == SpeculativeType::DraftDspark {
             15
         } else {

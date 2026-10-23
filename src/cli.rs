@@ -14,7 +14,8 @@ use std::{
 
 #[derive(Parser)]
 #[command(
-    name = "open_rknpu2_lm_infer",
+    name = crate::PROJECT_NAME,
+    bin_name = crate::PROJECT_NAME,
     version,
     about = "Local LLM inference on the RK3588 NPU",
     subcommand_required = true
@@ -217,7 +218,7 @@ fn default_tune_cache() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("open_rknpu2_lm_infer")
+        .join(crate::PROJECT_NAME)
 }
 #[derive(Subcommand)]
 pub enum Command {
@@ -252,6 +253,8 @@ pub enum Command {
         #[command(flatten)]
         generation: GenerationArgs,
     },
+    /// List the model families and capabilities compiled into this executable.
+    Models,
     /// Serve the OpenAI chat and text completion endpoints.
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -497,6 +500,13 @@ fn prompt(text: String, chat: bool, thinking: bool) -> Prompt {
     }
 }
 pub async fn execute(cli: Cli) -> Result<()> {
+    if matches!(cli.command, Command::Models) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::model::build_info())?
+        );
+        return Ok(());
+    }
     let mut model_args = cli.model;
     model_args.validate_command(&cli.command)?;
     let bench_cases = if let Command::Bench(args) = &cli.command {
@@ -512,6 +522,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     let options = model_args.options()?;
     match cli.command {
+        Command::Models => unreachable!("handled before model options"),
         Command::Inspect => {
             println!(
                 "{}",
@@ -660,6 +671,7 @@ mod tests {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
     }
     #[test]
+    #[cfg(feature = "draft-dflash")]
     fn dspark_and_expert_paging_options_reach_the_model() {
         let cli = parse(&[
             "infer",
@@ -703,6 +715,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "draft-dflash")]
     fn dflash_model_aliases_and_block_lengths_use_the_shared_speculative_options() {
         for flag in ["--spec-draft-model", "--model-draft", "-md"] {
             for maximum in ["3", "7"] {
@@ -771,6 +784,25 @@ mod tests {
         ]);
         tune.model.options().unwrap();
         tune.model.validate_command(&tune.command).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(feature = "draft-dflash"))]
+    fn excluded_draft_modes_fail_before_loading_a_checkpoint() {
+        for kind in ["draft-dflash", "draft-dspark"] {
+            let cli = parse(&[
+                "infer",
+                "-m",
+                "missing-target",
+                "run",
+                "--spec-type",
+                kind,
+                "--model-draft",
+                "missing-draft",
+            ]);
+            let error = cli.model.options().unwrap_err();
+            assert!(error.to_string().contains("not included in this build"));
+        }
     }
 
     #[test]
@@ -926,7 +958,12 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
         options.path = dir.path().to_owned();
         let error = crate::model::load(options).err().unwrap();
-        assert!(error.to_string().contains("Qwen3.5 or MiniCPM-V 4.7"));
+        let expected = if cfg!(feature = "model-qwen3") {
+            "Qwen3.5 or MiniCPM-V 4.7"
+        } else {
+            "not enabled in this build"
+        };
+        assert!(error.to_string().contains(expected));
     }
 
     #[test]

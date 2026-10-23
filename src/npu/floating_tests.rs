@@ -81,6 +81,7 @@ fn floating_profiles_preserve_weights_and_reload_without_search() -> Result<()> 
 
 #[test]
 #[ignore = "requires exclusive RK3588 NPU access"]
+#[cfg(feature = "vision")]
 fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
     let _lock = crate::validation::BoardLock::acquire()?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;

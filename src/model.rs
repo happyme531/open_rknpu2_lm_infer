@@ -4,9 +4,12 @@ use std::path::PathBuf;
 
 pub mod checkpoint;
 pub(crate) mod cpu;
+#[cfg(feature = "arch-dense")]
 pub mod dense;
+#[cfg(feature = "draft-dflash")]
 pub mod dflash;
 pub mod experts;
+#[cfg(feature = "model-ling3tiny")]
 pub mod ling3tiny;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
@@ -14,8 +17,31 @@ pub(crate) mod output_head;
 pub(crate) mod projection;
 mod speculation;
 pub use speculation::{SpeculativeConfig, SpeculativeType};
+#[cfg(feature = "arch-qwen35")]
 pub mod qwen35;
+mod registry;
+pub use registry::{build_info, ensure_enabled};
 pub(crate) mod trace;
+
+#[cfg(feature = "vision")]
+pub struct LinearShape {
+    pub name: &'static str,
+    pub rows: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+#[cfg(feature = "vision")]
+pub fn vision_tuning_shapes(path: &std::path::Path, rows: &[usize]) -> Result<Vec<LinearShape>> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    registry::require(&config)?;
+    match config["model_type"].as_str() {
+        #[cfg(feature = "model-qwen35")]
+        Some("qwen3_5") => qwen35::vision::tuning_shapes(path, rows),
+        _ => anyhow::bail!("this model family has no supported vision encoder"),
+    }
+}
 
 /// ViT activation storage and CPU arithmetic. NPU GEMMs remain FP16 in both modes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -192,6 +218,7 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
     let spec = options.speculation.clone();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+    let family = registry::require(&config)?;
     anyhow::ensure!(
         options.experts.storage != experts::Storage::Stream
             || matches!(
@@ -211,16 +238,7 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
         "speculative decoding requires a Qwen3.5 or MiniCPM-V 4.7 checkpoint"
     );
     crate::npu::configure_cpu(&mut options)?;
-    let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
-        Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
-        Some("bailing_hybrid") => Box::new(ling3tiny::Ling3Tiny::load(options)?),
-        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7") => {
-            Box::new(qwen35::Qwen35::load(options)?)
-        }
-        other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, minicpmv4_7, bailing_hybrid"
-        ),
-    };
+    let mut model = (family.load)(options)?;
     if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {
         model.enable_mtp(spec.window())?;
     }

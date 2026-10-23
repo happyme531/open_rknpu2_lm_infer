@@ -227,6 +227,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "model-minicpmv47")]
     fn minicpmv47_hybrid_moe_configuration() {
         let raw = serde_json::from_str(include_str!(
             "../../../tests/fixtures/minicpmv47/config.json"

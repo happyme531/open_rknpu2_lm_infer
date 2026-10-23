@@ -1,6 +1,19 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=RKNPU_PROJECT_NAME");
+    let name =
+        env::var("RKNPU_PROJECT_NAME").unwrap_or_else(|_| env::var("CARGO_PKG_NAME").unwrap());
+    assert!(
+        name.as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')),
+        "RKNPU_PROJECT_NAME must start with an ASCII letter or digit and contain only letters, digits, '.', '_' or '-'"
+    );
+    println!("cargo:rustc-env=RKNPU_PROJECT_NAME={name}");
     println!("cargo:rerun-if-env-changed=RK_NPU_MATMUL_ROOT");
     println!("cargo:rerun-if-env-changed=RK_NPU_ENABLE_TRACE");
     println!("cargo:rerun-if-env-changed=RK_NPU_PERFETTO_ROOT");
@@ -29,24 +42,30 @@ fn main() {
         native.define("RK_NPU_PERFETTO_ROOT", &perfetto);
     }
     let output = native.build_target("rk_npu_matmul_static").build();
-    let cpu_root =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("native/cpu_kernels");
-    println!("cargo:rerun-if-changed={}", cpu_root.display());
-    println!("cargo:rerun-if-changed=native/trace_bridge.cpp");
-    let mut cpu = cmake::Config::new(cpu_root);
-    cpu.out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
-        .profile("Release")
-        .define("RK_NPU_ENABLE_TRACE", if trace { "ON" } else { "OFF" });
-    if trace {
-        cpu.define("RK_NPU_TRACE_ROOT", &root)
-            .define("RK_NPU_PERFETTO_ROOT", &perfetto);
+    let gdn = env::var_os("CARGO_FEATURE_ARCH_QWEN35").is_some();
+    let kda = env::var_os("CARGO_FEATURE_MODEL_LING3TINY").is_some();
+    if gdn || kda || trace {
+        let cpu_root =
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("native/cpu_kernels");
+        println!("cargo:rerun-if-changed={}", cpu_root.display());
+        println!("cargo:rerun-if-changed=native/trace_bridge.cpp");
+        let mut cpu = cmake::Config::new(cpu_root);
+        cpu.out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
+            .profile("Release")
+            .define("RK_NPU_ENABLE_TRACE", if trace { "ON" } else { "OFF" });
+        if trace {
+            cpu.define("RK_NPU_TRACE_ROOT", &root)
+                .define("RK_NPU_PERFETTO_ROOT", &perfetto);
+        }
+        cpu.define("RK_CPU_GDN", if gdn { "ON" } else { "OFF" })
+            .define("RK_CPU_KDA", if kda { "ON" } else { "OFF" });
+        let cpu_output = cpu.build_target("rknpu2_cpu_kernels").build();
+        println!(
+            "cargo:rustc-link-search=native={}",
+            cpu_output.join("build").display()
+        );
+        println!("cargo:rustc-link-lib=static=rknpu2_cpu_kernels");
     }
-    let cpu_output = cpu.build_target("rknpu2_cpu_kernels").build();
-    println!(
-        "cargo:rustc-link-search=native={}",
-        cpu_output.join("build").display()
-    );
-    println!("cargo:rustc-link-lib=static=rknpu2_cpu_kernels");
     println!(
         "cargo:rustc-link-search=native={}",
         output.join("build").display()

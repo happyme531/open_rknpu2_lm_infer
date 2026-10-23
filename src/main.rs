@@ -1,3 +1,15 @@
+#[cfg(not(any(
+    feature = "model-qwen3",
+    feature = "model-llama",
+    feature = "model-granite",
+    feature = "model-qwen35",
+    feature = "model-minicpmv47",
+    feature = "model-ling3tiny"
+)))]
+compile_error!(
+    "select at least one model family, e.g. --features model-ling3tiny, or use default features"
+);
+
 use std::{env, os::unix::process::CommandExt, process::Command};
 
 fn main() {

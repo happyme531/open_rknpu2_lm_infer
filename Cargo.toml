@@ -7,23 +7,43 @@ description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"
 license = "AGPL-3.0-only"
 autoexamples = false
 
+[features]
+default = ["all-models", "draft-dflash"]
+all-models = ["model-qwen3", "model-llama", "model-granite", "model-qwen35", "model-minicpmv47", "model-ling3tiny"]
+model-qwen3 = ["arch-dense"]
+model-llama = ["arch-dense"]
+model-granite = ["arch-dense"]
+model-qwen35 = ["arch-qwen35", "vision"]
+model-minicpmv47 = ["arch-qwen35"]
+model-ling3tiny = []
+# Shared implementations/capabilities. Selecting an architecture alone does not
+# register any model family in the executable.
+arch-dense = []
+arch-qwen35 = []
+vision = ["arch-qwen35", "dep:image"]
+draft-dflash = ["arch-qwen35"]
+
 [[example]]
 name = "kda_check_cost"
+required-features = ["model-ling3tiny"]
 path = "tests/tools/kda_check_cost.rs"
 test = false
 
 [[example]]
 name = "ling3tiny_check"
+required-features = ["model-ling3tiny"]
 path = "tests/tools/ling3tiny_check.rs"
 test = false
 
 [[example]]
 name = "minicpmv47_check"
+required-features = ["model-minicpmv47"]
 path = "tests/tools/minicpmv47_check.rs"
 test = false
 
 [[example]]
 name = "minicpmv47_bench"
+required-features = ["model-minicpmv47"]
 path = "tests/tools/minicpmv47_bench.rs"
 test = false
 
@@ -41,43 +61,59 @@ test = false
 
 [[example]]
 name = "gdn_bench"
+required-features = ["arch-qwen35"]
 path = "tests/tools/gdn_bench.rs"
 test = false
 
 [[example]]
 name = "gdn_small_bench"
+required-features = ["arch-qwen35"]
 path = "tests/tools/gdn_small_bench.rs"
 test = false
 
 [[example]]
 name = "qwen35_check"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_check.rs"
 test = false
 
 [[example]]
 name = "qwen35_inventory"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_inventory.rs"
 test = false
 
 [[example]]
 name = "mtp_bench"
+required-features = ["arch-qwen35"]
 path = "tests/tools/mtp_bench.rs"
 test = false
 
 [[example]]
 name = "dflash_bench"
+required-features = ["draft-dflash"]
 path = "tests/tools/dflash_bench.rs"
 test = false
 
 [[example]]
 name = "vision_probe"
+required-features = ["vision"]
 path = "tests/tools/vision_probe.rs"
 test = false
 
 [[example]]
 name = "vision_profile"
+required-features = ["vision"]
 path = "tests/tools/vision_profile.rs"
 test = false
+
+[[test]]
+name = "cpu_layers"
+required-features = ["arch-qwen35"]
+
+[[test]]
+name = "vision_input"
+required-features = ["vision"]
 
 [dependencies]
 anyhow = "1"
@@ -103,7 +139,7 @@ rayon = "1"
 regex = "1"
 base64 = "0.22"
 sha2 = "0.10"
-image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }
+image = { version = "=0.25.8", optional = true, default-features = false, features = ["jpeg", "png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

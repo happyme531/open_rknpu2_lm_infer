@@ -1,6 +1,10 @@
-use super::{runtime::Qwen35, vision::Encoder};
+use super::runtime::Qwen35;
+#[cfg(feature = "vision")]
+use super::vision::Encoder;
 use crate::{input::PreparedInput, model::LanguageModel};
-use anyhow::{Context, Result, ensure};
+#[cfg(feature = "vision")]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) struct EmbeddedChunk<'a> {
@@ -16,6 +20,11 @@ impl Qwen35 {
         cancel: &AtomicBool,
     ) -> Result<()> {
         input.validate()?;
+        #[cfg(not(feature = "vision"))]
+        ensure!(
+            input.images.is_empty(),
+            "image support is not included in this build"
+        );
         ensure!(
             self.round.is_none(),
             "Qwen3.5 verification transaction is active"
@@ -29,7 +38,9 @@ impl Qwen35 {
         self.check_input(&input.tokens[start..])?;
         self.reserve(input.tokens.len())?;
         let result = (|| {
+            #[allow(unused_mut)]
             let mut features = Vec::new();
+            #[cfg(feature = "vision")]
             for span in input.images.iter().filter(|s| s.end() > start) {
                 ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
                 if self.vision.is_none() {

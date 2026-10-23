@@ -34,6 +34,7 @@ impl Drop for Span {
     }
 }
 #[inline]
+#[cfg(feature = "model-ling3tiny")]
 pub(crate) fn measure<T>(name: &'static CStr, operation: impl FnOnce() -> T) -> T {
     let _span = Span::new(name, -1, 0, 0);
     operation()
@@ -97,7 +98,7 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "arch-qwen35"))]
     pub fn in_directory(path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&path)?;
         Ok(Self {
@@ -105,7 +106,7 @@ impl Trace {
             position: None,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "model-minicpmv47"))]
     pub fn at_position(mut self, position: usize) -> Self {
         self.position = Some(position);
         self
@@ -123,6 +124,7 @@ impl Trace {
             position: None,
         })
     }
+    #[cfg(any(feature = "arch-dense", feature = "arch-qwen35", feature = "vision"))]
     pub fn enabled(&self) -> bool {
         self.directory.is_some()
     }
@@ -146,6 +148,7 @@ impl Trace {
         file.write_all(bytes)?;
         Ok(())
     }
+    #[cfg(feature = "vision")]
     pub fn save_half(
         &self,
         position: usize,

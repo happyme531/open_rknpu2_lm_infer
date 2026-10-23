@@ -58,6 +58,18 @@ impl Features {
 }
 
 impl Qwen35 {
+    pub(super) fn has_dflash(&self) -> bool {
+        #[cfg(feature = "draft-dflash")]
+        {
+            self.dflash.is_some()
+        }
+        #[cfg(not(feature = "draft-dflash"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "draft-dflash")]
     pub(super) fn load_dflash(&mut self) -> Result<()> {
         ensure!(
             !self
@@ -94,16 +106,18 @@ impl Qwen35 {
         self.load_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
     }
-    pub(super) fn flush_features(&mut self, cancel: Option<&AtomicBool>) -> Result<()> {
+    pub(super) fn flush_features(&mut self, _cancel: Option<&AtomicBool>) -> Result<()> {
+        #[cfg(feature = "draft-dflash")]
         if self.dflash.is_some() {
             let features = self.take_features();
             self.dflash
                 .as_mut()
                 .unwrap()
-                .prepare_context(&features, cancel)?;
+                .prepare_context(&features, _cancel)?;
         }
         Ok(())
     }
+    #[cfg(feature = "draft-dflash")]
     pub(super) fn dflash_logits(
         &mut self,
         anchor: u32,

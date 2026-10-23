@@ -116,6 +116,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn start(options: ModelOptions) -> Result<Self> {
+        model::ensure_enabled(&options.path)?;
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);

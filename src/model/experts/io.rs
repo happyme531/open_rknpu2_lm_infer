@@ -155,6 +155,7 @@ impl Reader {
             record_stride,
         })
     }
+    #[cfg(any(feature = "arch-qwen35", test))]
     pub fn predict(&self, layer: usize, experts: &[usize]) {
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();

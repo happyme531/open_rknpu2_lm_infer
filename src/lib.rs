@@ -1,3 +1,11 @@
+#[cfg(all(
+    feature = "draft-dflash",
+    not(any(feature = "model-qwen35", feature = "model-minicpmv47"))
+))]
+compile_error!("draft-dflash requires model-qwen35 or model-minicpmv47");
+
+pub const PROJECT_NAME: &str = env!("RKNPU_PROJECT_NAME");
+
 pub mod api;
 pub mod bench;
 pub mod cli;

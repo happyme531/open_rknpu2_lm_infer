@@ -1,16 +1,20 @@
+use crate::model::ModelOptions;
+#[cfg(feature = "vision")]
 use crate::{
-    model::{ModelOptions, VisionDtype},
+    model::VisionDtype,
     npu::{self, Backend, FloatBackend},
     vision::ImageProcessor,
 };
-use anyhow::{Context, Result, ensure};
+#[cfg(feature = "vision")]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Instant};
 
 pub(super) fn run(
     mut options: ModelOptions,
     vision: bool,
-    images: Vec<PathBuf>,
+    _images: Vec<PathBuf>,
     batches: Vec<usize>,
     report: Option<PathBuf>,
 ) -> Result<()> {
@@ -18,7 +22,14 @@ pub(super) fn run(
     options.tune_search = true;
     let start = Instant::now();
     let mut result = if vision {
-        vision_profiles(options, images)?
+        #[cfg(feature = "vision")]
+        {
+            vision_profiles(options, _images)?
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            anyhow::bail!("vision tuning is not included in this build")
+        }
     } else {
         text_profiles(options, batches)?
     };
@@ -58,6 +69,7 @@ fn text_profiles(options: ModelOptions, mut batches: Vec<usize>) -> Result<Value
     Ok(json!({"mode":"text", "batches":batches, "stats":model.stats()}))
 }
 
+#[cfg(feature = "vision")]
 fn vision_profiles(mut options: ModelOptions, images: Vec<PathBuf>) -> Result<Value> {
     let processor =
         ImageProcessor::load(&options.path)?.context("model has no supported vision encoder")?;
@@ -89,7 +101,7 @@ fn vision_profiles(mut options: ModelOptions, images: Vec<PathBuf>) -> Result<Va
     }
     rows.sort_unstable();
     rows.dedup();
-    let shapes = crate::model::qwen35::vision::tuning_shapes(&options.path, &rows)?;
+    let shapes = crate::model::vision_tuning_shapes(&options.path, &rows)?;
     npu::configure_cpu(&mut options)?;
     eprintln!(
         "Tuning ViT {}: {} shapes; cache={}",

@@ -50,6 +50,7 @@ impl Paging {
             timeline,
         }))
     }
+    #[cfg(feature = "arch-qwen35")]
     pub fn predict(&self, layer: usize, ids: &[i32]) {
         let Some(hot) = &self.hot else { return };
         self.timeline
@@ -70,11 +71,11 @@ impl Paging {
             "effective_cache_percent":100. * self.slots as f64 / self.experts as f64,
             "prefetch":self.hot.is_some(),"read_buffer_limit":32,"les_correct":correct,"les_total":total})
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "model-minicpmv47"))]
     pub fn save_timeline(&self) -> Result<()> {
         self.timeline.save()
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "model-minicpmv47", feature = "model-ling3tiny")))]
     pub fn forward_marker(&self, position: usize, rows: usize, begin: bool) {
         self.timeline.mark(
             if begin {
@@ -130,6 +131,7 @@ impl Paged {
             decode: Stats::default(),
         })
     }
+    #[cfg(feature = "arch-qwen35")]
     pub fn stats(&self) -> Value {
         json!({"all":self.stats,"decode":self.decode,"slots":self.window.contents()})
     }

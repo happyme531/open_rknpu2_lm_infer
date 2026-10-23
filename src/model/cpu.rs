@@ -8,6 +8,7 @@ pub struct Cpu {
 }
 
 #[inline]
+#[cfg(any(feature = "arch-dense", feature = "draft-dflash", test))]
 fn square_sum(x: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -40,10 +41,12 @@ fn square_sum(x: &[f32]) -> f32 {
 }
 
 #[inline]
+#[cfg(any(feature = "arch-dense", test))]
 fn rotate(a: f32, b: f32, cosine: f32, sine: f32) -> (f32, f32) {
     ((-b).mul_add(sine, a * cosine), b.mul_add(cosine, a * sine))
 }
 
+#[cfg(any(feature = "arch-dense", feature = "draft-dflash", test))]
 fn norm_row(x: &[f32], y: &mut [f32], w: &[f32], epsilon: f32) {
     let scale = (square_sum(x) / x.len() as f32 + epsilon).sqrt().recip();
     let mut i = 0;
@@ -221,6 +224,7 @@ impl Cpu {
             ),
         })
     }
+    #[cfg(any(feature = "arch-dense", feature = "draft-dflash", test))]
     pub fn norm(&self, x: &[f32], y: &mut [f32], weight: &[f32], epsilon: f32) {
         let width = weight.len();
         if x.len() == width {
@@ -244,6 +248,7 @@ impl Cpu {
             });
         }
     }
+    #[cfg(feature = "arch-dense")]
     pub fn scale(&self, values: &mut [f32], scale: f32) {
         if scale != 1.0 {
             for value in values {
@@ -252,6 +257,7 @@ impl Cpu {
         }
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(feature = "arch-dense", test))]
     pub fn rope(
         &self,
         x: &mut [f32],

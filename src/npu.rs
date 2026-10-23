@@ -22,18 +22,24 @@ mod ffi {
 use ffi::*;
 mod attention;
 pub use attention::{Attention, FullAttention};
+#[cfg(feature = "arch-qwen35")]
 mod gated_delta;
+#[cfg(feature = "arch-qwen35")]
 pub use gated_delta::GatedDelta;
 mod floating;
 pub use floating::{FloatBackend, FloatLinear};
+#[cfg(feature = "model-ling3tiny")]
 mod tf32;
+#[cfg(feature = "model-ling3tiny")]
 pub use tf32::{Tf32Backend, Tf32Linear};
 mod moe;
 pub use moe::Moe;
+#[cfg(feature = "model-ling3tiny")]
 mod mla;
+#[cfg(feature = "model-ling3tiny")]
 pub use mla::Mla;
 mod policy;
-#[cfg(test)]
+#[cfg(all(test, feature = "vision"))]
 mod vision_tests;
 
 #[cfg(test)]

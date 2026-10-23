@@ -2,7 +2,11 @@ use super::{
     checkpoint::{QuantLoader, concatenate},
     cpu::Cpu,
 };
-use crate::npu::{Backend, FloatBackend, FloatLinear};
+use crate::npu::Backend;
+#[cfg(feature = "arch-qwen35")]
+use crate::npu::FloatBackend;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
+use crate::npu::FloatLinear;
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -11,6 +15,7 @@ use std::sync::Arc;
 /// floating auxiliary networks; neither path changes checkpoint quantization.
 pub(crate) enum Linear {
     Quantized(crate::npu::Linear),
+    #[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
     Floating {
         linear: FloatLinear,
         n: usize,
@@ -19,11 +24,13 @@ pub(crate) enum Linear {
         weight: super::checkpoint::Tensor,
         pool: Arc<rayon::ThreadPool>,
     },
+    #[cfg(feature = "arch-qwen35")]
     SplitK {
         parts: Vec<(Linear, usize, usize)>,
         k: usize,
         n: usize,
     },
+    #[cfg(feature = "arch-qwen35")]
     SplitN {
         parts: Vec<Linear>,
         n: usize,
@@ -38,7 +45,10 @@ impl Linear {
     fn n(&self) -> usize {
         match self {
             Self::Quantized(l) => l.n(),
-            Self::Floating { n, .. } | Self::SplitK { n, .. } | Self::SplitN { n, .. } => *n,
+            #[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
+            Self::Floating { n, .. } => *n,
+            #[cfg(feature = "arch-qwen35")]
+            Self::SplitK { n, .. } | Self::SplitN { n, .. } => *n,
             Self::Host { weight, .. } => weight.shape[0],
         }
     }
@@ -73,6 +83,7 @@ impl Linear {
             )?
             .into())
     }
+    #[cfg(feature = "arch-qwen35")]
     pub(crate) fn floating(
         backend: &FloatBackend,
         store: &super::checkpoint::TensorStore,
@@ -130,6 +141,7 @@ impl Linear {
     pub(crate) fn run(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<()> {
         match self {
             Self::Quantized(l) => l.run(input, output, rows),
+            #[cfg(feature = "arch-qwen35")]
             Self::SplitN { parts, n } => {
                 ensure!(
                     output.len() == rows * n,
@@ -165,6 +177,7 @@ impl Linear {
                 });
                 Ok(())
             }
+            #[cfg(feature = "arch-qwen35")]
             Self::SplitK { parts, k, n } => {
                 ensure!(
                     input.len() == rows * k && output.len() == rows * n,
@@ -184,6 +197,7 @@ impl Linear {
                 }
                 Ok(())
             }
+            #[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
             Self::Floating { linear, n } => {
                 ensure!(
                     rows > 0 && input.len().is_multiple_of(rows) && output.len() == rows * n,
@@ -196,10 +210,7 @@ impl Linear {
     fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
         match self {
             Self::Quantized(l) => l.run_swiglu(input, output, rows),
-            Self::Floating { .. }
-            | Self::SplitK { .. }
-            | Self::SplitN { .. }
-            | Self::Host { .. } => Ok(false),
+            _ => Ok(false),
         }
     }
 }
@@ -210,6 +221,7 @@ pub(crate) struct Projection {
 }
 
 impl Projection {
+    #[cfg(feature = "arch-qwen35")]
     pub(crate) fn floating(
         backend: &FloatBackend,
         store: &super::checkpoint::TensorStore,
@@ -224,6 +236,12 @@ impl Projection {
         }
         Ok(Self { parts, width })
     }
+    #[cfg(any(
+        feature = "arch-dense",
+        feature = "model-ling3tiny",
+        feature = "draft-dflash",
+        test
+    ))]
     pub(crate) fn scratch_width(&self) -> usize {
         if self.parts.len() <= 1 {
             0

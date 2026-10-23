@@ -140,6 +140,7 @@ impl Qwen35 {
             if let Some(mtp) = &mut self.mtp {
                 mtp.abort()?;
             }
+            #[cfg(feature = "draft-dflash")]
             if let Some(draft) = &self.dflash {
                 draft.abort()?;
             }

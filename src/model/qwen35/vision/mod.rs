@@ -8,12 +8,7 @@ use crate::{
 };
 pub use encoder::Encoder;
 
-pub struct LinearShape {
-    pub name: &'static str,
-    pub rows: usize,
-    pub k: usize,
-    pub n: usize,
-}
+use crate::model::LinearShape;
 
 /// Static projection shapes from the model configuration, without loading weights.
 pub fn tuning_shapes(path: &std::path::Path, rows: &[usize]) -> anyhow::Result<Vec<LinearShape>> {

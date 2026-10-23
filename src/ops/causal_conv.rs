@@ -28,6 +28,7 @@ impl ConvState {
     pub fn history(&self) -> &[f32] {
         &self.history
     }
+    #[cfg(feature = "arch-qwen35")]
     pub(crate) fn history_mut(&mut self) -> &mut [f32] {
         &mut self.history
     }
