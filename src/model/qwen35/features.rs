@@ -164,7 +164,6 @@ impl Qwen35 {
         );
         let start = Instant::now();
         let mut logits = vec![0.; rows * self.info.vocab_size];
-        self.head.prepare(rows)?;
         self.head.run(&self.cpu, hidden, &mut logits, rows)?;
         self.head_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(logits)

@@ -91,13 +91,7 @@ impl Linear {
                 }
                 Ok(())
             }
-            Self::Floating { linear, n } => {
-                ensure!(
-                    rows > 0 && input.len().is_multiple_of(rows) && output.len() == rows * n,
-                    "invalid floating decoder projection shape"
-                );
-                linear.run(input, output, rows)
-            }
+            Self::Floating { linear, .. } => linear.run(input, output, rows),
         }
     }
     fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {

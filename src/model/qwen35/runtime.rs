@@ -446,7 +446,6 @@ impl LanguageModel for Qwen35 {
         let input = mtp.draft(&self.config, &self.cpu, &self.embedding, token, &self.trace)?;
         let head_start = Instant::now();
         self.logits.resize(self.info.vocab_size, 0.);
-        self.head.prepare(1)?;
         self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
         self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
         Ok(&self.logits)

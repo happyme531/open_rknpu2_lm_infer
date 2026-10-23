@@ -2,7 +2,7 @@ mod tune;
 use crate::{
     engine::{Engine, GenerationEvent, GenerationRequest, Prompt},
     model::{ModelOptions, SpeculativeConfig, SpeculativeType, VisionDtype},
-    sampling::{DraftSampling, SamplingParams},
+    sampling::{DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DraftSampling, SamplingParams},
     text::TextCodec,
 };
 use anyhow::{Context, Result, bail};
@@ -406,10 +406,10 @@ pub struct GenerationArgs {
         short = 'n',
         long = "n-predict",
         visible_alias = "predict",
-        default_value_t = 256
+        default_value_t = DEFAULT_MAX_TOKENS
     )]
     pub max_tokens: usize,
-    #[arg(long = "temp", visible_alias = "temperature", default_value_t = 0.6)]
+    #[arg(long = "temp", visible_alias = "temperature", default_value_t = DEFAULT_TEMPERATURE)]
     pub temperature: f32,
     #[arg(long, default_value_t = 0.95)]
     pub top_p: f32,
@@ -668,6 +668,27 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
+    }
+
+    #[test]
+    fn generation_defaults_and_overrides_are_shared_by_run_and_chat() {
+        for command in ["run", "chat"] {
+            for (flags, temperature, limit) in [
+                (vec![], 1., 2048),
+                (vec!["--temp", "0", "-n", "17"], 0., 17),
+            ] {
+                let mut args = vec!["infer", "-m", "model", command];
+                args.extend(flags);
+                let generation = match parse(&args).command {
+                    Command::Run { generation, .. } | Command::Chat { generation, .. } => {
+                        generation
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(generation.sampling().unwrap().temperature, temperature);
+                assert_eq!(generation.max_tokens, limit);
+            }
+        }
     }
 
     #[test]

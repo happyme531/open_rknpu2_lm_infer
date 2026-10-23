@@ -54,7 +54,6 @@ impl Qwen35 {
                 .hidden
                 .extend_from_slice(&self.work.normalized[..rows * h]);
             self.logits.resize(rows * self.info.vocab_size, 0.);
-            self.head.prepare(rows)?;
             self.head.run(
                 &self.cpu,
                 &self.work.normalized[..rows * h],
@@ -62,7 +61,7 @@ impl Qwen35 {
                 rows,
             )?;
             self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
-            ensure!(
+            debug_assert!(
                 self.logits.iter().all(|v| v.is_finite()),
                 "nonfinite verification logits"
             );

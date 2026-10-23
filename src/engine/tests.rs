@@ -1,6 +1,13 @@
 use super::*;
 use crate::sampling::SamplingParams;
 
+fn greedy() -> SamplingParams {
+    SamplingParams {
+        temperature: 0.,
+        ..Default::default()
+    }
+}
+
 /// A history-length oracle with controllable proposal rejection. It implements
 /// real pending transactions, so emitting/committing too far fails the test.
 struct Model {
@@ -152,7 +159,7 @@ fn confidence_truncation_preserves_greedy_commit_and_budget_boundaries() -> Resu
                         .collect();
                     let anchor =
                         model.forward(&[4])?.iter().position(|x| *x == 10.).unwrap() as u32;
-                    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[4, anchor])?;
+                    let mut sampler = Sampler::new(greedy(), 5, &[4, anchor])?;
                     let round = run_round_with_options(
                         &mut model,
                         &mut sampler,
@@ -226,7 +233,7 @@ fn run(
     max_tokens: usize,
     stop: Vec<String>,
 ) -> Result<(GenerationResult, String)> {
-    run_with_sampling(model, codec, max_tokens, stop, SamplingParams::default())
+    run_with_sampling(model, codec, max_tokens, stop, greedy())
 }
 fn run_with_sampling(
     model: &mut Model,
@@ -396,7 +403,7 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
-            sampling: SamplingParams::default(),
+            sampling: greedy(),
             max_tokens: 8,
             stop: vec![],
         },

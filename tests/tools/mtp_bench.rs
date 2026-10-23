@@ -61,7 +61,7 @@ struct Args {
     tune_cache: Option<PathBuf>,
     #[arg(long)]
     prompts: Option<PathBuf>,
-    #[arg(long, default_value_t = 0.)]
+    #[arg(long, default_value_t = open_rknpu2_lm_infer::sampling::DEFAULT_TEMPERATURE)]
     temperature: f32,
     #[arg(long, default_value_t = 42)]
     seed: u64,

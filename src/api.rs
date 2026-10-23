@@ -624,6 +624,25 @@ mod tests {
         json!({"model":"qwen","messages":[{"role":"user","content":"hi"}]})
     }
     #[test]
+    fn generation_defaults_and_overrides_match_both_endpoints() {
+        for (chat, input) in [
+            (true, request()),
+            (false, json!({"model":"qwen","prompt":"hi"})),
+        ] {
+            let parsed = parse_request(input.clone(), chat, "qwen", 4096).unwrap();
+            assert_eq!(parsed.request.sampling.temperature, 1.);
+            assert_eq!(parsed.request.max_tokens, 2048);
+            for key in ["max_tokens", "max_completion_tokens"] {
+                let mut explicit = input.clone();
+                explicit[key] = json!(17);
+                explicit["temperature"] = json!(0);
+                let parsed = parse_request(explicit, chat, "qwen", 4096).unwrap();
+                assert_eq!(parsed.request.sampling.temperature, 0.);
+                assert_eq!(parsed.request.max_tokens, 17);
+            }
+        }
+    }
+    #[test]
     fn rejects_semantic_options() {
         for (key, value) in [
             ("n", json!(2)),

@@ -3,6 +3,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+pub const DEFAULT_MAX_TOKENS: usize = 2048;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum DraftSampling {
     #[default]
@@ -34,7 +37,7 @@ pub struct SamplingParams {
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            temperature: 0.0,
+            temperature: DEFAULT_TEMPERATURE,
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
@@ -150,7 +153,7 @@ impl Sampler {
         let mut values = Vec::with_capacity(logits.len());
         for (token, &original) in logits.iter().enumerate() {
             let value = self.processed_logit(token, original);
-            ensure!(value.is_finite(), "nonfinite draft confidence logit");
+            debug_assert!(value.is_finite(), "nonfinite draft confidence logit");
             values.push(value);
         }
         if top_k > 0 && top_k < values.len() {
@@ -254,28 +257,31 @@ impl Sampler {
             "invalid logits vocabulary"
         );
         self.candidates.clear();
+        let mut best = (0, f32::NEG_INFINITY);
         for (token, &original) in logits.iter().enumerate() {
-            ensure!(original.is_finite(), "nonfinite logit at token {token}");
+            debug_assert!(original.is_finite(), "nonfinite logit at token {token}");
             let value = self.processed_logit(token, original);
-            self.candidates.push((token as u32, value));
-        }
-        if self.params.temperature == 0.0 {
-            // Stable first-token tie break matches the greedy reference path.
-            let mut best = self.candidates[0];
-            for &candidate in &self.candidates[1..] {
-                if candidate.1 > best.1 {
-                    best = candidate;
+            if self.greedy() {
+                // Retain the first token when processed logits tie.
+                if value > best.1 {
+                    best = (token as u32, value);
                 }
+            } else {
+                self.candidates.push((token as u32, value));
             }
+        }
+        if self.greedy() {
             return Ok(Distribution {
                 values: vec![(best.0, 1.)],
             });
         }
-        self.candidates
-            .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        if self.params.top_k > 0 {
-            self.candidates.truncate(self.params.top_k);
+        let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+        let k = self.params.top_k;
+        if k > 0 && k < self.candidates.len() {
+            self.candidates.select_nth_unstable_by(k - 1, order);
+            self.candidates.truncate(k);
         }
+        self.candidates.sort_unstable_by(order);
         let maximum = self.candidates[0].1;
         let mut sum = 0.0f64;
         for candidate in &mut self.candidates {
@@ -310,6 +316,94 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_top_k_matches_full_sort_probabilities_and_seeded_draws() -> Result<()> {
+        for vocab in [1, 37, 4096] {
+            for k in [0, 1, 20, vocab, vocab + 1] {
+                for step in 0..4 {
+                    let params = SamplingParams {
+                        temperature: if step % 2 == 0 { 1. } else { 0.6 },
+                        top_k: k,
+                        top_p: [0., 0.95, 1., 0.8][step],
+                        min_p: 0.05,
+                        repeat_penalty: 1.1,
+                        presence_penalty: 0.2,
+                        frequency_penalty: 0.1,
+                        seed: Some(42),
+                    };
+                    let mut actual = Sampler::new(params.clone(), vocab, &[0, 0])?;
+                    let mut reference = actual.clone();
+                    let logits: Vec<_> = (0..vocab)
+                        .map(|i| {
+                            if step == 0 {
+                                0.
+                            } else {
+                                ((i * 17 + step * 31) % 61) as f32 * 0.25 - 7.5
+                            }
+                        })
+                        .collect();
+                    let mut sorted: Vec<_> = logits
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &value)| (i as u32, reference.processed_logit(i, value)))
+                        .collect();
+                    sorted.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                    if k > 0 {
+                        sorted.truncate(k);
+                    }
+                    let maximum = sorted[0].1;
+                    for (_, value) in &mut sorted {
+                        *value = ((*value - maximum) / params.temperature).exp();
+                    }
+                    let sum: f64 = sorted.iter().map(|(_, value)| *value as f64).sum();
+                    let minimum = sorted[0].1 * params.min_p;
+                    let mut cumulative = 0.;
+                    let mut kept = Vec::new();
+                    for candidate in sorted {
+                        if candidate.1 < minimum {
+                            break;
+                        }
+                        cumulative += candidate.1 as f64;
+                        kept.push(candidate);
+                        if cumulative >= sum * params.top_p as f64 {
+                            break;
+                        }
+                    }
+                    let total: f64 = kept.iter().map(|(_, value)| *value as f64).sum();
+                    let expected = Distribution {
+                        values: kept
+                            .into_iter()
+                            .map(|(i, value)| (i, value as f64 / total))
+                            .collect(),
+                    };
+                    assert_eq!(
+                        actual.distribution(&logits)?.values,
+                        expected.values,
+                        "vocab={vocab},k={k},step={step}"
+                    );
+                    assert_eq!(actual.sample(&logits)?, reference.draw(&expected));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn greedy_preserves_first_token_ties() -> Result<()> {
+        let mut sampler = Sampler::new(
+            SamplingParams {
+                temperature: 0.,
+                ..Default::default()
+            },
+            3,
+            &[],
+        )?;
+        assert_eq!(sampler.sample(&[-0., 0., -1.])?, 0);
+        assert_eq!(sampler.sample(&[-1., 2., 2.])?, 1);
+        Ok(())
+    }
+
     #[test]
     fn mtp_draft_uses_raw_top_ten_and_independent_sampling_settings() -> Result<()> {
         let parent = Sampler::new(
@@ -346,6 +440,7 @@ mod tests {
     fn draft_confidence_precedes_greedy_and_sampling_truncation() -> Result<()> {
         let mut sampler = Sampler::new(
             SamplingParams {
+                temperature: 0.,
                 repeat_penalty: 2.,
                 presence_penalty: 1.,
                 frequency_penalty: 0.5,
@@ -361,7 +456,6 @@ mod tests {
         assert_eq!(sampler.distribution(&logits)?.probability(1), 1.);
         let sampler = Sampler::new(SamplingParams::default(), 3, &[])?;
         assert!((sampler.draft_confidence(&[10000.; 3], 10)? - 1. / 3.).abs() < 1e-12);
-        assert!(sampler.draft_confidence(&[0., f32::NAN, 0.], 10).is_err());
         assert!(sampler.draft_confidence(&[0.], 10).is_err());
         Ok(())
     }
@@ -451,6 +545,7 @@ mod tests {
     fn proposal_history_does_not_change_committed_processors() {
         let mut target = Sampler::new(
             SamplingParams {
+                temperature: 0.,
                 frequency_penalty: 2.,
                 ..Default::default()
             },
@@ -478,6 +573,7 @@ mod tests {
     #[test]
     fn penalties_change_greedy_choice() {
         let params = SamplingParams {
+            temperature: 0.,
             frequency_penalty: 1.0,
             ..Default::default()
         };

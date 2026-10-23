@@ -294,6 +294,7 @@ fn run_generation(
     let mut verify_physical_rows = 0;
     let mut replay_rows = 0;
     let mut repair_rows = 0;
+    let mut events = Vec::new();
     while generated < job.request.max_tokens {
         ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
         let call = Instant::now();
@@ -308,26 +309,29 @@ fn run_generation(
         } else {
             None
         };
-        let batch = if let Some(round) = &round {
+        let sampled;
+        let batch: &[u32] = if let Some(round) = &round {
             draft_ms += round.draft_ms;
             verify_ms += round.verify_ms;
             proposed += round.inputs.len() - 1;
             draft_attempts += round.draft_attempts;
             confidence_stops += usize::from(round.confidence_stopped);
-            round.output.clone()
+            &round.output
         } else {
             if let Some(anchor) = pending {
-                cache.logits = model.forward_cancellable(&[anchor], &job.cancel)?.to_vec();
+                let logits = model.forward_cancellable(&[anchor], &job.cancel)?;
+                cache.logits.clear();
+                cache.logits.extend_from_slice(logits);
                 cache.append_token(anchor);
                 decode_calls += 1;
                 consumed_tokens += 1;
             }
-            vec![sampler.sample(&cache.logits)?]
+            sampled = [sampler.sample(&cache.logits)?];
+            &sampled
         };
-        let mut events = Vec::new();
         let mut emitted = 0;
         let mut stopped = false;
-        for &token in &batch {
+        for &token in batch {
             ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
             generated += 1;
             emitted += 1;
@@ -358,7 +362,10 @@ fn run_generation(
             model.finish_verification(emitted)?;
             repair_ms += repair_start.elapsed().as_secs_f64() * 1000.;
             let vocab = model.info().vocab_size;
-            cache.logits = round.logits[(emitted - 1) * vocab..emitted * vocab].to_vec();
+            cache.logits.clear();
+            cache
+                .logits
+                .extend_from_slice(&round.logits[(emitted - 1) * vocab..emitted * vocab]);
             for &input in &round.inputs[..emitted] {
                 cache.append_token(input);
             }
@@ -377,7 +384,7 @@ fn run_generation(
         if generated > emitted {
             decode_model_ms += call.elapsed().as_secs_f64() * 1000.;
         }
-        for output in events {
+        for output in events.drain(..) {
             text.push_str(&output);
             if ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.);

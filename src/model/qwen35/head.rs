@@ -50,11 +50,10 @@ impl Qwen35 {
         self.trace
             .save(self.position, -1, "head_input", &self.work.normalized[..h])?;
         self.logits.resize(self.info.vocab_size, 0.0);
-        self.head.prepare(1)?;
         self.head
             .run(&self.cpu, &self.work.normalized[..h], &mut self.logits, 1)?;
         self.head_ms += start.elapsed().as_secs_f64() * 1000.0;
-        ensure!(
+        debug_assert!(
             self.logits.iter().all(|v| v.is_finite()),
             "nonfinite Qwen3.5 logits"
         );

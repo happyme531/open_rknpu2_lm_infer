@@ -408,7 +408,8 @@ impl FloatLinear {
                     std::mem::size_of_val(output) as u64,
                 )
             },
-            &format!("floating Linear M={rows} K={} N={}", self.k, self.n),
+            "floating Linear run",
         )
+        .with_context(|| format!("floating Linear M={rows} K={} N={}", self.k, self.n))
     }
 }
