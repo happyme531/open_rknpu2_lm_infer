@@ -234,6 +234,9 @@ pub enum Command {
         port: u16,
         #[arg(long, env = "OPEN_RKNPU_API_KEY")]
         api_key: Option<String>,
+        /// Tool output protocol; does not change the chat template.
+        #[arg(long, value_enum, default_value = "tool-call-json")]
+        tool_call_parser: crate::api::ToolCallParser,
     },
     /// Inspect model metadata without opening the NPU.
     Inspect,
@@ -593,9 +596,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
             host,
             port,
             api_key,
+            tool_call_parser,
         } => {
             let engine = Engine::start(options)?;
-            crate::api::serve(engine, &host, port, api_key).await?;
+            crate::api::serve_with_parser(engine, &host, port, api_key, tool_call_parser).await?;
         }
         Command::Bench(args) => crate::bench::run(
             options,
@@ -628,6 +632,38 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serve_tool_parser_is_explicit() {
+        for (args, expected) in [
+            (
+                vec!["test", "serve"],
+                crate::api::ToolCallParser::ToolCallJson,
+            ),
+            (
+                vec!["test", "serve", "--tool-call-parser", "minicpm5"],
+                crate::api::ToolCallParser::Minicpm5,
+            ),
+        ] {
+            let cli = <super::Cli as clap::Parser>::try_parse_from(args).unwrap();
+            let super::Command::Serve {
+                tool_call_parser, ..
+            } = cli.command
+            else {
+                panic!("expected serve")
+            };
+            assert_eq!(tool_call_parser, expected);
+        }
+        assert!(
+            <super::Cli as clap::Parser>::try_parse_from([
+                "test",
+                "serve",
+                "--tool-call-parser",
+                "auto"
+            ])
+            .is_err()
+        );
+    }
+
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {

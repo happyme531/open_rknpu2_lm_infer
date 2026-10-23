@@ -1,10 +1,9 @@
 use crate::{
     model::{self, LanguageModel, ModelInfo, ModelOptions},
-    sampling::{Sampler, SamplingParams},
-    text::{StopFilter, TextCodec},
+    sampling::Sampler,
+    text::{OutputDecoder, StopFilter, TextCodec},
 };
 use anyhow::{Context, Result, anyhow, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -20,63 +19,11 @@ mod context;
 mod tests;
 use context::{PrefixCache, validate_request_tokens};
 
-#[derive(Debug, Clone)]
-pub enum Prompt {
-    Text(String),
-    Tokens(Vec<u32>),
-    Chat {
-        messages: Vec<Value>,
-        tools: Option<Value>,
-        enable_thinking: bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationRequest {
-    pub prompt: Prompt,
-    pub sampling: SamplingParams,
-    pub max_tokens: usize,
-    pub stop: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationResult {
-    pub text: String,
-    pub finish_reason: String,
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub cached_tokens: usize,
-    pub timings: Value,
-    pub stats: Value,
-}
-
-#[derive(Debug, Clone)]
-pub enum GenerationEvent {
-    Token(String),
-    Finished(GenerationResult),
-    Error(String),
-}
-
-pub struct GenerationHandle {
-    pub events: mpsc::Receiver<GenerationEvent>,
-    pub cancel: Arc<AtomicBool>,
-}
-impl Drop for GenerationHandle {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
-#[derive(Debug)]
-pub struct EngineBusy;
-impl std::fmt::Display for EngineBusy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("inference request queue is full")
-    }
-}
-impl std::error::Error for EngineBusy {}
+mod types;
+pub use types::*;
 
 struct Job {
+    preserve_tool_markers: bool,
     input: crate::input::PreparedInput,
     request: GenerationRequest,
     events: mpsc::Sender<GenerationEvent>,
@@ -223,6 +170,14 @@ impl Engine {
     }
 
     pub fn generate(&self, request: GenerationRequest) -> Result<GenerationHandle> {
+        self.generate_with_tool_markers(request, false)
+    }
+
+    pub(crate) fn generate_with_tool_markers(
+        &self,
+        request: GenerationRequest,
+        preserve_tool_markers: bool,
+    ) -> Result<GenerationHandle> {
         ensure!(
             !self.inner.shutdown.load(Ordering::Relaxed),
             "inference worker is shutting down"
@@ -241,6 +196,7 @@ impl Engine {
         let (events_tx, events) = mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
         let job = Job {
+            preserve_tool_markers,
             input,
             request,
             events: events_tx,
@@ -315,7 +271,7 @@ fn run_generation(
         &job.input.tokens,
     )?;
     let mut filter = StopFilter::new(job.request.stop.clone())?;
-    let mut decoder = codec.tokenizer.decode_stream(true);
+    let mut decoder = OutputDecoder::new(&codec.tokenizer, job.preserve_tool_markers);
     let mut text = String::new();
     let mut generated = 0;
     let mut reason = "length";

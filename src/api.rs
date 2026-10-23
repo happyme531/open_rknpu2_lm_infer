@@ -2,7 +2,10 @@ use crate::engine::{
     Engine, GenerationEvent, GenerationHandle, GenerationRequest, GenerationResult, Prompt,
 };
 use crate::sampling::SamplingParams;
+#[path = "api/request.rs"]
 mod request;
+#[path = "api/tool_parser.rs"]
+mod tool_parser;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -24,14 +27,24 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub use tool_parser::ToolCallParser;
 
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+    tool_call_parser: ToolCallParser,
     api_key: Option<Arc<str>>,
 }
 
 pub fn router(engine: Engine, api_key: Option<String>) -> Router {
+    router_with_parser(engine, api_key, ToolCallParser::default())
+}
+
+pub fn router_with_parser(
+    engine: Engine,
+    api_key: Option<String>,
+    tool_call_parser: ToolCallParser,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -41,6 +54,7 @@ pub fn router(engine: Engine, api_key: Option<String>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(24 * 1024 * 1024))
         .with_state(AppState {
             engine,
+            tool_call_parser,
             api_key: api_key.map(Arc::from),
         })
 }
@@ -51,15 +65,29 @@ pub async fn serve(
     port: u16,
     api_key: Option<String>,
 ) -> anyhow::Result<()> {
+    serve_with_parser(engine, host, port, api_key, ToolCallParser::default()).await
+}
+
+pub async fn serve_with_parser(
+    engine: Engine,
+    host: &str,
+    port: u16,
+    api_key: Option<String>,
+    tool_call_parser: ToolCallParser,
+) -> anyhow::Result<()> {
+    eprintln!("{}", tool_call_parser.startup_message());
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     eprintln!("OpenAI API listening on http://{}", listener.local_addr()?);
     let shutdown_engine = engine.clone();
-    axum::serve(listener, router(engine, api_key))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_engine.shutdown();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router_with_parser(engine, api_key, tool_call_parser),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_engine.shutdown();
+    })
+    .await?;
     Ok(())
 }
 
@@ -183,9 +211,11 @@ async fn respond(
             .engine
             .prompt_opens_thinking(&parsed.request.prompt)
             .map_err(generation_error)?;
+    let preserve_xml =
+        chat && parsed.tools_enabled && state.tool_call_parser == ToolCallParser::Minicpm5;
     let mut handle = state
         .engine
-        .generate(parsed.request)
+        .generate_with_tool_markers(parsed.request, preserve_xml)
         .map_err(generation_error)?;
     let id = response_id(chat);
     let timestamp = created();
@@ -200,6 +230,7 @@ async fn respond(
             parsed.include_usage,
             parsed.tools_enabled,
             preopened_thinking,
+            state.tool_call_parser,
         ));
     }
     while let Some(event) = handle.events.recv().await {
@@ -214,7 +245,13 @@ async fn respond(
             }
             GenerationEvent::Finished(result) => {
                 let choice = if chat {
-                    chat_choice(&result, &id, parsed.tools_enabled, preopened_thinking)
+                    chat_choice_with_parser(
+                        &result,
+                        &id,
+                        parsed.tools_enabled,
+                        preopened_thinking,
+                        state.tool_call_parser,
+                    )
                 } else {
                     json!({"index":0,"text":result.text,"logprobs":null,"finish_reason":result.finish_reason})
                 };
@@ -259,6 +296,7 @@ struct ToolStream {
     pending: String,
     calls: usize,
     response_id: String,
+    xml: Option<tool_parser::MiniCpm5Stream>,
 }
 impl ToolStream {
     fn new(enabled: bool, response_id: String) -> Self {
@@ -267,7 +305,15 @@ impl ToolStream {
             pending: String::new(),
             calls: 0,
             response_id,
+            xml: None,
         }
+    }
+    fn with_parser(enabled: bool, response_id: String, parser: ToolCallParser) -> Self {
+        let mut stream = Self::new(enabled, response_id.clone());
+        if enabled && parser == ToolCallParser::Minicpm5 {
+            stream.xml = Some(tool_parser::MiniCpm5Stream::new(response_id));
+        }
+        stream
     }
     fn push(&mut self, text: &str, flush: bool) -> Vec<Value> {
         if !self.enabled {
@@ -276,6 +322,11 @@ impl ToolStream {
             } else {
                 vec![json!({"content":text})]
             };
+        }
+        if let Some(xml) = &mut self.xml {
+            let out = xml.push(text, flush);
+            self.calls = xml.calls;
+            return out;
         }
         self.pending.push_str(text);
         let mut out = vec![];
@@ -322,17 +373,39 @@ impl ToolStream {
         }
     }
 }
+#[cfg(test)]
 fn chat_choice(
     result: &GenerationResult,
     id: &str,
     tools_enabled: bool,
     preopened_thinking: bool,
 ) -> Value {
+    chat_choice_with_parser(
+        result,
+        id,
+        tools_enabled,
+        preopened_thinking,
+        ToolCallParser::ToolCallJson,
+    )
+}
+
+fn chat_choice_with_parser(
+    result: &GenerationResult,
+    id: &str,
+    tools_enabled: bool,
+    preopened_thinking: bool,
+    protocol: ToolCallParser,
+) -> Value {
     let (text, reasoning) = split_thinking(&result.text, preopened_thinking);
     let mut parser = ToolStream::new(tools_enabled, id.to_owned());
     let mut content = String::new();
     let mut calls = vec![];
-    for delta in parser.push(text, true) {
+    let deltas = if tools_enabled && protocol == ToolCallParser::Minicpm5 {
+        tool_parser::parse_minicpm5(text, id)
+    } else {
+        parser.push(text, true)
+    };
+    for delta in deltas {
         if let Some(text) = delta["content"].as_str() {
             content.push_str(text);
         }
@@ -458,8 +531,9 @@ fn stream_response(
     include_usage: bool,
     tools_enabled: bool,
     preopened_thinking: bool,
+    parser: ToolCallParser,
 ) -> Response {
-    let tools = ToolStream::new(tools_enabled, id.clone());
+    let tools = ToolStream::with_parser(tools_enabled, id.clone(), parser);
     let state = StreamState {
         handle,
         id,
@@ -760,6 +834,7 @@ mod tests {
             false,
             true,
             false,
+            ToolCallParser::ToolCallJson,
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&bytes).unwrap();
@@ -822,6 +897,7 @@ mod tests {
             true,
             false,
             false,
+            ToolCallParser::ToolCallJson,
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
@@ -870,11 +946,111 @@ mod tests {
             false,
             false,
             false,
+            ToolCallParser::ToolCallJson,
         );
         assert!(!cancel.load(Ordering::Relaxed));
         drop(response);
         assert!(cancel.load(Ordering::Relaxed));
     }
+    #[tokio::test]
+    async fn xml_sse_error_does_not_turn_pending_xml_into_a_call() {
+        use http_body_util::BodyExt;
+        for error in [false, true] {
+            let (sender, events) = tokio::sync::mpsc::channel(2);
+            sender
+                .send(GenerationEvent::Token(
+                    "<function name='f'><param name='x'>1".into(),
+                ))
+                .await
+                .unwrap();
+            if error {
+                sender
+                    .send(GenerationEvent::Error("test failure".into()))
+                    .await
+                    .unwrap();
+            }
+            drop(sender);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let response = stream_response(
+                GenerationHandle {
+                    events,
+                    cancel: cancel.clone(),
+                },
+                "r".into(),
+                1,
+                "mock".into(),
+                true,
+                true,
+                true,
+                false,
+                ToolCallParser::Minicpm5,
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(body.contains("server_error"));
+            assert!(!body.contains("\"tool_calls\":["));
+            assert_eq!(body.matches("data: [DONE]").count(), 1);
+            assert!(cancel.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_sse_length_flushes_truncated_xml_as_text() {
+        use http_body_util::BodyExt;
+        let (sender, events) = tokio::sync::mpsc::channel(2);
+        let text = "<function name='f'><param name='x'>123";
+        sender
+            .send(GenerationEvent::Token(text.into()))
+            .await
+            .unwrap();
+        sender
+            .send(GenerationEvent::Finished(GenerationResult {
+                text: text.into(),
+                finish_reason: "length".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+                timings: Value::Null,
+                stats: Value::Null,
+            }))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = stream_response(
+            GenerationHandle {
+                events,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            "r".into(),
+            1,
+            "mock".into(),
+            true,
+            false,
+            true,
+            false,
+            ToolCallParser::Minicpm5,
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let chunks: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c["choices"][0]["delta"]["content"] == text)
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c["choices"][0]["finish_reason"] == "length")
+        );
+        assert!(!body.contains("\"tool_calls\":["));
+    }
+
     #[test]
     fn native_prompt_can_open_thinking_before_generated_text() {
         assert_eq!(

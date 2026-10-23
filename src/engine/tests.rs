@@ -1,4 +1,5 @@
 use super::*;
+use crate::sampling::SamplingParams;
 
 /// A history-length oracle with controllable proposal rejection. It implements
 /// real pending transactions, so emitting/committing too far fails the test.
@@ -236,6 +237,7 @@ fn run_with_sampling(
 ) -> Result<(GenerationResult, String)> {
     let (events, mut receiver) = mpsc::channel(64);
     let job = Job {
+        preserve_tool_markers: false,
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
@@ -390,6 +392,7 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
     let (_dir, codec) = codec()?;
     let (events, mut receiver) = mpsc::channel(64);
     let job = Job {
+        preserve_tool_markers: false,
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
