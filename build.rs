@@ -25,6 +25,7 @@ fn main() {
     let cpu_output = cmake::Config::new(cpu_root)
         .out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
         .profile("Release")
+        .define("RK_NPU_MATMUL_ROOT", &root)
         .build_target("rknpu2_cpu_kernels")
         .build();
     println!(

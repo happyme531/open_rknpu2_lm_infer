@@ -84,71 +84,13 @@ fn add_chunk(y: &mut [f32], x: &[f32]) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn exp2(x: std::arch::aarch64::float64x2_t) -> std::arch::aarch64::float64x2_t {
-    use std::arch::aarch64::*;
-    unsafe {
-        let n = vrndmq_f64(vfmaq_n_f64(vdupq_n_f64(0.5), x, std::f64::consts::LOG2_E));
-        let r = vfmsq_n_f64(x, n, std::f64::consts::LN_2);
-        let r = vfmsq_n_f64(r, n, 2.319_046_813_846_299_6e-17);
-        let mut p = vdupq_n_f64(1.0 / 479001600.0);
-        for coefficient in [
-            1.0 / 39916800.0,
-            1.0 / 3628800.0,
-            1.0 / 362880.0,
-            1.0 / 40320.0,
-            1.0 / 5040.0,
-            1.0 / 720.0,
-            1.0 / 120.0,
-            1.0 / 24.0,
-            1.0 / 6.0,
-            0.5,
-            1.0,
-            1.0,
-        ] {
-            p = vfmaq_f64(vdupq_n_f64(coefficient), p, r);
-        }
-        let power = vreinterpretq_f64_s64(vshlq_n_s64::<52>(vaddq_s64(
-            vcvtq_s64_f64(n),
-            vdupq_n_s64(1023),
-        )));
-        vmulq_f64(p, power)
-    }
+unsafe extern "C" {
+    fn rknpu2_cpu_swiglu(gate: *const f32, up: *const f32, output: *mut f32, count: usize);
 }
 
 fn swiglu_block(gates: &[f32], ups: &[f32], y: &mut [f32]) {
-    let width = y.len();
-    let mut i = 0;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        while i + 4 <= width {
-            let gate = vld1q_f32(gates.as_ptr().add(i));
-            let up = vld1q_f32(ups.as_ptr().add(i));
-            if vminvq_u32(vcleq_f32(vabsq_f32(gate), vdupq_n_f32(80.0))) != 0 {
-                let x = vnegq_f32(gate);
-                let e = vcombine_f32(
-                    vcvt_f32_f64(exp2(vcvt_f64_f32(vget_low_f32(x)))),
-                    vcvt_f32_f64(exp2(vcvt_f64_f32(vget_high_f32(x)))),
-                );
-                vst1q_f32(
-                    y.as_mut_ptr().add(i),
-                    vmulq_f32(vdivq_f32(gate, vaddq_f32(vdupq_n_f32(1.0), e)), up),
-                );
-            } else {
-                for j in i..i + 4 {
-                    let g = gates[j];
-                    y[j] = (g / (1.0 + (-g).exp())) * ups[j];
-                }
-            }
-            i += 4;
-        }
-    }
-    while i < width {
-        let g = gates[i];
-        y[i] = (g / (1.0 + (-g).exp())) * ups[i];
-        i += 1;
-    }
+    // The slices come from one row's gate/up pair in Cpu::swiglu.
+    unsafe { rknpu2_cpu_swiglu(gates.as_ptr(), ups.as_ptr(), y.as_mut_ptr(), y.len()) };
 }
 
 fn dense_dot(weight: &Tensor, row: usize, input: &[f32]) -> f32 {
@@ -491,6 +433,24 @@ mod tests {
                 }
             }
             close(&y, &expected, 3e-7);
+        }
+    }
+
+    #[test]
+    fn swiglu_partial_vectors_preserve_output_guards() {
+        for width in [1, 7, 15, 16, 17, 31, 32, 33] {
+            let gates: Vec<_> = (0..width).map(|i| i as f32 * 0.75 - 8.0).collect();
+            let ups: Vec<_> = (0..width).map(|i| (i as f32 * 0.3).cos()).collect();
+            let mut output = vec![12345.0; width + 2];
+            swiglu_block(&gates, &ups, &mut output[1..width + 1]);
+            let expected: Vec<_> = gates
+                .iter()
+                .zip(&ups)
+                .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+                .collect();
+            close(&output[1..width + 1], &expected, 3e-7);
+            assert_eq!(output[0], 12345.0);
+            assert_eq!(output[width + 1], 12345.0);
         }
     }
 }
