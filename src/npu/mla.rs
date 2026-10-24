@@ -89,6 +89,13 @@ impl Mla {
             "MLA reset",
         )
     }
+    pub fn truncate(&self, position: usize) -> Result<()> {
+        let position = i32::try_from(position).context("MLA prefix position overflow")?;
+        check(
+            unsafe { rk_npu_mla_f16_cache_truncate(self.cache.raw, position) },
+            "MLA prefix truncate",
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,

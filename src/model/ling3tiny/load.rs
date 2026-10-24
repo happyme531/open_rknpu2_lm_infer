@@ -212,6 +212,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         eos_tokens: super::super::metadata::eos_tokens(&options.path, &config.eos, config.vocab)?,
     };
     let trace = crate::model::trace::Trace::from_environment()?;
+    let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
     Ok(Ling3Tiny {
         options,
         info,
@@ -228,6 +229,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         position: 0,
         logits: Vec::new(),
         last_hidden: Vec::new(),
+        prefix_cache,
         trace,
         load_ms: start.elapsed().as_secs_f64() * 1000.,
         forward_ms: 0.,

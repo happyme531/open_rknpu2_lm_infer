@@ -15,7 +15,10 @@ pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
 mod prefill;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
+mod prefix_cache;
 pub(crate) mod projection;
+#[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
 pub(crate) use prefill::PrefillStep;
 pub use prefill::PreparedPrefill;
 mod speculation;
@@ -131,7 +134,9 @@ pub trait LanguageModel {
         Ok(PreparedPrefill {
             input,
             start,
+            #[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
             steps: Vec::new(),
+            #[cfg(any(feature = "arch-qwen35", feature = "model-ling3tiny"))]
             checkpoint: None,
         })
     }

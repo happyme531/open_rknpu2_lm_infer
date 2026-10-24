@@ -20,7 +20,9 @@ Resident recurrent prefix checkpoints follow `llama-memory-recurrent.cpp` and
 `tools/server/server-context.cpp` at upstream revision
 `7894e8b92481a8bb8ffe94f73b656ffe0dd01e10`: snapshot recurrent/convolution
 state, retain ordinary attention KV, and resume from a checkpoint within the
-shared prefix. The Rust implementation also restores its MTP seed and draft KV.
+shared prefix. The shared Rust policy in `src/model/prefix_cache/` serves
+Qwen3.5 GDN and Ling3tiny KDA/convolution checkpoints. Qwen3.5 also restores
+its MTP seed and draft KV.
 ChatML user/tool delimiter matching follows `common/chat.cpp` and
 `common/parsers/qwen3-coder.cpp` at the same revision.
 Prompt-cache flag/environment precedence and per-request `cache_prompt`

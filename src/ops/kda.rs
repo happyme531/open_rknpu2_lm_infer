@@ -77,6 +77,7 @@ unsafe extern "C" {
     fn rknpu2_kda_run(params: *const Params);
 }
 
+#[derive(Clone, PartialEq)]
 pub struct State {
     heads: usize,
     dimension: usize,
@@ -115,6 +116,14 @@ impl State {
     }
     pub fn allocated_bytes(&self) -> usize {
         self.values.len() * 4
+    }
+    pub(crate) fn restore(&mut self, snapshot: &Self) -> Result<()> {
+        ensure!(
+            self.heads == snapshot.heads && self.dimension == snapshot.dimension,
+            "KDA checkpoint dimensions mismatch"
+        );
+        self.values.copy_from_slice(&snapshot.values);
+        Ok(())
     }
 
     /// Q/K are normalized, log_decay is nonpositive and beta is in [0, 1].

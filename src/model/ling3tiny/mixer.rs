@@ -6,6 +6,13 @@ use crate::{
     ops::{causal_conv::ConvState, kda, norm, rope::InterleavedRope},
 };
 use anyhow::Result;
+mod checkpoint;
+
+#[derive(PartialEq)]
+pub(super) struct Snapshot {
+    state: kda::State,
+    convolution: Vec<ConvState>,
+}
 
 struct Convolution {
     weights: Vec<f32>,
@@ -112,6 +119,16 @@ impl Mixer {
             }
         }
         Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn prepared_workspaces(&self) -> Option<[(usize, usize); 4]> {
+        match self {
+            Self::Mla(m) => Some(
+                [&m.q_a, &m.q_b, &m.kv_a, &m.gate]
+                    .map(|p| p.prepared_workspace().expect("prepared MLA projection")),
+            ),
+            Self::Kda(_) => None,
+        }
     }
     pub fn stats(&self) -> Result<serde_json::Value> {
         Ok(match self {

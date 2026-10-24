@@ -214,13 +214,16 @@ fn restored_tail_keeps_earlier_checkpoint(model: &mut Qwen35, cancel: &AtomicBoo
     assert_eq!(model.prefix_cache.positions(), [468, 596]);
     let saves = model.prefix_cache.saves;
     let save_ms = model.prefix_cache.save_ms;
-    let snapshot = model.prefix_cache.entries[1].recurrent.as_ptr();
+    let snapshot = model.prefix_cache.entries[1].state.recurrent.as_ptr();
     assert_eq!(model.restore_prefix(599)?, 596);
     let prepared = model.prepare_prepared(&input, 596)?;
     exact(model.forward_prepared(prepared, cancel)?, &expected);
     exact(&state(model), &expected_state);
     assert_eq!(model.prefix_cache.positions(), [468, 596]);
-    assert_eq!(model.prefix_cache.entries[1].recurrent.as_ptr(), snapshot);
+    assert_eq!(
+        model.prefix_cache.entries[1].state.recurrent.as_ptr(),
+        snapshot
+    );
     assert_eq!(model.prefix_cache.saves, saves);
     assert_eq!(model.prefix_cache.save_ms, save_ms);
     assert_eq!(model.prefix_cache.entries[1].task, model.prefix_cache.task);

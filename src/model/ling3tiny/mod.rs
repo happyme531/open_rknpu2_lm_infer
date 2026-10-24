@@ -21,6 +21,7 @@ use std::{
     },
     time::Instant,
 };
+mod cache;
 mod config;
 mod load;
 mod mixer;
@@ -48,6 +49,7 @@ pub struct Ling3Tiny {
     position: usize,
     logits: Vec<f32>,
     last_hidden: Vec<f32>,
+    prefix_cache: cache::PrefixCache,
     trace: Trace,
     load_ms: f64,
     forward_ms: f64,
@@ -57,9 +59,9 @@ impl Ling3Tiny {
     pub fn load(options: ModelOptions) -> Result<Self> {
         load::load(options)
     }
-    fn consume(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>) -> Result<()> {
+    fn check_input(&self, tokens: &[u32]) -> Result<()> {
         ensure!(
-            !tokens.is_empty() && self.position + tokens.len() <= self.options.context,
+            !tokens.is_empty() && tokens.len() <= self.options.context - self.position,
             "empty Ling input or context exceeded"
         );
         ensure!(
@@ -68,6 +70,10 @@ impl Ling3Tiny {
                 .all(|&id| (id as usize) < self.info.vocab_size),
             "token outside Ling vocabulary"
         );
+        Ok(())
+    }
+    fn consume(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>) -> Result<()> {
+        self.check_input(tokens)?;
         for batch in tokens.chunks(self.options.chunk) {
             let result = self.chunk(batch, cancel);
             if let Err(error) = result {
@@ -142,6 +148,30 @@ impl Ling3Tiny {
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
     }
+    fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
+        let floating_rows = rows[0];
+        rows.push(1);
+        rows.sort_unstable();
+        rows.dedup();
+        for backend in &self.backends {
+            for &n in &rows {
+                backend.prepare(n)?;
+            }
+            backend.retain_workspaces(&rows)?;
+        }
+        for backend in &self.router_backends {
+            backend.retain_workspaces(&rows);
+            for &n in &rows {
+                backend.prepare(self.config.hidden, self.config.experts, n)?;
+            }
+        }
+        // FP16 retains one row shape per geometry. Prepare the first actual
+        // batch; later batches and decode switch lazily when consumed.
+        for layer in &self.layers {
+            layer.mixer.prepare(floating_rows)?;
+        }
+        self.head.prepare(1)
+    }
     fn output(&mut self) -> Result<&[f32]> {
         let _head = trace::Span::new(c"ling.output_head", -1, 1, self.position);
         let start = Instant::now();
@@ -169,6 +199,9 @@ impl LanguageModel for Ling3Tiny {
     fn info(&self) -> &ModelInfo {
         &self.info
     }
+    fn uses_user_boundaries(&self) -> bool {
+        self.prefix_cache.settings.capacity > 0
+    }
     fn position(&self) -> usize {
         self.position
     }
@@ -184,6 +217,7 @@ impl LanguageModel for Ling3Tiny {
         self.head_ms = 0.;
         self.last_hidden.clear();
         self.logits.clear();
+        self.prefix_cache.clear();
         Ok(())
     }
     fn reserve(&mut self, tokens: usize) -> Result<()> {
@@ -197,32 +231,31 @@ impl LanguageModel for Ling3Tiny {
         Ok(())
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()> {
-        let mut rows = vec![1, self.options.chunk.min(prompt_tokens.max(1))];
+        ensure!(
+            prompt_tokens > 0 && prompt_tokens <= self.options.context,
+            "invalid Ling prompt length"
+        );
+        let mut rows = vec![self.options.chunk.min(prompt_tokens)];
         let tail = prompt_tokens % self.options.chunk;
         if tail > 0 {
             rows.push(tail);
         }
-        rows.sort_unstable();
-        rows.dedup();
-        for backend in &self.backends {
-            for &n in &rows {
-                backend.prepare(n)?;
-            }
-            backend.retain_workspaces(&rows)?;
-        }
-        for backend in &self.router_backends {
-            backend.retain_workspaces(&rows);
-            for &n in &rows {
-                backend.prepare(self.config.hidden, self.config.experts, n)?;
-            }
-        }
-        // Floating backends retain the current batch workspace per geometry;
-        // smaller tail batches and decode switch lazily when consumed.
-        let floating_rows = self.options.chunk.min(prompt_tokens.max(1));
-        for layer in &self.layers {
-            layer.mixer.prepare(floating_rows)?;
-        }
-        self.head.prepare(1)
+        self.prepare_rows(rows)
+    }
+    fn prepare_prepared<'a>(
+        &mut self,
+        input: &'a crate::input::PreparedInput,
+        start: usize,
+    ) -> Result<crate::model::PreparedPrefill<'a>> {
+        self.prepare_prompt(input, start)
+    }
+    fn forward_prepared(
+        &mut self,
+        prepared: crate::model::PreparedPrefill<'_>,
+        cancel: &AtomicBool,
+    ) -> Result<&[f32]> {
+        self.consume_prepared(prepared, cancel)?;
+        Ok(&self.logits)
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
         self.consume(tokens, None)
@@ -236,6 +269,10 @@ impl LanguageModel for Ling3Tiny {
         self.output()
     }
     fn truncate(&mut self, position: usize) -> Result<bool> {
+        ensure!(
+            position <= self.position,
+            "cannot extend Ling prefix by truncation"
+        );
         if position == self.position {
             return Ok(true);
         }
@@ -243,7 +280,14 @@ impl LanguageModel for Ling3Tiny {
             self.reset()?;
             return Ok(true);
         }
+        if self.prefix_cache.has(position) {
+            self.restore_cached_prefix(position)?;
+            return Ok(true);
+        }
         Ok(false)
+    }
+    fn restore_prefix(&mut self, maximum: usize) -> Result<usize> {
+        self.restore_cached_prefix(maximum)
     }
     fn stats(&self) -> serde_json::Value {
         let mut result = crate::model::metrics::backend_stats(&self.backends, self.head.backend());
@@ -275,6 +319,10 @@ impl LanguageModel for Ling3Tiny {
             .as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(self.prefix_cache.statistics().as_object().unwrap().clone());
         result
     }
 }

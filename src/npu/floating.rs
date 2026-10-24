@@ -296,6 +296,14 @@ impl FloatBackend {
     }
 }
 impl FloatLinear {
+    #[cfg(all(test, feature = "model-ling3tiny"))]
+    pub(crate) fn prepared_workspace(&self) -> Option<(usize, usize)> {
+        self.owner
+            .work
+            .borrow()
+            .get(&(self.k, self.n))
+            .map(|w| (w.strategy.M as usize, w.workspace.raw as usize))
+    }
     pub fn prepare(&self, rows: usize) -> Result<()> {
         self.owner
             .prepare_for_weights(self.k, self.n, rows, self.weight.raw)

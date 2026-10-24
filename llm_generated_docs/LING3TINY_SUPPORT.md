@@ -452,3 +452,39 @@ KDA的Q/K/V、decay/beta值域扫描，Ling与其他解码器的logits/router扫
 性能基本稳定，prefill/decode分别改善约0.39%/0.87%。137-token输入加3个continuation的628736个FP32 logits逐字节一致；四组head-free检查均逐位一致，在线调优、cache miss和strategy fallback均为0。默认完整版本128项、Ling专用版93项自动测试通过，all-targets release Clippy `-D warnings`通过。
 
 最终release的7项HTTP短问答、多轮记忆/更名与SSE测试通过，同题CLI/HTTP/SSE输出一致；真实终端chat在温度1、top_k20、seed42、128-token测试中为22.2355 tok/s。频率设置恢复正常，`tune_calls=0`。`dist/ling3tiny-named/ling3tiny`已更新为清理版，8,375,096字节；原始记录与六样本汇总位于 `results/hotpath-cleanup-20261023/`，最终汇总为 `comparison.json`。
+
+## 2026-10-24：SSM 前缀检查点
+
+`feat/ling3tiny` 已通过 merge commit `33503e5` 合并本地 main 至 `7d72396`，包含 main 的跨请求前缀缓存；该 main 包含拉取时的远端 main `8b186ef`。算子库先更新至远端 main `4f36ab6`，接口提交 `860c369` 在其上增加公共 `rk_npu_mla_f16_cache_truncate`，复用现有 Attention cache 的截断实现，保留 absorbed KV 的分配及有效前缀。
+
+`src/model/prefix_cache.rs` 与 `prefix_cache/policy.rs` 供 Qwen3.5 和 Ling 共用：按 user 消息边界和 prompt 尾块安排检查点，复用同位置快照，沿用 main 的当前请求保护、间隔压缩和 FIFO 容量限制。Ling 每个快照只保存各 KDA 层的 FP32 recurrence 和 Q/K/V 三路因果卷积历史。恢复时选择不超过共享前缀长度的最近检查点，恢复上述状态、截断所有 MLA KV，清除旧 logits/hidden，并移除未来分支的检查点；没有检查点时由 engine reset/recompute。
+
+`prepare_prepared` 生成的同一份计划用于准备所有实际 batch 行数和执行前向。取消或执行错误会重置模型和检查点，避免复用部分更新的状态。`stats` 暴露 `prefix_checkpoint_positions/count/bytes/saves/hits/save_ms`、容量和最小间距。
+
+真实 Bailing V3 模板使用 `<role>HUMAN</role>`；`TextCodec` 已支持这个用户边界，排除 OBSERVATION 工具消息以及以 `<tool_response>` 开头的旧式用户工具响应，同时保留 ChatML 的识别规则。
+
+沿用 main 的参数：`--ctx-checkpoints`（默认 32，0 或 -1 关闭）、`--checkpoint-min-step`（默认 8192）；别名为 `--swa-checkpoints`、`-ctxcp` 和 `-cms`。服务级 `--no-cache-prompt` 和请求级 `cache_prompt` 控制前缀复用。快照占用 CPU 内存，由数量限制约束；本次没有进行吞吐或 PPL 测量。
+
+未完成的 UBTree 改动已独立 stash，包含未跟踪的源码、fixture 和验证工具。后续 agent 使用 `git stash apply ac6ce1cb7318e48a9ecfcfbad8d9dc7f97f0c50e` 继续，需要处理与本次缓存适配的重叠。合并 main 前的第一份保险备份为 `cd50dbd186ccebd30c6a5a6024cc4c2e7359ca04`；本次不继续 UBTree。
+
+验证记录位于 `results/ling-ssm-20261024/`，最终汇总为 `validation-summary.json`。主板默认 154 项、Ling 专用 117 项自动测试及两种构建的 all-targets Release Clippy `-D warnings` 通过。板端执行时的 333 份源码/fixture 与主机哈希一致，快照见 `board-tested-source-manifest.json`；测试二进制已冻结并校验备份哈希。
+
+MLA 公共接口的 expanded/absorbed 两种模式在 mask1/3/7 下通过：保留长度 0/1/17/31/32/33/63/64/65/129，截断后追加与全新加载前缀输出逐位一致，分配不变，非法长度被拒绝。
+
+最新真实权重 resident 和 streaming 两种模式均通过：600-token 固定输入、3 个 continuation、从 596 恢复，以及在 500 处分叉后从 468 重算，完整 logits 逐位一致，KDA recurrence 与三路卷积历史比较相同。同时覆盖同位置快照复用、容量限制、miss/reset、取消、过期计划及禁用缓存。真实 Bailing 模板的两条用户消息与工具消息边界断言也通过。Streaming 重建后的专家记录位于主板 `/home/firefly/ling-ssm-20261024/expert-store`。
+
+验证期间主板曾出现 `switch iommu domain time out ... id: 15`，原有 dense GEMM canary 也超时。按用户要求向 `/sys/kernel/debug/rknpu/reset` 写入 `1\n`，内核确认执行 soft reset，但未恢复；用户随后手动重启主板。重启后 canary、mask1/3/7 MLA 回归和两种专家模式的整模型回归全部通过。六份 `reboot*-clock.json` 均为 `exit_code=0`、`restore_errors=[]`，NPU 最终负载读数为 0%。故障前和 debugfs reset 的记录保留作历史证据，最终通过记录为 `board-artifacts/results/ssm/reboot-*.log`。
+
+最后修正了纯 dense 构建的兼容边界：未启用循环模型时不编译检查点计划字段，并始终构建所有模型共用的 CPU SwiGLU，避免缺少 `rknpu2_cpu_swiglu` 链接符号。此三文件修改不改变默认/Ling 的执行分支；最终主机默认 154 项、Ling 117 项、Qwen3-only 97 项测试均通过。CI 的八种单模型/组合 feature 配置均通过主机 Release Clippy，命令仅额外允许既有的非 AArch64 `unused_mut` 警告；严格 ARM 检查为前述默认/Ling 构建。最终源码哈希及与板端冻结版本的三个 feature/build 文件差异见 `final-source-manifest.json`。
+
+恢复 UBTree stash 后，还需让前缀保存/恢复避开验证事务，并同步 draft/Features 状态及 MLA 的 UBTree host KV mirror；本次验证的 Ling speculation 配置为 None。
+
+## 2026-10-25：SSM review 修正
+
+Workspace 准备仅保留实际 prefill 计划的行数，并为量化/TF32 backend 保留 decode 的 1 行。FP16 backend 每个 K/N 只保留一个行数，因此预热计划的首个实际 batch：例如首批 20 行则准备 20 行，缓存恢复仅需 4 行则准备 4 行；后续 batch 和 decode 按实际行数切换。
+
+卷积历史新增 `ConvState::restore()`：校验 channels/kernel 后使用 `copy_from_slice()` 原地恢复；Ling 检查点恢复改用该方法。主机隔离测量 18 层×3 路卷积：派生 `clone_from()` 为 54 次分配、54 次释放并替换 54 个 buffer；新方法分配、释放、realloc 和 buffer 替换均为 0，history 内容逐位相同。探针调用实际 crate 的公开 API，源码、构建日志和结果保存在 `results/ling-ssm-review-20261025/`，未加入生产目标。
+
+新增单元回归覆盖 history 地址/容量保持、kernel=1、2048 通道、恢复后的连续计算，以及同长度异维度快照拒绝。板端回归增加计划首批 20 行与短重放 4 行的检查，直接核对每个 FP16 workspace 的逻辑行数与句柄，要求执行后保持同一 workspace。总 backend fallback 计数包含量化投影首次建策略，不用它代替 FP16 workspace 的观测。
+
+验证：最终主机默认 155 项、板端 Ling-only Release 118 项自动测试及严格 Release Clippy 通过；resident/streaming 两种真实权重回归均通过 20/4 行 workspace 行数与句柄保持断言，完整 logits 逐位一致。两次 runner 均 exit_code=0、restore_errors=[]。观测方法限定为 cfg(test)，当前板端编译源码与主机 333 份源码/fixture 哈希一致。最终汇总为 `results/ling-ssm-review-20261025/validation-summary.json`。

@@ -35,6 +35,15 @@ impl ConvState {
     pub fn reset(&mut self) {
         self.history.fill(0.0);
     }
+    /// Restore compatible history without replacing its allocation.
+    pub fn restore(&mut self, snapshot: &Self) -> Result<()> {
+        ensure!(
+            self.channels == snapshot.channels && self.kernel == snapshot.kernel,
+            "convolution checkpoint dimensions mismatch"
+        );
+        self.history.copy_from_slice(&snapshot.history);
+        Ok(())
+    }
     pub fn allocated_bytes(&self) -> usize {
         self.history.capacity() * 4
     }
@@ -147,6 +156,51 @@ impl ConvState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_reuses_history_and_rejects_incompatible_geometry() -> Result<()> {
+        for channels in [3, 2048] {
+            for kernel in [1, 4] {
+                let mut snapshot = ConvState::new(channels, kernel)?;
+                let input: Vec<_> = (0..channels * 5)
+                    .map(|i| if i % 7 == 0 { -0.0 } else { i as f32 * 0.03 })
+                    .collect();
+                snapshot.append(&input)?;
+                let mut state = ConvState::new(channels, kernel)?;
+                let pointer = state.history.as_ptr();
+                let capacity = state.history.capacity();
+                state.restore(&snapshot)?;
+                assert_eq!(state.history.as_ptr(), pointer);
+                assert_eq!(state.history.capacity(), capacity);
+                assert!(
+                    state
+                        .history
+                        .iter()
+                        .zip(&snapshot.history)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+
+                let mut expected = snapshot.clone();
+                let weights = vec![0.25; channels * kernel];
+                let mut actual = vec![0.; input.len()];
+                let mut reference = actual.clone();
+                state.run(&input, &weights, &mut actual)?;
+                expected.run(&input, &weights, &mut reference)?;
+                assert_eq!(actual, reference);
+                assert_eq!(state, expected);
+            }
+        }
+        let snapshot = ConvState::new(3, 3)?;
+        let mut state = ConvState::new(6, 2)?;
+        state.append(&[2.; 6])?;
+        let before = state.clone();
+        let pointer = state.history.as_ptr();
+        // Equal buffer lengths still require equal convolution geometry.
+        assert!(state.restore(&snapshot).is_err());
+        assert_eq!(state, before);
+        assert_eq!(state.history.as_ptr(), pointer);
+        Ok(())
+    }
+
     #[test]
     fn strided_decode_matches_batch_bits_and_history() -> Result<()> {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;

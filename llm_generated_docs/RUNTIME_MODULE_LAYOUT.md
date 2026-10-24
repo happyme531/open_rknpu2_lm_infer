@@ -6,6 +6,8 @@
 
 独立测试和诊断工具源码统一放在 `tests/tools/`，通过 Cargo.toml 显式注册，沿用 `--example NAME` 构建/运行入口；默认测试不执行这些需要外部数据或设备的程序。历史消融和插桩工具移至 `scripts/archive/`，目录与依赖见 [FP16/ViT 实验归档](FP16_VIT_EXPERIMENT_ARCHIVE.md)。
 
+2026-10-24 SSM 前缀缓存：`model/prefix_cache.rs` 和 `model/prefix_cache/` 统一管理 Qwen3.5 与 Ling3tiny 的请求边界调度、同位置快照复用、容量淘汰和统计。模型私有的 `qwen35/cache.rs`、`ling3tiny/cache.rs` 分别负责 GDN/MTP 与 KDA/卷积快照的保存和恢复；Attention/MLA KV 保留分配并截断。模型前向使用同一份 `PreparedPrefill` 计划完成 workspace 准备和实际执行。
+
 ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，使用 Rust NEON/窄范围内联汇编及模型自身的 Rayon 线程池。此前新增的 `native/cpu_kernels/vision.cpp`、`vision_rotary.cpp` 和对应 FFI 已移除；`native/cpu_kernels/` 只保留已有的 GDN 内核。
 
 本轮将 Qwen3.5 接入时放在模型目录内的公共实现提取出来。依赖方向为模型适配层 → 可复用层 → 数值算子；公共算子和 GDN 层不导入模型配置、checkpoint、NPU backend 或 engine。
