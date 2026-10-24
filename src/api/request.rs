@@ -471,6 +471,11 @@ pub(super) fn parse_request(
     Ok(ParsedRequest {
         request: GenerationRequest {
             prompt,
+            cache_prompt: v
+                .get("cache_prompt")
+                .filter(|x| !x.is_null())
+                .map(|_| boolean(&v, "cache_prompt", true))
+                .transpose()?,
             sampling,
             max_tokens,
             stop,

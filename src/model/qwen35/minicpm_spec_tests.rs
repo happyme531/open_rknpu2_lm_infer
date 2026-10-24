@@ -87,6 +87,8 @@ fn minicpm_dspark_generation_matches_ar() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: crate::model::experts::Options {
             cache: Some(std::env::var("MINICPM_TEST_STORE")?.into()),
             ..Default::default()

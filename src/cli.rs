@@ -40,6 +40,7 @@ pub struct ModelArgs {
         short = 'c',
         long = "ctx-size",
         global = true,
+        env = "LLAMA_ARG_CTX_SIZE",
         default_value_t = 4096,
         help = "KV capacity in tokens; 0 selects the required bench capacity or model limit"
     )]
@@ -47,10 +48,33 @@ pub struct ModelArgs {
     #[arg(
         long = "ubatch-size",
         global = true,
+        env = "LLAMA_ARG_UBATCH",
         default_value_t = 128,
         help = "Physical prefill batch size; also accepts -ub"
     )]
     pub chunk: usize,
+    #[arg(
+        long = "ctx-checkpoints",
+        visible_alias = "swa-checkpoints",
+        global = true,
+        env = "LLAMA_ARG_CTX_CHECKPOINTS",
+        default_value_t = 32,
+        allow_hyphen_values = true,
+        value_parser = parse_checkpoint_capacity,
+        overrides_with = "ctx_checkpoints",
+        help = "Maximum context checkpoints; 0 disables; also accepts -ctxcp"
+    )]
+    pub ctx_checkpoints: usize,
+    #[arg(
+        long = "checkpoint-min-step",
+        global = true,
+        env = "LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT",
+        default_value_t = 8192,
+        value_parser = parse_checkpoint_min_step,
+        overrides_with = "checkpoint_min_step",
+        help = "Minimum checkpoint spacing in tokens; 0 = no minimum; also accepts -cms"
+    )]
+    pub checkpoint_min_step: usize,
     #[arg(short = 't', long, global = true, default_value_t = 4)]
     pub threads: usize,
     #[arg(long, global = true, default_value = "7", value_parser = parse_u32)]
@@ -130,6 +154,15 @@ pub struct ModelArgs {
     #[arg(long, global = true, value_enum, default_value = "greedy")]
     pub spec_draft_sampling: DraftSampling,
 }
+fn parse_checkpoint_capacity(s: &str) -> std::result::Result<usize, String> {
+    s.parse::<i32>()
+        .map(|n| n.max(0) as usize)
+        .map_err(|e| e.to_string())
+}
+fn parse_checkpoint_min_step(s: &str) -> std::result::Result<usize, String> {
+    let n = s.parse::<i32>().map_err(|e| e.to_string())?;
+    usize::try_from(n).map_err(|_| "checkpoint-min-step must be non-negative".into())
+}
 fn parse_u64(s: &str) -> std::result::Result<u64, String> {
     if let Some(s) = s.strip_prefix("0x") {
         u64::from_str_radix(s, 16)
@@ -201,6 +234,10 @@ impl ModelArgs {
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,
+            checkpoints: crate::model::CheckpointOptions {
+                capacity: self.ctx_checkpoints,
+                min_step: self.checkpoint_min_step,
+            },
             experts: crate::model::experts::Options {
                 storage: self.expert_storage,
                 cache: self.expert_store.clone(),
@@ -257,12 +294,17 @@ pub enum Command {
     Models,
     /// Serve the OpenAI chat and text completion endpoints.
     Serve {
+        #[command(flatten)]
+        cache: CachePromptArgs,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
         #[arg(long, env = "OPEN_RKNPU_API_KEY")]
         api_key: Option<String>,
+        /// Tool output protocol; does not change the chat template.
+        #[arg(long, value_enum, default_value = "tool-call-json")]
+        tool_call_parser: crate::api::ToolCallParser,
     },
     /// Inspect model metadata without opening the NPU.
     Inspect,
@@ -414,6 +456,10 @@ fn llama_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ff
                 "--n-prompt-gen".into()
             } else if !positional && arg == "-ub" {
                 "--ubatch-size".into()
+            } else if !positional && arg == "-ctxcp" {
+                "--ctx-checkpoints".into()
+            } else if !positional && arg == "-cms" {
+                "--checkpoint-min-step".into()
             } else if !positional && arg == "-cnv" {
                 "--conversation".into()
             } else if !positional && arg == "-sys" {
@@ -425,6 +471,48 @@ fn llama_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ff
             }
         })
         .collect()
+}
+
+#[derive(Args)]
+pub struct CachePromptArgs {
+    #[arg(
+        long,
+        overrides_with_all = ["cache_prompt", "no_cache_prompt"],
+        help = "Enable prompt caching (default: enabled; env: LLAMA_ARG_CACHE_PROMPT)"
+    )]
+    cache_prompt: bool,
+    #[arg(long, overrides_with_all = ["cache_prompt", "no_cache_prompt"], help = "Disable prompt caching")]
+    no_cache_prompt: bool,
+}
+impl CachePromptArgs {
+    fn enabled(&self) -> Result<bool> {
+        self.resolve(
+            std::env::var_os("LLAMA_ARG_CACHE_PROMPT").as_deref(),
+            std::env::var_os("LLAMA_ARG_NO_CACHE_PROMPT").is_some(),
+        )
+    }
+
+    fn resolve(&self, value: Option<&std::ffi::OsStr>, no_env: bool) -> Result<bool> {
+        // common/arg.cpp applies the legacy negative env by presence, before
+        // the positive env, then lets command-line flags override that default.
+        let default = if no_env {
+            false
+        } else {
+            match value.map(std::ffi::OsStr::to_str) {
+                None => true,
+                Some(Some("on" | "enabled" | "true" | "1")) => true,
+                Some(Some("off" | "disabled" | "false" | "0")) => false,
+                _ => bail!("invalid boolean value for LLAMA_ARG_CACHE_PROMPT"),
+            }
+        };
+        Ok(if self.cache_prompt {
+            true
+        } else if self.no_cache_prompt {
+            false
+        } else {
+            default
+        })
+    }
 }
 #[derive(Args, Clone)]
 pub struct GenerationArgs {
@@ -507,6 +595,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
         );
         return Ok(());
     }
+    let cache_prompt = if let Command::Serve { cache, .. } = &cli.command {
+        cache.enabled()?
+    } else {
+        true
+    };
     let mut model_args = cli.model;
     model_args.validate_command(&cli.command)?;
     let bench_cases = if let Command::Bench(args) = &cli.command {
@@ -591,6 +684,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let engine = Engine::start(options)?;
             let mut handle = engine.generate(GenerationRequest {
                 prompt,
+                cache_prompt: None,
                 sampling,
                 max_tokens: generation.max_tokens,
                 stop: generation.stop,
@@ -630,9 +724,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
             host,
             port,
             api_key,
+            tool_call_parser,
+            ..
         } => {
-            let engine = Engine::start(options)?;
-            crate::api::serve(engine, &host, port, api_key).await?;
+            let engine = Engine::start_with_cache_prompt(options, cache_prompt)?;
+            crate::api::serve_with_parser(engine, &host, port, api_key, tool_call_parser).await?;
         }
         Command::Bench(args) => crate::bench::run(
             options,
@@ -665,10 +761,121 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serve_tool_parser_is_explicit() {
+        for (args, expected) in [
+            (
+                vec!["test", "serve"],
+                crate::api::ToolCallParser::ToolCallJson,
+            ),
+            (
+                vec!["test", "serve", "--tool-call-parser", "minicpm5"],
+                crate::api::ToolCallParser::Minicpm5,
+            ),
+        ] {
+            let cli = <super::Cli as clap::Parser>::try_parse_from(args).unwrap();
+            let super::Command::Serve {
+                tool_call_parser, ..
+            } = cli.command
+            else {
+                panic!("expected serve")
+            };
+            assert_eq!(tool_call_parser, expected);
+        }
+        assert!(
+            <super::Cli as clap::Parser>::try_parse_from([
+                "test",
+                "serve",
+                "--tool-call-parser",
+                "auto"
+            ])
+            .is_err()
+        );
+    }
+
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(llama_args(args.iter().map(std::ffi::OsString::from))).unwrap()
+    }
+
+    #[test]
+    fn prompt_cache_flags_and_environment_follow_llama_cpp_precedence() {
+        for (flags, forced) in [
+            (vec![], None),
+            (vec!["--cache-prompt"], Some(true)),
+            (vec!["--no-cache-prompt"], Some(false)),
+            (vec!["--cache-prompt", "--no-cache-prompt"], Some(false)),
+            (vec!["--no-cache-prompt", "--cache-prompt"], Some(true)),
+            (vec!["--cache-prompt", "--cache-prompt"], Some(true)),
+            (vec!["--no-cache-prompt", "--no-cache-prompt"], Some(false)),
+        ] {
+            let mut args = vec!["infer", "serve"];
+            args.extend(flags);
+            let Command::Serve { cache, .. } = parse(&args).command else {
+                unreachable!()
+            };
+            assert_eq!(cache.resolve(None, false).unwrap(), forced.unwrap_or(true));
+            for (value, default) in [
+                ("on", true),
+                ("enabled", true),
+                ("true", true),
+                ("1", true),
+                ("off", false),
+                ("disabled", false),
+                ("false", false),
+                ("0", false),
+            ] {
+                let value = Some(std::ffi::OsStr::new(value));
+                assert_eq!(
+                    cache.resolve(value, false).unwrap(),
+                    forced.unwrap_or(default)
+                );
+                // Legacy LLAMA_ARG_NO_CACHE_PROMPT disables by presence,
+                // regardless of its value or the positive env's contents.
+                assert_eq!(cache.resolve(value, true).unwrap(), forced.unwrap_or(false));
+            }
+            for invalid in ["", "yes", "TRUE", "garbage"] {
+                let value = Some(std::ffi::OsStr::new(invalid));
+                assert!(cache.resolve(value, false).is_err());
+                assert_eq!(cache.resolve(value, true).unwrap(), forced.unwrap_or(false));
+            }
+        }
+        assert!(Cli::try_parse_from(["infer", "chat", "--no-cache-prompt"]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_flags_accept_upstream_aliases_and_disable_values() {
+        for name in ["--ctx-checkpoints", "--swa-checkpoints", "-ctxcp"] {
+            for (value, capacity) in [("4", 4), ("0", 0), ("-1", 0)] {
+                let cli = parse(&["infer", name, value, "serve", "-cms", "0"]);
+                assert_eq!(cli.model.ctx_checkpoints, capacity);
+                assert_eq!(cli.model.checkpoint_min_step, 0);
+            }
+        }
+        let cli = parse(&[
+            "infer",
+            "serve",
+            "--ctx-checkpoints",
+            "2",
+            "-ctxcp",
+            "4",
+            "--checkpoint-min-step",
+            "128",
+            "-cms",
+            "256",
+        ]);
+        assert_eq!(cli.model.ctx_checkpoints, 4);
+        assert_eq!(cli.model.checkpoint_min_step, 256);
+        assert!(
+            Cli::try_parse_from(llama_args(["infer", "serve", "-cms", "-1"].map(Into::into)))
+                .is_err()
+        );
+        let cli = parse(&["infer", "tokenize", "--", "-ctxcp"]);
+        let Command::Tokenize { input, .. } = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(input.as_deref(), Some("-ctxcp"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::model::trace::Trace;
 use crate::ops::norm;
 use crate::{
     model::{
-        LanguageModel, ModelInfo, ModelOptions,
+        LanguageModel, ModelInfo, ModelOptions, PreparedPrefill,
         checkpoint::{QuantLoader, Tensor},
         cpu::Cpu,
     },
@@ -53,9 +53,29 @@ pub struct Qwen35 {
     pub(super) features: super::features::Features,
     #[cfg(feature = "draft-dflash")]
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
+    pub(super) prefix_cache: super::cache::PrefixCache,
 }
 
 impl Qwen35 {
+    fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
+        rows.extend([1, self.options.chunk]);
+        rows.extend(1..=self.speculation_window() + 1);
+        rows.sort_unstable();
+        rows.dedup();
+        for backend in self.backends.iter().chain(self.head.backend()) {
+            backend.retain_workspaces(&rows)?;
+            for rows in &rows {
+                backend.prepare(*rows)?;
+            }
+        }
+        self.work.recurrent.prepare(&rows)?;
+        #[cfg(feature = "draft-dflash")]
+        if let Some(draft) = &self.dflash {
+            draft.prepare(&rows, self.options.speculation.window())?;
+        }
+        self.loader.store.release_pages()?;
+        Ok(())
+    }
     pub fn load(options: ModelOptions) -> Result<Self> {
         options.validate_speculation()?;
         #[allow(unused_mut)]
@@ -221,8 +241,7 @@ impl Qwen35 {
             }
             Ok(())
         })();
-        // A failed/cancelled hybrid chunk may have modified earlier layers. No
-        // arbitrary GDN rollback is exposed until prefix checkpoints exist.
+        // A failed/cancelled hybrid chunk may have modified earlier layers.
         if result.is_err() {
             self.reset()?;
         }
@@ -279,6 +298,9 @@ impl LanguageModel for Qwen35 {
     fn info(&self) -> &ModelInfo {
         &self.info
     }
+    fn uses_user_boundaries(&self) -> bool {
+        self.prefix_cache.settings.capacity > 0
+    }
     fn position(&self) -> usize {
         self.position
     }
@@ -303,6 +325,7 @@ impl LanguageModel for Qwen35 {
             draft.reset()?;
         }
         self.next_rope_position = 0;
+        self.prefix_cache.clear();
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
         self.phases = Timings::default();
@@ -336,7 +359,14 @@ impl LanguageModel for Qwen35 {
             self.reset()?;
             return Ok(true);
         }
+        if self.prefix_cache.has(position) {
+            self.restore_cached_prefix(position)?;
+            return Ok(true);
+        }
         Ok(false)
+    }
+    fn restore_prefix(&mut self, maximum: usize) -> Result<usize> {
+        self.restore_cached_prefix(maximum)
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()> {
         ensure!(
@@ -347,26 +377,26 @@ impl LanguageModel for Qwen35 {
         if !prompt_tokens.is_multiple_of(self.options.chunk) {
             rows.push(prompt_tokens % self.options.chunk);
         }
-        rows.sort_unstable();
-        rows.dedup();
-        if self.speculation_window() > 0 {
-            rows.extend(1..=self.speculation_window() + 1);
-            rows.sort_unstable();
-            rows.dedup();
-        }
-        for backend in self.backends.iter().chain(self.head.backend()) {
-            backend.retain_workspaces(&rows)?;
-            for rows in &rows {
-                backend.prepare(*rows)?;
-            }
-        }
-        self.work.recurrent.prepare(&rows)?;
-        #[cfg(feature = "draft-dflash")]
-        if let Some(draft) = &self.dflash {
-            draft.prepare(&rows, self.options.speculation.window())?;
-        }
-        self.loader.store.release_pages()?;
-        Ok(())
+        self.prepare_rows(rows)
+    }
+    fn prepare_prepared<'a>(
+        &mut self,
+        input: &'a crate::input::PreparedInput,
+        start: usize,
+    ) -> Result<PreparedPrefill<'a>> {
+        ensure!(
+            start < input.tokens.len() && input.tokens.len() <= self.options.context,
+            "invalid prepared prompt"
+        );
+        let prepared = PreparedPrefill {
+            input,
+            start,
+            steps: self.prefix_cache.plan(input, start, self.options.chunk),
+            checkpoint: self.prefix_cache.last_position(),
+        };
+        let rows = prepared.steps.iter().map(|s| s.range.len()).collect();
+        self.prepare_rows(rows)?;
+        Ok(prepared)
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
         self.forward_impl(tokens, None, false)
@@ -377,11 +407,10 @@ impl LanguageModel for Qwen35 {
     }
     fn forward_prepared(
         &mut self,
-        input: &crate::input::PreparedInput,
-        start: usize,
+        prepared: PreparedPrefill<'_>,
         cancelled: &AtomicBool,
     ) -> Result<&[f32]> {
-        self.consume_prepared(input, start, cancelled)?;
+        self.consume_prepared(prepared, cancelled)?;
         Ok(&self.logits)
     }
     fn forward_cancellable(&mut self, tokens: &[u32], cancelled: &AtomicBool) -> Result<&[f32]> {

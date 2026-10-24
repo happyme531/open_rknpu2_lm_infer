@@ -1,0 +1,23 @@
+[package]
+name = "api-mock-tests"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
+roxmltree = "0.20"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+minijinja = { version = "2", features = ["builtins", "json", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }

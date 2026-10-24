@@ -58,6 +58,8 @@ fn main() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: model::experts::Options {
             cache: args.expert_store,
             ..Default::default()

@@ -16,6 +16,22 @@ Upstream license: https://www.apache.org/licenses/LICENSE-2.0
 
 ## llama.cpp / ggml
 
+Resident recurrent prefix checkpoints follow `llama-memory-recurrent.cpp` and
+`tools/server/server-context.cpp` at upstream revision
+`7894e8b92481a8bb8ffe94f73b656ffe0dd01e10`: snapshot recurrent/convolution
+state, retain ordinary attention KV, and resume from a checkpoint within the
+shared prefix. The Rust implementation also restores its MTP seed and draft KV.
+ChatML user/tool delimiter matching follows `common/chat.cpp` and
+`common/parsers/qwen3-coder.cpp` at the same revision.
+Prompt-cache flag/environment precedence and per-request `cache_prompt`
+overrides follow `common/arg.cpp` and `tools/server/server-schema.cpp` at
+that revision. Disabling reuse still retains the newly computed prompt state.
+Same-position snapshot reuse and current-task refresh adapt the proposal in
+[llama.cpp PR #30683](https://github.com/ggml-org/llama.cpp/pull/30683), head
+`435211bd898abdaf86655a421ce9e5de83c4d39e`. Restore invalidates future-branch
+snapshots before reuse; this retains earlier checkpoints without copying the
+same recurrent state again.
+
 The Qwen3.5 NextN graph and normalized hidden-state handoff were checked
 against `src/models/qwen35.cpp` and `common/speculative.cpp` at local reference
 revision `de3ebb93bd8828496faefb44ed45059ec7ed3ea5`:

@@ -57,6 +57,14 @@ impl DFlash {
         }
         Ok(())
     }
+    pub(crate) fn restore_prefix(&mut self, position: usize) -> Result<()> {
+        ensure!(position <= self.position, "cannot extend DFlash prefix");
+        for layer in &self.layers {
+            layer.cache.truncate(position)?;
+        }
+        self.position = position;
+        Ok(())
+    }
     pub(crate) fn backends(&self) -> &[Backend] {
         &self.backends
     }

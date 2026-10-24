@@ -88,11 +88,14 @@ fn main() -> Result<()> {
             let directory = args.output.join(name);
             std::fs::create_dir_all(&directory)?;
             let messages = serde_json::from_value(case["messages"].clone())?;
-            let input = codec.prepare(&Prompt::Chat {
-                messages,
-                tools: None,
-                enable_thinking: false,
-            })?;
+            let input = codec.prepare(
+                &Prompt::Chat {
+                    messages,
+                    tools: None,
+                    enable_thinking: false,
+                },
+                model.uses_user_boundaries(),
+            )?;
             let continuation: Vec<u32> = case
                 .get("continuation")
                 .map(|x| serde_json::from_value(x.clone()))
@@ -100,9 +103,9 @@ fn main() -> Result<()> {
                 .unwrap_or_default();
             model.reset()?;
             model.reserve(input.tokens.len() + continuation.len() + 1)?;
-            model.prepare(input.tokens.len())?;
+            let prepared = model.prepare_prepared(&input, 0)?;
             let mut logits = model
-                .forward_prepared(&input, 0, &AtomicBool::new(false))?
+                .forward_prepared(prepared, &AtomicBool::new(false))?
                 .to_vec();
             for token in continuation {
                 logits.extend_from_slice(model.forward(&[token])?);
@@ -117,11 +120,14 @@ fn main() -> Result<()> {
         let messages: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(
             args.messages.context("provide --image or --messages")?,
         )?)?;
-        let input = TextCodec::load(&options.path)?.prepare(&Prompt::Chat {
-            messages,
-            tools: None,
-            enable_thinking: false,
-        })?;
+        let input = TextCodec::load(&options.path)?.prepare(
+            &Prompt::Chat {
+                messages,
+                tools: None,
+                enable_thinking: false,
+            },
+            options.checkpoints.capacity > 0,
+        )?;
         std::fs::write(
             args.output.join("input.json"),
             serde_json::to_vec_pretty(
@@ -134,9 +140,9 @@ fn main() -> Result<()> {
         let _lock = BoardLock::acquire()?;
         let mut model = model::load(options)?;
         model.reserve(input.tokens.len() + 8)?;
-        model.prepare(input.tokens.len())?;
+        let prepared = model.prepare_prepared(&input, 0)?;
         let mut logits = model
-            .forward_prepared(&input, 0, &AtomicBool::new(false))?
+            .forward_prepared(prepared, &AtomicBool::new(false))?
             .to_vec();
         if let Some(path) = args.continuation {
             let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(path)?)?;

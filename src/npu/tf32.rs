@@ -163,6 +163,8 @@ mod tests {
             tune_cache: Default::default(),
             attention_tile: 512,
             vision_dtype: Default::default(),
+            checkpoints: Default::default(),
+
             experts: Default::default(),
             speculation: Default::default(),
         };

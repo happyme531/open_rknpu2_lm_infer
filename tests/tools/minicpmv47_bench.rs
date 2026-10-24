@@ -103,6 +103,7 @@ fn main() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
         speculation: Default::default(),
         experts: experts::Options {
             storage: args.storage,

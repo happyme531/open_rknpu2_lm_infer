@@ -22,6 +22,8 @@ pub struct PreparedInput {
     pub positions: Vec<[usize; 3]>,
     pub images: Vec<ImageSpan>,
     pub next_position: usize,
+    /// User message delimiters, in expanded KV rows.
+    pub user_starts: Vec<usize>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowIdentity {
@@ -38,6 +40,7 @@ impl PreparedInput {
             positions,
             images: vec![],
             next_position,
+            user_starts: Vec::new(),
         }
     }
     pub fn expand(
@@ -86,6 +89,21 @@ impl PreparedInput {
         );
         result.next_position = pos;
         Ok(result)
+    }
+    pub fn set_user_starts(&mut self, raw_positions: &[usize]) {
+        self.user_starts = raw_positions
+            .iter()
+            .map(|&position| {
+                let mut extra = 0;
+                for span in &self.images {
+                    if span.start - extra >= position {
+                        break;
+                    }
+                    extra += span.image.tokens() - 1;
+                }
+                position + extra
+            })
+            .collect();
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(

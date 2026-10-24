@@ -5,6 +5,47 @@ use open_rknpu2_lm_infer::{
 };
 
 #[test]
+fn update_ranges_reject_nan_and_positive_infinity_but_allow_zero_decay() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let dim = GdnDimensions::new(1, 1, 2, 2).unwrap();
+    let mut workspace = Workspace::default();
+    for (decay, beta, valid) in [
+        (f32::NEG_INFINITY, 0., true),
+        (f32::NEG_INFINITY, 1., true),
+        (0., 0.5, true),
+        (f32::NAN, 0.5, false),
+        (f32::INFINITY, 0.5, false),
+        (0.1, 0.5, false),
+        (-1., f32::NAN, false),
+        (-1., f32::INFINITY, false),
+        (-1., f32::NEG_INFINITY, false),
+        (-1., -0.1, false),
+        (-1., 1.1, false),
+    ] {
+        let mut state = vec![0.25; dim.state_elements()];
+        let before = state.clone();
+        let mut output = vec![0.; dim.value_width()];
+        let updates = Updates {
+            rows: 1,
+            key: &[0.5, 0.5],
+            value: &[1., 2.],
+            log_decay: &[decay],
+            beta: &[beta],
+        };
+        let result = workspace.run(&pool, dim, &mut state, &[0.5, 0.5], updates, &mut output);
+        assert_eq!(result.is_ok(), valid, "decay={decay}, beta={beta}");
+        if valid {
+            assert!(output.iter().chain(&state).all(|v| v.is_finite()));
+        } else {
+            assert_eq!(state, before, "invalid updates must not mutate state");
+        }
+    }
+}
+
+#[test]
 fn scalar_and_parallel_match_pinned_transformers_nonzero_rectangular_state() {
     let f = fixtures().gdn;
     let dim = GdnDimensions::new(f.key_heads, f.value_heads, f.key_dim, f.value_dim).unwrap();

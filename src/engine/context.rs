@@ -34,7 +34,6 @@ impl PrefixCache {
             .take(input.tokens.len())
             .take_while(|(i, row)| **row == input.row(*i))
             .count()
-            .min(input.tokens.len() - 1)
     }
     pub fn extend_input(&mut self, input: &PreparedInput, start: usize) {
         self.rows
@@ -78,7 +77,7 @@ mod tests {
         cache.extend_input(&PreparedInput::text(vec![1, 2, 3]), 0);
         assert_eq!(cache.reusable(&PreparedInput::text(vec![1, 2, 3, 4]), 3), 3);
         assert_eq!(cache.reusable(&PreparedInput::text(vec![1, 2, 4]), 3), 2);
-        assert_eq!(cache.reusable(&PreparedInput::text(vec![1, 2]), 3), 1);
+        assert_eq!(cache.reusable(&PreparedInput::text(vec![1, 2]), 3), 2);
         assert_eq!(cache.reusable(&PreparedInput::text(vec![1, 2, 3]), 2), 0);
         let mut input = PreparedInput::text(vec![1, 2, 3, 4]);
         input.positions[1] = [9; 3];

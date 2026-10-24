@@ -227,7 +227,10 @@ fn main() -> Result<()> {
         tune_cache: args.tune_cache.clone(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
+
         speculation: Default::default(),
     };
     open_rknpu2_lm_infer::npu::configure_cpu(&mut options)?;

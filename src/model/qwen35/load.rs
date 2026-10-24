@@ -341,6 +341,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         loader.store.contains("mtp.fc.weight") || loader.store.contains("mtp.fc.weight_packed");
     let trace = Trace::from_environment()?;
     let load_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
     Ok(Qwen35 {
         options,
         info,
@@ -371,5 +372,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         features: Default::default(),
         #[cfg(feature = "draft-dflash")]
         dflash: None,
+        prefix_cache,
     })
 }

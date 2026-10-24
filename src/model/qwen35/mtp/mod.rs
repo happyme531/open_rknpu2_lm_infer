@@ -3,6 +3,16 @@
 //! token[t+2]. Recursive draft steps use the MTP's own normalized hidden state.
 mod adapter;
 mod load;
+pub(super) struct Snapshot {
+    seed: Vec<f32>,
+    seed_rope: [usize; 3],
+    canonical: usize,
+}
+impl Snapshot {
+    pub fn bytes(&self) -> usize {
+        self.seed.len() * 4
+    }
+}
 #[cfg(test)]
 mod tests;
 use super::{
@@ -38,6 +48,21 @@ pub(super) struct Predictor {
     pub elapsed_ms: f64,
 }
 impl Predictor {
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            seed: self.seed.clone(),
+            seed_rope: self.seed_rope,
+            canonical: self.canonical,
+        }
+    }
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.truncate(snapshot.canonical)?;
+        self.canonical = snapshot.canonical;
+        self.seed.clone_from(&snapshot.seed);
+        self.seed_rope = snapshot.seed_rope;
+        self.recursive.clear();
+        Ok(())
+    }
     pub fn reset(&mut self) -> Result<()> {
         if let Mixer::Attention { cache, .. } = &self.layer.mixer {
             cache.reset()?;

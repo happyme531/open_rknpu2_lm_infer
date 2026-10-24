@@ -36,6 +36,50 @@ fn complete_cpu_mixer_matches_pinned_transformers_fixture() {
 }
 
 #[test]
+fn checkpoints_restore_state_history_and_next_output_after_a_branch() {
+    let dim = GdnDimensions::new(2, 4, 128, 8).unwrap();
+    let weights = weights(dim, 4, 3);
+    let input = Inputs::new(dim, 12, 7);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let mut state = LayerState::new(dim, 4, 8).unwrap();
+    let mut scratch = Scratch::default();
+    state
+        .forward(&pool, &weights, input.view(0, 5), &mut scratch)
+        .unwrap();
+    let saved = state.snapshot().unwrap();
+    let canonical = state.canonical().to_vec();
+    let history = state.convolution().to_vec();
+    let expected = state
+        .forward(&pool, &weights, input.view(5, 7), &mut scratch)
+        .unwrap()
+        .to_vec();
+    state.restore(&saved).unwrap();
+    assert_eq!(state.position(), 5);
+    assert_eq!(state.canonical(), canonical);
+    assert_eq!(state.convolution(), history);
+    assert_eq!(
+        state
+            .forward(&pool, &weights, input.view(5, 7), &mut scratch)
+            .unwrap(),
+        expected
+    );
+    state
+        .verify(&pool, &weights, input.view(0, 2), &mut scratch)
+        .unwrap();
+    assert!(state.snapshot().is_err());
+    assert!(state.restore(&saved).is_err());
+    state.abort_round();
+    state.reset();
+    state.restore(&saved).unwrap();
+    assert_eq!(state.canonical(), canonical);
+    let mut other = LayerState::new(dim, 3, 8).unwrap();
+    assert!(other.restore(&saved).is_err());
+}
+
+#[test]
 fn prefill_chunks_and_single_token_execution_have_identical_states_and_outputs() {
     for (kd, vd) in [(8, 5), (128, 8)] {
         check_chunks(GdnDimensions::new(2, 4, kd, vd).unwrap());

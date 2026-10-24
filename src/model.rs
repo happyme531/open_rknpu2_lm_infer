@@ -14,7 +14,10 @@ pub mod ling3tiny;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
+mod prefill;
 pub(crate) mod projection;
+pub(crate) use prefill::PrefillStep;
+pub use prefill::PreparedPrefill;
 mod speculation;
 pub use speculation::{SpeculativeConfig, SpeculativeType};
 #[cfg(feature = "arch-qwen35")]
@@ -74,7 +77,22 @@ pub struct ModelOptions {
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
     pub experts: experts::Options,
+    pub checkpoints: CheckpointOptions,
     pub speculation: SpeculativeConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointOptions {
+    pub capacity: usize,
+    pub min_step: usize,
+}
+impl Default for CheckpointOptions {
+    fn default() -> Self {
+        Self {
+            capacity: 32,
+            min_step: 8192,
+        }
+    }
 }
 impl ModelOptions {
     pub(crate) fn validate_speculation(&self) -> Result<()> {
@@ -95,12 +113,28 @@ pub struct ModelInfo {
 /// New architectures register through `load` and implement this contract.
 pub trait LanguageModel {
     fn info(&self) -> &ModelInfo;
+    fn uses_user_boundaries(&self) -> bool {
+        false
+    }
     fn reset(&mut self) -> Result<()>;
     /// Reserve KV for a complete request before tuning and timed forwards.
     fn reserve(&mut self, _tokens: usize) -> Result<()> {
         Ok(())
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()>;
+    fn prepare_prepared<'a>(
+        &mut self,
+        input: &'a crate::input::PreparedInput,
+        start: usize,
+    ) -> Result<PreparedPrefill<'a>> {
+        self.prepare(input.tokens.len() - start)?;
+        Ok(PreparedPrefill {
+            input,
+            start,
+            steps: Vec::new(),
+            checkpoint: None,
+        })
+    }
     /// Consume prompt/history tokens without evaluating final output norm or
     /// lm_head. Generation uses `forward` when next-token logits are required.
     fn prefill(&mut self, _tokens: &[u32]) -> Result<()> {
@@ -111,10 +145,10 @@ pub trait LanguageModel {
     /// state; image decoding and token expansion have already completed.
     fn forward_prepared(
         &mut self,
-        input: &crate::input::PreparedInput,
-        start: usize,
+        prepared: PreparedPrefill<'_>,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<&[f32]> {
+        let PreparedPrefill { input, start, .. } = prepared;
         anyhow::ensure!(
             input.images.is_empty(),
             "this model does not support images"
@@ -209,6 +243,15 @@ pub trait LanguageModel {
     /// truncate its cache and the caller should reset and recompute instead.
     fn truncate(&mut self, _position: usize) -> Result<bool> {
         Ok(false)
+    }
+    /// Restore a usable prefix no longer than `maximum`. Zero asks the caller
+    /// to reset. Recurrent models may restore an earlier checkpoint.
+    fn restore_prefix(&mut self, maximum: usize) -> Result<usize> {
+        if maximum == self.position() || self.truncate(maximum)? {
+            Ok(maximum)
+        } else {
+            Ok(0)
+        }
     }
     fn stats(&self) -> serde_json::Value;
 }

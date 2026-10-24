@@ -30,6 +30,7 @@ fn minicpm_prefetch_timeline() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
         speculation: Default::default(),
         experts: Options {
             storage: Storage::Stream,

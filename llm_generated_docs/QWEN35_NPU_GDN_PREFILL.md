@@ -1,18 +1,18 @@
 # Qwen3.5 NPU GDN prefill
 
-Qwen3.5 的实际调用窗口 `M > 12` 使用算子库 NPU GDN，`M <= 12` 使用现有 CPU FP32 recurrence。路由依据每次 decoder chunk 的实际行数：长 prompt 的短尾部仍可走 CPU，单 token decode 保持 CPU。没有新增环境变量或模型参数。
+Qwen3.5 的实际调用窗口 `M > 12` 使用算子库 NPU GDN，`M <= 12` 使用现有 CPU FP32 recurrence。路由依据每次 decoder chunk 的实际行数：长 prompt 的短尾部仍可走 CPU，单 token decode 保持 CPU。
 
 当前算子库支持 Hk16/Hv32、Dk128/Dv128、K4 Conv，覆盖 C7。其他维度继续使用通用 CPU mixer。所有 canonical state 保持 FP32 `[value_head,value_channel,key_channel]`，key 连续，value head `h` 使用 key head `h/2`。
 
 ## 执行与所有权
 
-`src/npu/gated_delta.rs` 封装公开 `rk_npu_gdn_run_projected_strided` ABI，复用模型最后一个权重 domain 的 Backend。各层共享 Scratch 中的工作区，只保留配置的主窗口和一个实际尾窗口。正常模型 prepare 预建工作区；首次直接 forward 也可按需创建。不进行在线调优。
+`src/npu/gated_delta.rs` 封装公开 `rk_npu_gdn_run_projected_strided` ABI，复用模型最后一个权重 domain 的 Backend。各层共享 Scratch 中的工作区。模型 prepare 按本次执行计划预建全部所需块长，下一次 prepare 释放不再使用的形状；直接 forward 遇到未准备的尾块时，沿用保留主窗口并替换旧尾块的按需策略。不进行在线调优。
 
 合并投影通过带步长视图直接提供 QKV/Z/a/b，输出 gated RMSNorm 直接写入 decoder 的输出投影缓冲区。输入为原始 projected QKV、K4 Conv 权重、FP32 log decay／sigmoid beta、卷积历史与 canonical state。算子库的 CPU producer 将 Conv＋SiLU＋固定顺序 Q/K L2 直接写入 native 输入；NPU TF32 乘法计算 Gram、state prediction、输出与状态增量。衰减系数、三角求解和输出收集由算子库 CPU 部分完成；投影后 gate 变换、output gated RMSNorm 仍在 Rust。
 
 使用 ordinary TF32，state 存储和 DPU 状态合并为 FP32；这不等于全精度 FP32 GEMM。内部块长使用 `next_power_of_two(M).clamp(16,64)`：M13..16 为 chunk16，M17..32 为 chunk32，更长窗口为 chunk64；CPU worker 和 NPU mask 沿用模型配置。每次调用都导入当前层的 canonical state 和历史，成功后导出。NPU prefill 后可直接交给 CPU decode，不保留跨层隐式设备状态。native 输出失败时不提交 state/history，workspace 会释放，错误交给模型已有的 reset 路径。
 
-verify／部分接受 replay 保持 CPU，沿用现有事务日志。NPU normal forward 不生成多 token rollback 快照。
+verify／部分接受 replay 保持 CPU，沿用现有事务日志。prompt checkpoint 在 prefill 边界保存，与验证事务日志独立。
 
 ## 统计
 
@@ -25,16 +25,39 @@ verify／部分接受 replay 保持 CPU，沿用现有事务日志。NPU normal 
 - `gdn_split_ms` / `gdn_output_copy_ms`：trace 开启时 QKV 紧凑化，以及输出复制的累计时间。正常推理直接读取合并投影视图，输出直接写入调用方缓冲区，两项均为 0。
 - `gdn_layer_prepare_ms`：形状/状态检查及当前层卷积历史复制；`gdn_buffers_ms` 是 mixer 输出和 gate 缓冲区 resize 时间。
 - `gdn_gates_ms` / `gdn_output_norm_ms`：log decay/beta 生成，以及输出 gated RMSNorm 的累计时间。
-- `gdn_npu_workspace_rows`：当前驻留的实际窗口形状，至多两个。
+- `gdn_npu_workspace_rows`：当前驻留的实际窗口形状；准备好的计划可以同时保留多个尾块。
+- `gdn_npu_workspace_creations`：本次模型 reset 后成功创建工作区的次数；执行前后取差可检查初始化是否落入 prefill，与 native run 内的 `gdn_npu_prepare_ms` 分开。
 - `gdn_npu_chunks`：各驻留窗口的实际内部块长。
 
 原有 `gdn_ms` 仍是完整 mixer 阶段，包括投影拆分和输出 gated RMSNorm。NPU GDN 的内部 CPU/device 分配未计入原 Backend 的量化 workspace 字节字段。
 
 模型热路径不扫描 projected QKV/Z/a/b 或 CPU recurrence 的 Q/K/V 来检查有限值。保留形状/长度检查、verify 事务状态检查和小尺寸 gate 范围检查；静态权重在加载时检查。
 
+## 前缀缓存
+
+前缀检查点的位置与淘汰规则参考 llama.cpp `7894e8b92481`。在逻辑批次执行前保存，优先覆盖最后一条 user 消息起点及距 prompt 末尾 `4+ubatch`、`4` 个 token 的位置。其他 user 边界受最小间距约束；最后一条 user 消息和尾部检查点可以绕过间距限制。实际执行按 physical ubatch 拆分，不按每个 microbatch 保存。
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| `serve --cache-prompt` / `--no-cache-prompt` | 开启 | 设置请求的前缀复用默认值 |
+| `--ctx-checkpoints`，别名 `-ctxcp`、`--swa-checkpoints` | 32 | 检查点数量上限；非正值关闭保存 |
+| `--checkpoint-min-step`，别名 `-cms` | 8192 | 最小间距；0 表示不限制间距 |
+
+服务请求的 `cache_prompt` 为 `true/false` 时覆盖服务默认值；省略或 `null` 时继承默认值。关闭复用仍保留本次计算的新状态，后续请求可以重新启用复用。环境变量使用上游名称 `LLAMA_ARG_CACHE_PROMPT`、`LLAMA_ARG_CTX_CHECKPOINTS`、`LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT`，命令行覆盖环境变量。兼容旧的 `LLAMA_ARG_NO_CACHE_PROMPT`，其存在即关闭默认复用；命令行开关按最后一个生效。现有 context/ubatch 参数也接受 `LLAMA_ARG_CTX_SIZE`、`LLAMA_ARG_UBATCH`。
+
+CPU/NPU 共用检查点中的 FP32 GDN 状态、卷积历史和位置；MTP 同时恢复 seed，target/draft KV 保持驻留并截断到恢复位置。相同活动分支的同位置快照直接复用并刷新请求标记，避免重复复制与误淘汰更早的检查点。C7 的一个 GDN/卷积快照载荷约 50.25 MiB，数量上限不代表预先分配。
+
+准备阶段生成一份借用输入的执行计划，执行阶段直接消费。ChatML user/tool 分隔符在 tokenizer 加载时编码；仅消费这些边界且开启检查点的模型扫描消息边界。当前服务仍由单个推理 worker 持有一份活动模型状态。
+
+**数值 NOTE：** 检查点会改变实际 prefill 分块。已验证 CPU FP32 与 NPU TF32 的恢复结果，各自与同一分块路径重算的完整 logits、GDN/卷积状态一致。NPU TF32 在不同分块路径下可能出现 greedy 输出差异；已复现的 427/428-token 公共前缀分支中，CPU FP32 GDN 对照没有该差异。本次保留缓存策略并记录此限制，没有修改 GDN 数值算法。
+
+`prefix_restore_matches_all_logits_and_draft_state` 覆盖 AR/MTP/DFlash、CPU/NPU 状态恢复、`[468,596]` 的同位置复用和后续分支恢复 468。工作区回归覆盖 `[20,74,118,128]`、`[20,52,128]`、`[84,128]` 三组计划，检查 prefill 创建计数增量为 0，以及旧尾块回收。另有软件回归覆盖调度位置、分隔符优先级、参数覆盖和非法 gate 不修改状态。
+
+缓存验证使用 spare1、CPU2.256GHz/NPU1GHz、DDR 未固定、`--no-tune`。原始请求、输出和状态诊断保存在忽略目录 `llm_generated_docs/evidence/ssm_prefix_cache_20261024/`、`cache_controls_20261024/`、`cache_review_20261024/`、`gdn_workspace_20261024/`。这些是功能与数值验证，下面的历史调优性能数据不代表新增缓存的吞吐基准。
+
 ## 验证
 
-`npu_prefill_threshold_state_handoff_and_layer_reuse` 覆盖 M12 的 CPU 输出/state 逐 bit 一致；M13/32/64/128 以及短窗口交错、两层共享、不同 Conv 权重、canonical state 和 history、NPU 后的 CPU decode、verify/commit、非法派生 gate 失败不提交状态。CPU 接续从相同导出状态开始时逐 bit 一致。缓存始终至多两个窗口。
+`npu_prefill_threshold_state_handoff_and_layer_reuse` 覆盖 M12 的 CPU 输出/state 逐 bit 一致；M13/32/64/128 以及短窗口交错、两层共享、不同 Conv 权重、canonical state 和 history、NPU 后的 CPU decode、verify/commit、非法派生 gate 失败不提交状态。CPU 接续从相同导出状态开始时逐 bit 一致。该按需调用序列保持至多两个窗口。
 
 真实模型对照以外层 `6143940`、算子库 `a9a2e06` 的冻结 CPU GDN 二进制为基线，同 C7 权重和同一调优缓存。精度用真实文本 128-token prompt＋16 个固定 continuation 的全量 logits，以及原有 C7 PPL 数据的前两个 512-token 窗口、每窗 255 个目标，合计 510 个 NLL。
 

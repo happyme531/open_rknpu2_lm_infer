@@ -52,6 +52,7 @@ fn main() {
         let mut cpu = cmake::Config::new(cpu_root);
         cpu.out_dir(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cpu-kernels"))
             .profile("Release")
+            .define("RK_NPU_MATMUL_ROOT", &root)
             .define("RK_NPU_ENABLE_TRACE", if trace { "ON" } else { "OFF" });
         if trace {
             cpu.define("RK_NPU_TRACE_ROOT", &root)

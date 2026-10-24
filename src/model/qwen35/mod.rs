@@ -1,6 +1,7 @@
 //! Shared Qwen3.5 decoder architecture, also used by MiniCPM-V 4.7 text.
 //! Model-family availability is controlled by the registry, independently of reuse.
 mod attention;
+mod cache;
 pub mod config;
 mod decoder;
 mod features;

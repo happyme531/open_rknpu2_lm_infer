@@ -149,6 +149,7 @@ impl Conversation {
                 tools: None,
                 enable_thinking: thinking,
             },
+            cache_prompt: None,
             sampling: sampling.clone(),
             max_tokens,
             stop: stop.to_vec(),
