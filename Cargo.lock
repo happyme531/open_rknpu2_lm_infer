@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "open_rknpu2_lm_infer"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
