@@ -202,7 +202,10 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         } else {
             0
         };
-        let budget = (2usize << 30) - (128usize << 20);
+        // Streamed domains also own staging and prefill workspaces. Reserve
+        // their address space before assigning another layer's weights.
+        let reserve_mib = if paging.is_some() { 512 } else { 128 };
+        let budget = (2usize << 30) - (reserve_mib << 20);
         ensure!(
             estimate + kv < budget,
             "Qwen3.5 layer exceeds IOMMU domain budget"
@@ -373,5 +376,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         mtp: None,
         features: Default::default(),
         dflash: None,
+        decode_prepared: false,
     })
 }

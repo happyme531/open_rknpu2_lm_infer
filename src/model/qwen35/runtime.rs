@@ -51,6 +51,7 @@ pub struct Qwen35 {
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
+    pub(super) decode_prepared: bool,
 }
 
 impl Qwen35 {
@@ -96,6 +97,9 @@ impl Qwen35 {
         verify: bool,
     ) -> Result<()> {
         let start = Instant::now();
+        if !verify && tokens.len() > 1 {
+            self.decode_prepared = false;
+        }
         let h = self.config.hidden_size;
         self.phases.context(self.position, tokens.len(), -1, verify);
         self.phases.stage(Phase::Cpu, "target embedding", || {
@@ -272,6 +276,17 @@ impl Qwen35 {
         }
         Ok(values)
     }
+
+    pub(super) fn release_prefill_workspaces(&mut self) -> Result<()> {
+        if !self.decode_prepared {
+            let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+            for backend in self.backends.iter().chain(self.head.backend()) {
+                backend.retain_workspaces(&rows)?;
+            }
+            self.decode_prepared = true;
+        }
+        Ok(())
+    }
 }
 
 impl LanguageModel for Qwen35 {
@@ -292,6 +307,7 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.position = 0;
+        self.decode_prepared = false;
         self.round = None;
         self.features.reset();
         if let Some(mtp) = &mut self.mtp {
@@ -352,10 +368,20 @@ impl LanguageModel for Qwen35 {
             rows.sort_unstable();
             rows.dedup();
         }
-        for backend in self.backends.iter().chain(self.head.backend()) {
+        self.decode_prepared = false;
+        for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
                 backend.prepare(*rows)?;
+            }
+        }
+        // Generation projects only the prompt's final row; full-row scoring
+        // prepares its own head workspace when token_nll is requested.
+        let head_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        if let Some(backend) = self.head.backend() {
+            backend.retain_workspaces(&head_rows)?;
+            for rows in head_rows {
+                backend.prepare(rows)?;
             }
         }
         self.work.recurrent.prepare(&rows)?;

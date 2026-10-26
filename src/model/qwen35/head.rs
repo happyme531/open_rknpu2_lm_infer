@@ -38,6 +38,7 @@ pub(super) fn load(
 
 impl Qwen35 {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
+        self.release_prefill_workspaces()?;
         let start = Instant::now();
         let h = self.config.hidden_size;
         norm::rms_norm(

@@ -33,6 +33,7 @@ impl Qwen35 {
             "verification exceeds the reserved speculative window or ubatch"
         );
         self.reserve(self.position + tokens.len())?;
+        self.release_prefill_workspaces()?;
         self.round = Some(Round {
             tokens: tokens.to_vec(),
             hidden: Vec::new(),

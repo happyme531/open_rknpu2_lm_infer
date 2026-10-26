@@ -110,6 +110,7 @@ impl Qwen35 {
         drafts: usize,
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<f32>>> {
+        self.release_prefill_workspaces()?;
         let Some(draft) = &self.dflash else {
             return Ok(None);
         };
