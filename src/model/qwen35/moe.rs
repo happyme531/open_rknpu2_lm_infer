@@ -195,34 +195,33 @@ impl Routed {
         let rows = e.rows;
         let mut ids = Vec::with_capacity(rows * self.top);
         let mut weights = Vec::with_capacity(rows * self.top);
-        let mut logits = vec![0.; self.count];
+        let mut logits = vec![0.; rows * self.count];
         timings.measure(Phase::Cpu, || -> Result<()> {
-            for x in input.chunks_exact(self.h) {
-                e.cpu.dense_head(&self.router, x, &mut logits);
-                let (i, r) = routes(&logits, self.top)?;
+            e.cpu.dense_head_batch(&self.router, input, &mut logits);
+            for row in logits.chunks_exact(self.count) {
+                let (i, r) = routes(row, self.top)?;
                 ids.extend(i);
                 weights.extend(r);
             }
             Ok(())
         })?;
-        let request = timings.measure(Phase::Cpu, || -> Result<_> {
-            let request = match &self.experts {
-                Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
-                Bank::Resident(_) => None,
-            };
-            if rows <= DECODE_BATCH_MAX_ROWS
-                && let Some((router, paging, next)) = &self.prediction
-            {
-                let mut logits = vec![0.; self.count];
+        let request = timings.measure(Phase::Cpu, || match &self.experts {
+            Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
+            Bank::Resident(_) => None,
+        });
+        if rows <= DECODE_BATCH_MAX_ROWS
+            && let Some((router, paging, next)) = &self.prediction
+        {
+            let predicted = timings.measure(Phase::Cpu, || -> Result<_> {
                 let mut predicted = Vec::with_capacity(rows * self.top);
-                for x in input.chunks_exact(self.h) {
-                    e.cpu.dense_head(router, x, &mut logits);
-                    predicted.extend(routes(&logits, self.top)?.0);
+                e.cpu.dense_head_batch(router, input, &mut logits);
+                for row in logits.chunks_exact(self.count) {
+                    predicted.extend(routes(row, self.top)?.0);
                 }
-                paging.predict(*next, &predicted);
-            }
-            Ok(request)
-        })?;
+                Ok(predicted)
+            })?;
+            timings.measure(Phase::Cpu, || paging.predict(*next, &predicted));
+        }
         if e.trace.enabled() {
             e.trace.save(
                 e.position,
