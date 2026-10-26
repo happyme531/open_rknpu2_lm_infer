@@ -80,6 +80,7 @@ impl Markov {
         row: usize,
         previous: u32,
         logits: &mut [f32],
+        cutoff: f64,
     ) -> Result<Option<f64>> {
         ensure!(
             (previous as usize) < self.previous.shape[0]
@@ -88,10 +89,7 @@ impl Markov {
         );
         let mut latent = vec![0.; self.rank];
         self.previous.row(previous as usize, &mut latent);
-        let mut bias = vec![0.; logits.len()];
-        self.projection.run(&latent, &mut bias, 1)?;
-        cpu.add(logits, &bias);
-        Ok(self.confidence.as_ref().map(|(weight, bias, with_markov)| {
+        let confidence = self.confidence.as_ref().map(|(weight, bias, with_markov)| {
             let hidden = &self.draft_hidden[row * self.hidden..(row + 1) * self.hidden];
             let mut score = *bias;
             for (&x, &w) in hidden.iter().zip(weight) {
@@ -103,7 +101,14 @@ impl Markov {
                 }
             }
             1. / (1. + (-(score as f64)).exp())
-        }))
+        });
+        if confidence.is_some_and(|p| p < cutoff) {
+            return Ok(confidence);
+        }
+        let mut bias = vec![0.; logits.len()];
+        self.projection.run(&latent, &mut bias, 1)?;
+        cpu.add(logits, &bias);
+        Ok(confidence)
     }
 }
 
@@ -144,7 +149,13 @@ mod tests {
         let w2 = store.get("markov_head.markov_w2.weight")?;
         for previous in [17, 695] {
             let mut actual = vec![0.; c.vocab_size];
-            let confidence = markov.adjust(&cpu, 0, previous, &mut actual)?.unwrap();
+            let confidence = markov.adjust(&cpu, 0, previous, &mut actual, 0.)?.unwrap();
+            let mut skipped = vec![0.; c.vocab_size];
+            let stopped = markov.adjust(&cpu, 0, previous, &mut skipped, 1.)?.unwrap();
+            ensure!(
+                stopped.to_bits() == confidence.to_bits() && skipped.iter().all(|&x| x == 0.),
+                "stopped Markov correction changed logits/confidence"
+            );
             let mut latent = vec![0.; markov.rank];
             markov.previous.row(previous as usize, &mut latent);
             let mut expected = vec![0.; c.vocab_size];

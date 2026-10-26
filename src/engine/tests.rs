@@ -123,6 +123,7 @@ impl LanguageModel for Model {
         row: usize,
         previous: u32,
         logits: &mut [f32],
+        cutoff: f64,
     ) -> Result<Option<f64>> {
         let Some(&(expected, token, confidence)) = self.draft_adjust.get(row) else {
             return Ok(None);
@@ -131,6 +132,9 @@ impl LanguageModel for Model {
             previous == expected,
             "parallel draft correction did not receive the preceding proposal"
         );
+        if confidence < cutoff {
+            return Ok(Some(confidence));
+        }
         logits.fill(-10.);
         logits[token as usize] = 10.;
         Ok(Some(confidence))
@@ -175,6 +179,41 @@ fn parallel_corrections_use_previous_proposal_and_learned_confidence() -> Result
     assert!(round.confidence_stopped);
     model.finish_verification(2)?;
     assert_eq!(model.tokens, [1, 2, 3, 4]);
+    Ok(())
+}
+
+#[test]
+fn learned_cutoff_uses_round_options_and_corrects_kept_low_rows() -> Result<()> {
+    use crate::speculative::{DraftOptions, run_round_with_options};
+    for keep in [false, true] {
+        let mut model = Model::new(3, 0, 100);
+        model.parallel = true;
+        model.p_min = 0.99;
+        model.draft_adjust = vec![(3, 4, 0.9), (4, 2, 0.2)];
+        model.forward(&[1, 2])?;
+        let mut sampler = Sampler::new(SamplingParams::default(), 5, &[1, 2, 3])?;
+        let round = run_round_with_options(
+            &mut model,
+            &mut sampler,
+            3,
+            8,
+            &AtomicBool::new(false),
+            DraftOptions {
+                p_min: 0.5,
+                keep_low_confidence: keep,
+                collect_confidence: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(round.inputs, if keep { vec![3, 4, 2] } else { vec![3, 4] });
+        assert_eq!(round.output, [4, 1]);
+        assert_eq!(round.accepted, 1);
+        assert_eq!(round.draft_confidence, [0.9, 0.2]);
+        assert_eq!(round.draft_attempts, 2);
+        assert!(round.confidence_stopped);
+        model.finish_verification(2)?;
+        assert_eq!(model.tokens, [1, 2, 3, 4]);
+    }
     Ok(())
 }
 

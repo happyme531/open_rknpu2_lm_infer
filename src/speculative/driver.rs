@@ -101,7 +101,16 @@ pub fn run_round_with_options(
             let previous = *inputs.last().unwrap();
             let (logits, learned) = if let Some(values) = &mut block {
                 let logits = &mut values[row * vocab..(row + 1) * vocab];
-                let learned = model.adjust_draft_logits(row, previous, logits)?;
+                let learned = model.adjust_draft_logits(
+                    row,
+                    previous,
+                    logits,
+                    if options.keep_low_confidence {
+                        0.
+                    } else {
+                        options.p_min
+                    },
+                )?;
                 (&*logits, learned)
             } else {
                 (model.draft_logits(previous, cancel)?, None)

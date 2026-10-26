@@ -139,9 +139,15 @@ impl DFlash {
         }
         Ok(normalized)
     }
-    pub fn adjust(&self, row: usize, previous: u32, logits: &mut [f32]) -> Result<Option<f64>> {
+    pub fn adjust(
+        &self,
+        row: usize,
+        previous: u32,
+        logits: &mut [f32],
+        cutoff: f64,
+    ) -> Result<Option<f64>> {
         match &self.markov {
-            Some(markov) => markov.adjust(&self.cpu, row, previous, logits),
+            Some(markov) => markov.adjust(&self.cpu, row, previous, logits, cutoff),
             None => Ok(None),
         }
     }

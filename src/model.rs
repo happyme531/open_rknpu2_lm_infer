@@ -142,12 +142,14 @@ pub trait LanguageModel {
         Ok(None)
     }
     /// Optional sequential correction to a parallel draft row. Returns a
-    /// learned acceptance probability when the drafter supplies one.
+    /// learned acceptance probability when the drafter supplies one. Below
+    /// cutoff, correction may be omitted and the caller must discard that row.
     fn adjust_draft_logits(
         &self,
         _row: usize,
         _previous: u32,
         _logits: &mut [f32],
+        _cutoff: f64,
     ) -> Result<Option<f64>> {
         Ok(None)
     }

@@ -500,11 +500,12 @@ impl LanguageModel for Qwen35 {
         row: usize,
         previous: u32,
         logits: &mut [f32],
+        cutoff: f64,
     ) -> Result<Option<f64>> {
         match &self.dflash {
-            Some(draft) => self
-                .phases
-                .trace("draft Markov", || draft.adjust(row, previous, logits)),
+            Some(draft) => self.phases.trace("draft Markov", || {
+                draft.adjust(row, previous, logits, cutoff)
+            }),
             None => Ok(None),
         }
     }
