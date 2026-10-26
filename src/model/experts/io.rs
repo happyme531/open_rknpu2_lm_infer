@@ -438,23 +438,8 @@ impl Reader {
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();
         loop {
-            if let Some(&expert) = experts
-                .iter()
-                .find(|&&id| s.ready.contains_key(&(layer, id)))
-            {
-                let key = (layer, expert);
-                let result = s.ready.remove(&key).unwrap();
-                s.pending.remove(&key);
-                s.ram_ready.remove(&key);
-                s.stats.wait_ms += start.elapsed().as_secs_f64() * 1000.;
-                self.timeline.span("wait record", 0, start, || {
-                    json!({"layer":layer,"expert":expert,"wanted":experts,
-                        "staged":result.as_ref().ok().is_some_and(|l|l.staged.is_some())})
-                });
-                wake.notify_all();
-                return result
-                    .map(|loaded| (expert, loaded))
-                    .map_err(|e| anyhow!(e));
+            if let Some(loaded) = self.take_ready(&mut s, layer, experts, start)? {
+                return Ok(loaded);
             }
             if let Some(index) = s.imports.iter().position(|job| {
                 job.key.0 == layer && experts.contains(&job.key.1) && job.generation == s.generation
@@ -488,6 +473,39 @@ impl Reader {
                 })
             });
         }
+    }
+    /// Drain published records without waiting for I/O or taking over queued imports.
+    pub fn try_take_any(&self, layer: usize, experts: &[usize]) -> Result<Option<(usize, Loaded)>> {
+        let start = Instant::now();
+        let mut s = self.shared.0.lock().unwrap();
+        self.take_ready(&mut s, layer, experts, start)
+    }
+    fn take_ready(
+        &self,
+        s: &mut State,
+        layer: usize,
+        experts: &[usize],
+        start: Instant,
+    ) -> Result<Option<(usize, Loaded)>> {
+        let Some(&expert) = experts
+            .iter()
+            .find(|&&id| s.ready.contains_key(&(layer, id)))
+        else {
+            return Ok(None);
+        };
+        let key = (layer, expert);
+        let result = s.ready.remove(&key).unwrap();
+        s.pending.remove(&key);
+        s.ram_ready.remove(&key);
+        s.stats.wait_ms += start.elapsed().as_secs_f64() * 1000.;
+        self.timeline.span("wait record", 0, start, || {
+            json!({"layer":layer,"expert":expert,"wanted":experts,
+                "staged":result.as_ref().ok().is_some_and(|l|l.staged.is_some())})
+        });
+        self.shared.1.notify_all();
+        result
+            .map(|loaded| Some((expert, loaded)))
+            .map_err(|e| anyhow!(e))
     }
     pub fn stats(&self) -> Stats {
         self.shared.0.lock().unwrap().stats.clone()
@@ -637,7 +655,9 @@ mod tests {
         }
         let mut remaining: Vec<_> = (0..96).collect();
         reader.demand(0, &remaining);
-        let (expert, loaded) = reader.take_any(0, &remaining)?;
+        // Nonblocking drains must consume the published prediction while other
+        // demanded records may still be queued or in flight.
+        let (expert, loaded) = reader.try_take_any(0, &remaining)?.unwrap();
         assert!(predicted.contains(&expert));
         assert_eq!(loaded.record.as_bytes(), vec![expert as u8; 4096]);
         remaining.retain(|&id| id != expert);
@@ -647,6 +667,34 @@ mod tests {
             remaining.retain(|&id| id != expert);
         }
         assert!(reader.stats().max_outstanding_records <= READ_BUFFER_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    fn nonblocking_take_preserves_unready_demand_and_reports_read_errors() -> Result<()> {
+        let reader = Reader {
+            shared: Shared::default(),
+            workers: Vec::new(),
+            timeline: Timeline::default(),
+            record_stride: 4096,
+        };
+        reader.demand(0, &[2, 3]);
+        assert!(reader.try_take_any(0, &[2, 3])?.is_none());
+        {
+            let mut s = reader.shared.0.lock().unwrap();
+            assert_eq!(s.demand, VecDeque::from([(0, 2), (0, 3)]));
+            assert!(s.pending.contains(&(0, 2)));
+            s.demand.pop_front();
+            s.ready.insert((0, 2), Err("test read failure".into()));
+        }
+        assert_eq!(
+            reader.try_take_any(0, &[2, 3]).err().unwrap().to_string(),
+            "test read failure"
+        );
+        let s = reader.shared.0.lock().unwrap();
+        assert!(!s.pending.contains(&(0, 2)));
+        assert!(s.pending.contains(&(0, 3)));
+        assert_eq!(s.demand, VecDeque::from([(0, 3)]));
         Ok(())
     }
 

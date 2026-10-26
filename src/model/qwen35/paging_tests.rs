@@ -14,6 +14,16 @@ use std::{path::PathBuf, time::Instant};
 #[test]
 #[ignore = "requires MiniCPM checkpoint, prepared expert store, token windows and RK3588"]
 fn minicpm_prefetch_timeline() -> Result<()> {
+    run_batches(&[128, 1, 1, 1, 1, 1, 1, 1, 1])
+}
+
+#[test]
+#[ignore = "requires MiniCPM checkpoint, prepared expert store, token windows and RK3588"]
+fn minicpm_batched_prefetch_timeline() -> Result<()> {
+    run_batches(&[128, 4, 16, 4, 16, 1])
+}
+
+fn run_batches(batches: &[usize]) -> Result<()> {
     let _lock = BoardLock::acquire()?;
     let windows: Vec<Vec<u32>> =
         serde_json::from_slice(&std::fs::read(std::env::var("MINICPM_TEST_WINDOWS")?)?)?;
@@ -45,12 +55,10 @@ fn minicpm_prefetch_timeline() -> Result<()> {
     let mut report = json!({"model":model.options.path,"store":model.options.experts.cache,
         "prefetch":model.options.experts.prefetch,"steps":[],"completed":false});
     let mut outputs = Vec::new();
-    for step in 0..=8 {
-        let tokens = if step == 0 {
-            &windows[0][..128]
-        } else {
-            &windows[0][127 + step..128 + step]
-        };
+    let mut cursor = 0;
+    for &rows in batches {
+        let tokens = &windows[0][cursor..cursor + rows];
+        cursor += rows;
         let position = model.position();
         let paging = model
             .paging

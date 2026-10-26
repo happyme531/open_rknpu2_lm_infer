@@ -321,13 +321,27 @@ impl Paged {
                 plan_start,
                 || json!({"layer":self.layer,"rows":rows,"position":position}),
             );
+            // Two substantial cold groups amortize NPU submissions while the
+            // first group hides reads/imports for the second. Larger unions
+            // still respect the bounded persistent window.
+            let minimum_group = cold.len().min(capacity).div_ceil(2).max(3);
             let mut remaining = cold.clone();
             while !remaining.is_empty() {
                 let count = remaining.len().min(capacity);
                 let mut group = Vec::with_capacity(count);
                 let mut plan = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let (id, loaded) = self.shared.reader.take_any(self.layer, &remaining)?;
+                for index in 0..count {
+                    // Drain extra published records without waiting for the
+                    // rest or taking over its queued background imports.
+                    let (id, loaded) = if index < minimum_group {
+                        self.shared.reader.take_any(self.layer, &remaining)?
+                    } else if let Some(loaded) =
+                        self.shared.reader.try_take_any(self.layer, &remaining)?
+                    {
+                        loaded
+                    } else {
+                        break;
+                    };
                     let selection_start = Instant::now();
                     remaining.retain(|&expert| expert != id);
                     group.push(id);
@@ -372,6 +386,12 @@ impl Paged {
                     imports += 1;
                     self.window.publish(slot, id);
                 }
+                self.shared.timeline.mark("cold group", || {
+                    json!({
+                        "layer":self.layer,"position":position,"rows":rows,
+                        "experts":group,"remaining":remaining.len()
+                    })
+                });
                 let timer = Instant::now();
                 workspace.execute(
                     &self.hot,
