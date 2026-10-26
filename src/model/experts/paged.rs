@@ -34,6 +34,9 @@ pub(crate) struct Paging {
     workspace: RefCell<Workspace>,
 }
 impl Paging {
+    pub fn timeline(&self) -> Timeline {
+        self.timeline.clone()
+    }
     pub fn reset(&self) {
         self.reader.reset();
         self.predictions.borrow_mut().fill(None);

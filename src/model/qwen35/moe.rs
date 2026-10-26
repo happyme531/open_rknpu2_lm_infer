@@ -193,10 +193,11 @@ impl Routed {
         timings: &mut Timings,
     ) -> Result<()> {
         let rows = e.rows;
+        timings.context(e.position, rows, e.index, e.verify);
         let mut ids = Vec::with_capacity(rows * self.top);
         let mut weights = Vec::with_capacity(rows * self.top);
         let mut logits = vec![0.; rows * self.count];
-        timings.measure(Phase::Cpu, || -> Result<()> {
+        timings.stage(Phase::Cpu, "target router", || -> Result<()> {
             e.cpu.dense_head_batch(&self.router, input, &mut logits);
             for row in logits.chunks_exact(self.count) {
                 let (i, r) = routes(row, self.top)?;
@@ -205,14 +206,16 @@ impl Routed {
             }
             Ok(())
         })?;
-        let request = timings.measure(Phase::Cpu, || match &self.experts {
-            Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
-            Bank::Resident(_) => None,
+        let request = timings.stage(Phase::Cpu, "target demand bookkeeping", || {
+            match &self.experts {
+                Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
+                Bank::Resident(_) => None,
+            }
         });
         if rows <= DECODE_BATCH_MAX_ROWS
             && let Some((router, paging, next)) = &self.prediction
         {
-            let predicted = timings.measure(Phase::Cpu, || -> Result<_> {
+            let predicted = timings.stage(Phase::Cpu, "target LES router", || -> Result<_> {
                 let mut predicted = Vec::with_capacity(rows * self.top);
                 e.cpu.dense_head_batch(router, input, &mut logits);
                 for row in logits.chunks_exact(self.count) {
@@ -220,7 +223,9 @@ impl Routed {
                 }
                 Ok(predicted)
             })?;
-            timings.measure(Phase::Cpu, || paging.predict(*next, &predicted));
+            timings.stage(Phase::Cpu, "target LES enqueue", || {
+                paging.predict(*next, &predicted)
+            });
         }
         if e.trace.enabled() {
             e.trace.save(
@@ -232,7 +237,7 @@ impl Routed {
             e.trace
                 .save(e.position, e.index, "router_weights", &weights)?;
         }
-        timings.measure(Phase::Linear, || match &mut self.experts {
+        timings.stage(Phase::Linear, "target routed", || match &mut self.experts {
             Bank::Resident(bank) => bank.run(input, &ids, &weights, output, rows),
             Bank::Paged(bank) => bank.run(
                 input,
@@ -252,7 +257,8 @@ impl Routed {
         timings: &mut Timings,
     ) -> Result<()> {
         let rows = e.rows;
-        timings.measure(Phase::Linear, || {
+        timings.context(e.position, rows, e.index, e.verify);
+        timings.stage(Phase::Linear, "target shared gateup", || {
             self.shared_gu.run(
                 &w.normalized[..rows * self.h],
                 &mut w.gate_up[..rows * 2 * self.f],
@@ -260,19 +266,21 @@ impl Routed {
                 &mut w.scatter,
             )
         })?;
-        e.cpu.swiglu(
-            &w.gate_up[..rows * 2 * self.f],
-            &mut w.middle[..rows * self.f],
-            self.f,
-        );
-        timings.measure(Phase::Linear, || {
+        timings.trace("target shared activation", || {
+            e.cpu.swiglu(
+                &w.gate_up[..rows * 2 * self.f],
+                &mut w.middle[..rows * self.f],
+                self.f,
+            );
+        });
+        timings.stage(Phase::Linear, "target shared down", || {
             self.shared_down.run(
                 &w.middle[..rows * self.f],
                 &mut w.attended[..rows * self.h],
                 rows,
             )
         })?;
-        timings.measure(Phase::Cpu, || {
+        timings.stage(Phase::Cpu, "target shared gate merge", || {
             let mut gate = [0.];
             for row in 0..rows {
                 e.cpu.dense_head(

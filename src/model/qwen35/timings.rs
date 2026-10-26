@@ -1,4 +1,5 @@
 //! Synchronous stage totals; fused Linear finish remains part of its call.
+use crate::model::experts::Timeline;
 use serde::Serialize;
 use std::time::Instant;
 
@@ -12,6 +13,10 @@ pub(super) struct Timings {
     gdn_output_copy_ms: f64,
     attention_verify_calls: usize,
     attention_verify_rows: usize,
+    #[serde(skip)]
+    timeline: Timeline,
+    #[serde(skip)]
+    context: (usize, usize, i32, bool),
 }
 
 pub(super) enum Phase {
@@ -22,6 +27,43 @@ pub(super) enum Phase {
 }
 
 impl Timings {
+    pub fn with_timeline(timeline: Timeline) -> Self {
+        Self {
+            timeline,
+            ..Self::default()
+        }
+    }
+    pub fn reset(&mut self) {
+        *self = Self::with_timeline(self.timeline.clone());
+    }
+    pub fn context(&mut self, position: usize, rows: usize, layer: i32, verify: bool) {
+        self.context = (position, rows, layer, verify);
+    }
+    pub fn stage<T>(
+        &mut self,
+        phase: Phase,
+        name: &'static str,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let start = Instant::now();
+        let result = self.measure(phase, operation);
+        self.span(name, start);
+        result
+    }
+    pub fn trace<T>(&self, name: &'static str, operation: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let result = operation();
+        self.span(name, start);
+        result
+    }
+    pub fn span(&self, name: &'static str, start: Instant) {
+        let (position, rows, layer, verify) = self.context;
+        self.timeline.span(name, 0, start, || {
+            serde_json::json!({
+                "position":position,"rows":rows,"layer":layer,"verify":verify
+            })
+        });
+    }
     pub fn record_attention_verification(&mut self, rows: usize) {
         self.attention_verify_calls += 1;
         self.attention_verify_rows += rows;

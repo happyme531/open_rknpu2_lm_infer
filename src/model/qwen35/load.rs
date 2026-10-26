@@ -340,6 +340,11 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         loader.store.contains("mtp.fc.weight") || loader.store.contains("mtp.fc.weight_packed");
     let trace = Trace::from_environment()?;
     let load_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let phases = super::timings::Timings::with_timeline(
+        paging
+            .as_ref()
+            .map_or_else(Default::default, |p| p.timeline()),
+    );
     Ok(Qwen35 {
         options,
         info,
@@ -360,7 +365,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         load_ms,
         forward_ms: 0.0,
         head_ms: 0.0,
-        phases: Default::default(),
+        phases,
         mtp_available,
         vision: None,
         next_rope_position: 0,

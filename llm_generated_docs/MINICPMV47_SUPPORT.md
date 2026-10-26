@@ -1,8 +1,8 @@
 # MiniCPM-V 4.7 35B-A3B
 
-支持文本常驻推理、专家流式加载与 LES 预取；DSpark 接口为实验功能，视觉尚未接入。
+支持文本常驻推理、专家流式加载、LES 预取与 DSpark 投机解码；视觉尚未接入。
 
-当前文本路径已支持标准 compressed-tensors 的无 SQ QQQ 权重，并移植 Strata 的逻辑 prefill chunk／专家分组读取和 llama.cpp-omni 的逐层 LRU 调度。[pp512/tg128 实测](MINICPMV47_NOSQ_BENCHMARK.md)、[万兆 NFS 对照](MINICPMV47_NFS10G_BENCHMARK.md)、[扩大专家缓存](MINICPMV47_CACHE_BUDGET.md)。
+当前文本路径已支持标准 compressed-tensors 的无 SQ QQQ 权重，并移植 Strata 的逻辑 prefill chunk／专家分组读取和 llama.cpp-omni 的逐层 LRU 调度。[pp512/tg128 实测](MINICPMV47_NOSQ_BENCHMARK.md)、[万兆 NFS 对照](MINICPMV47_NFS10G_BENCHMARK.md)、[扩大专家缓存](MINICPMV47_CACHE_BUDGET.md)、[8 GiB NVMe 对照](MINICPMV47_NVME_H88K_BENCHMARK.md)。
 
 执行路径不做自定义 input-scale 除法；C4 加载器拒绝非单位 `input_scale`。标准 compressed-tensors 无 SQ 权重已完成板端数值与性能检查。
 
@@ -45,13 +45,17 @@ open_rknpu2_lm_infer -m MODEL --expert-storage stream \
   --ubatch-size 128 run --conversation --stats -p '你好' -n 128
 ```
 
-启动日志和 `--stats` 输出均显示请求百分比、实际槽数及有效比例。stream 模式必须提供 `--expert-store DIR`。原目录参数 `--expert-cache` 已更名为 `--expert-store`，主程序和测试工具均使用新名。decode 的真实 miss 写入本层窗口，按 LRU 淘汰，并先保护本步所需及预测集中的专家。prefill 使用共享的 16 槽 bank 流式计算专家并集，持久窗口保留逻辑 chunk 结束时的最近访问集合。
+启动日志和 `--stats` 输出均显示请求百分比、实际槽数及有效比例。stream 模式必须提供 `--expert-store DIR`。原目录参数 `--expert-cache` 已更名为 `--expert-store`，主程序和测试工具均使用新名。decode 的真实 miss 写入本层窗口，按 LRU 淘汰，并先保护本步所需及预测集中的专家。prefill 使用共享的 16 槽 bank 流式计算专家并集，prompt-tail 专家直接进入最终热槽，避免计算后再次导入。
 
 文件中的一个专家记录包含 gate/up、down、输出通道 scales 和 INT4 correction。native v2 的 H2048/F512 W4 记录每条 1,597,440 bytes，10240 条记录的文件合计 16,357,789,696 bytes。v2 不复用 v1 缓存。缓存头记录模型几何、打包版本、源文件大小与修改时间；原始 checkpoint 改变后重新准备缓存。
 
 checkpoint 文件发现及来源信息由 `src/model/checkpoint.rs` 负责：`TensorStore` 记录实际打开的单文件或分片及索引，`QuantLoader` 记录配置和实际使用的量化清单。专家缓存接收来源快照，在打开缓存和发布新记录前校验；校验仅查询文件元数据，不重复解析索引。`experts/store.rs` 负责原生记录格式及读写，不依赖 checkpoint 文件名或分片方式。
 
-读取默认使用 `O_DIRECT`；`--expert-buffered-io` 允许系统页缓存。一个后台线程执行定位读取，需求请求优先于预测请求，最多保留 32 条已读取记录。计算线程负责槽位导入、同步和 NPU 提交。prefill 按实际路由去重；decode 使用当前层 FFN 输入通过下一层 router 预测，`--no-expert-prefetch` 关闭 LES。
+读取默认使用 `O_DIRECT`；`--expert-buffered-io` 允许系统页缓存。两个后台 reader 共用需求优先队列，当前代的 ready/in-flight 合计最多 32 条记录，页对齐 RAM 缓冲归还后复用。开启预取时，各 NPU context 共享一个 32 槽 staging bank，由单独的 importer 在真实路由确认后执行复制和同步。完成后主线程交换 staging/hot 的存储视图和元数据，不再次复制权重；尚未开始导入的记录可以由主线程接管。SSD→RAM→NPU staging 的复制仍然存在。
+
+LES 使用当前层 FFN 输入通过下一层 router 预测，M≤16 时按输入行预测并合并专家并集；实际需求总是先入队。router/LES 在 CPU 上批量调度，保持各点积原有累加顺序。`--no-expert-prefetch` 关闭 LES 和异步 NPU staging。专家并集超过热槽容量时，先算完原 hot 专家的贡献，再分组复用槽位；不会要求一次装下全部验证专家。
+
+小批量路径先执行热专家，再执行约两组冷专家，使前组计算与后组读取、导入重叠。每组领取已发布的 ready 记录后执行；较大的专家并集继续按缓存容量分组。全部层复用一份分页工作区。[流式 I/O](MINICPMV47_STREAM_IO_OPTIMIZATION_20261025.md)、[异步导入](MINICPMV47_ASYNC_IMPORT_20261025.md)、[冷专家分组对照](MINICPMV47_READY_GROUPS_20261026.md)分别记录实际收益和调用代价。
 
 各路由贡献按原始 top-k 顺序进行 FP32 FMA 归约，避免读入顺序改变累加结果。缓存命中、预测召回、预测及时率、读取 bytes、等待时间分别统计。IO 计数区分正确预测到来时的 `predicted_ready`、`predicted_in_flight`、`predicted_queued`，以及未使用预测的 `canceled_before_io`、`canceled_in_flight`、`canceled_ready`。`discarded_read_bytes` 同时计入读完后取消的记录与在途取消后丢弃的读取。
 
@@ -66,15 +70,20 @@ checkpoint 文件发现及来源信息由 `src/model/checkpoint.rs` 负责：`Te
 - C4 合成小矩阵单核板测中，1/5/128 行的融合与独立输出逐值一致，浮点保护层路径保留。
 - 正式 `run --conversation --stats` 路径确认 25% 对应 64 槽，并完成简单算术生成。
 - 板端 fmt、Clippy 和自动测试通过；固定频率测试正常恢复配置。逐次时延与协议见三个性能报告；完整原始 JSON、trace 和源码快照保留在本地实验目录，未随仓库发布。
+- CPU router 批处理在 BF16/F16/F32、M1/4/8/16/128 上与逐行计算逐位一致。[分页工作区](MINICPMV47_PAGING_WORKSPACE_20261026.md)及两组冷执行分别完成完整词表 logits 对照。
+- `minicpm_prefetch_timeline` 与 `minicpm_batched_prefetch_timeline` 为依赖外部 checkpoint 的忽略测试。通过 `MINICPM_TEST_MODEL`、`MINICPM_TEST_STORE`、`MINICPM_TEST_WINDOWS` 和 `MINICPM_TEST_REPORT` 指定模型、专家目录、JSON token 窗口和输出报告；`MINICPM_TEST_PREFETCH=0` 可关闭预取。测试同时输出同名 `.logits.f32`，供同版本算子的对照比较。批量入口执行128/4/16/4/16/1行，覆盖专家并集超过默认20槽的情况。
+- 2026-10-26 整理后在 RK3588 上完成 release 格式、all-target Clippy 和默认测试检查：112通过、21忽略。8 GiB 板另行完成原生导入/换槽并发测试、staging 销毁后的所有权测试，以及 M1/M4/M16 共3722160个FP32 logits与同版本算子基线的逐位对照。
+
+`RKNPU_EXPERT_TIMELINE=PATH` 启用 expert I/O、target verification 和分页阶段的时间线；默认不开启。事件包含位置、逻辑行数、层号和是否为投机验证。后台服务时间与主线程阶段会重叠，不应直接相加为端到端耗时。[阶段分析](MINICPMV47_RECORD_VERIFY_PROFILE_20261026.md)给出统计口径。
 
 ## DSpark
 
 草稿 checkpoint 为五层全注意力网络，从目标层 `[3,11,19,27,35]` 收集 post-block 状态，复用目标 embedding 与 LM head。DSpark 的第零输出行预测 anchor 后的第一个 token；逐步 Markov 修正使用前一个已提议 token，并在修正后的分布上采样和验证。置信度头供 `--spec-draft-p-min` 使用。
 
-接口为 `--spec-type draft-dspark --spec-draft-model PATH --spec-draft-n-max 15`。完整草稿、head、目标验证与 commit 均计入推测解码流程。数值与端到端验证仍在进行。
+接口为 `--spec-type draft-dspark --spec-draft-model PATH --spec-draft-n-max 15`。完整草稿、head、目标验证与 commit 均计入推测解码流程。8 GiB H88K 的 pp512/tg128 已完成实际 checkpoint 端到端测试；当前优先采用3草稿，更多草稿不保证更快。吞吐、接受率和读量随算子版本及提示词变化，见 [DSpark 与 M≤16 对照](MINICPMV47_DSPARK_H88K_20261026.md)和[算子库更新记录](MINICPMV47_NATIVE_UPDATE_20261026.md)。
 
 Markov 与置信度头公式参考 [DeepSpec](https://github.com/deepseek-ai/DeepSpec/tree/main/deepspec/modeling/dspark)，保留其 MIT 许可于 `src/model/dflash/DeepSpec-LICENSE`。
 
 ## 尚未完成
 
-长文本流式性能验证、CPU GDN 默认路径 PPL、DSpark 端到端验证，以及视觉接入。
+长文本流式性能验证、CPU GDN 默认路径的完整 PPL 验证，以及视觉接入。旧新算子版本间已有生成轨迹变化，尚未补充完整 PPL 对照；当前调度的逐位一致性结论仅针对同一算子版本。

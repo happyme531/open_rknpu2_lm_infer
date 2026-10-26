@@ -97,7 +97,8 @@ impl Qwen35 {
     ) -> Result<()> {
         let start = Instant::now();
         let h = self.config.hidden_size;
-        self.phases.measure(Phase::Cpu, || {
+        self.phases.context(self.position, tokens.len(), -1, verify);
+        self.phases.stage(Phase::Cpu, "target embedding", || {
             for (row, token) in tokens.iter().enumerate() {
                 self.embedding.row(
                     *token as usize,
@@ -153,8 +154,10 @@ impl Qwen35 {
                 },
                 &mut self.phases,
             )?;
-            self.features
-                .record(i, &self.work.hidden[..tokens.len() * h]);
+            self.phases.trace("target feature record", || {
+                self.features
+                    .record(i, &self.work.hidden[..tokens.len() * h]);
+            });
         }
         if let (Some(mtp), Some(embeddings)) = (&mut self.mtp, embeddings) {
             norm::rms_norm(
@@ -300,7 +303,7 @@ impl LanguageModel for Qwen35 {
         self.next_rope_position = 0;
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
-        self.phases = Timings::default();
+        self.phases.reset();
         self.work.recurrent.reset_statistics();
         Ok(())
     }

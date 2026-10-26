@@ -149,8 +149,9 @@ impl Layer {
             trace,
             ..
         } = *e;
+        timings.context(position, rows, index, e.verify);
         let h = c.hidden_size;
-        timings.measure(Phase::Cpu, || {
+        timings.stage(Phase::Cpu, "target input norm", || {
             norm::rms_norm(
                 &w.hidden[..rows * h],
                 &self.input_norm,
@@ -167,7 +168,7 @@ impl Layer {
             "attn",
             &w.attended[..rows * attended_width],
         )?;
-        timings.measure(Phase::Linear, || {
+        timings.stage(Phase::Linear, "target output projection", || {
             self.output.run(
                 &w.attended[..rows * attended_width],
                 &mut w.projected[..rows * h],
@@ -175,7 +176,7 @@ impl Layer {
             )
         })?;
         trace.save(position, index, "o", &w.projected[..rows * h])?;
-        timings.measure(Phase::Cpu, || {
+        timings.stage(Phase::Cpu, "target residual norm", || {
             cpu.add(&mut w.hidden[..rows * h], &w.projected[..rows * h]);
             norm::rms_norm(
                 &w.hidden[..rows * h],
@@ -204,11 +205,14 @@ impl Layer {
             trace,
             ..
         } = *e;
+        timings.context(position, rows, index, e.verify);
         let h = c.hidden_size;
         if let FeedForward::Routed(moe) = &mut self.ffn {
             moe.forward(w, e, timings)?;
             trace.save(position, index, "ffn", &w.projected[..rows * h])?;
-            cpu.add(&mut w.hidden[..rows * h], &w.projected[..rows * h]);
+            timings.trace("target FFN residual", || {
+                cpu.add(&mut w.hidden[..rows * h], &w.projected[..rows * h]);
+            });
             return trace.save(position, index, "output", &w.hidden[..rows * h]);
         }
         let FeedForward::Dense { gate_up, down } = &self.ffn else {

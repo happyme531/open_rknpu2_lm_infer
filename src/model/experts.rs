@@ -6,6 +6,7 @@ pub mod store;
 mod timeline;
 mod window;
 pub(crate) use paged::{Paged, Paging};
+pub(crate) use timeline::Timeline;
 
 use anyhow::{Result, ensure};
 use std::path::PathBuf;
