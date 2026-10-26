@@ -28,6 +28,7 @@ mod floating;
 pub use floating::{FloatBackend, FloatLinear};
 mod moe;
 pub use moe::Moe;
+pub(crate) use moe::{ImportBank, ImportTarget};
 mod policy;
 #[cfg(test)]
 mod vision_tests;

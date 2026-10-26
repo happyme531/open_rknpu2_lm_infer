@@ -9,6 +9,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     ptr::NonNull,
+    sync::{Arc, Mutex},
 };
 
 const PAGE: usize = 4096;
@@ -35,6 +36,7 @@ struct Header {
 pub struct Store {
     file: File,
     header: Header,
+    buffers: Arc<Mutex<Buffers>>,
 }
 impl Store {
     pub fn open(
@@ -77,7 +79,12 @@ impl Store {
             .and_then(|n| n.checked_add(header.data_offset))
             .context("expert cache size overflow")?;
         ensure!(file.metadata()?.len() == bytes, "incomplete expert cache");
-        Self { file, header }.with_direct(direct)
+        Self {
+            file,
+            header,
+            buffers: Arc::default(),
+        }
+        .with_direct(direct)
     }
     pub(super) fn with_direct(self, direct: bool) -> Result<Self> {
         if direct {
@@ -102,12 +109,41 @@ impl Store {
     pub fn record_stride(&self) -> usize {
         self.header.record_stride
     }
+    pub fn buffer_stats(&self) -> BufferStats {
+        let buffers = self.buffers.lock().unwrap();
+        BufferStats {
+            allocations: buffers.allocations,
+            reuses: buffers.reuses,
+            idle_buffers: buffers.free.len(),
+            idle_bytes: buffers.free.len() * self.header.record_stride,
+        }
+    }
+    fn buffer(&self) -> Result<Record> {
+        let data = {
+            let mut buffers = self.buffers.lock().unwrap();
+            if let Some(data) = buffers.free.pop() {
+                buffers.reuses += 1;
+                Some(data)
+            } else {
+                buffers.allocations += 1;
+                None
+            }
+        };
+        Ok(Record {
+            data: Some(match data {
+                Some(data) => data,
+                None => Allocation::new(self.header.record_stride)?,
+            }),
+            raw: self.header.record_bytes,
+            pool: self.buffers.clone(),
+        })
+    }
     pub fn read(&self, layer: usize, expert: usize) -> Result<Record> {
         ensure!(
             layer < self.header.geometry.layers && expert < self.header.geometry.experts,
             "expert file index out of range"
         );
-        let mut data = Record::new(self.header.record_stride, self.header.record_bytes)?;
+        let mut data = self.buffer()?;
         let offset = self.header.data_offset
             + ((layer * self.header.geometry.experts + expert) * self.header.record_stride) as u64;
         self.file
@@ -126,7 +162,7 @@ impl Store {
             "expert batch out of range"
         );
         let mut records = (0..count)
-            .map(|_| Record::new(self.header.record_stride, self.header.record_bytes))
+            .map(|_| self.buffer())
             .collect::<Result<Vec<_>>>()?;
         let offset = self.header.data_offset
             + ((layer * self.header.geometry.experts + first) * self.header.record_stride) as u64;
@@ -172,33 +208,35 @@ impl Store {
     }
 }
 
-/// Single owned read buffer, suitable for O_DIRECT and transfer to an I/O worker.
-pub struct Record {
+#[derive(Default)]
+struct Buffers {
+    free: Vec<Allocation>,
+    allocations: u64,
+    reuses: u64,
+}
+#[derive(Serialize)]
+pub struct BufferStats {
+    pub allocations: u64,
+    pub reuses: u64,
+    pub idle_buffers: usize,
+    pub idle_bytes: usize,
+}
+
+struct Allocation {
     pointer: NonNull<u8>,
     length: usize,
-    raw: usize,
 }
 // The allocation has a single owner. No references survive a move to another thread.
-unsafe impl Send for Record {}
-impl Record {
-    fn new(length: usize, raw: usize) -> Result<Self> {
+unsafe impl Send for Allocation {}
+impl Allocation {
+    fn new(length: usize) -> Result<Self> {
         let layout = Layout::from_size_align(length, PAGE)?;
         let pointer =
             NonNull::new(unsafe { alloc_zeroed(layout) }).context("allocate expert read buffer")?;
-        Ok(Self {
-            pointer,
-            length,
-            raw,
-        })
-    }
-    fn all_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.length) }
-    }
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.raw) }
+        Ok(Self { pointer, length })
     }
 }
-impl Drop for Record {
+impl Drop for Allocation {
     fn drop(&mut self) {
         unsafe {
             dealloc(
@@ -206,6 +244,75 @@ impl Drop for Record {
                 Layout::from_size_align(self.length, PAGE).unwrap(),
             )
         };
+    }
+}
+
+/// An owned, page-aligned record returned to the store after its consumer finishes.
+pub struct Record {
+    data: Option<Allocation>,
+    raw: usize,
+    pool: Arc<Mutex<Buffers>>,
+}
+impl Record {
+    fn all_mut(&mut self) -> &mut [u8] {
+        let data = self.data.as_mut().unwrap();
+        unsafe { std::slice::from_raw_parts_mut(data.pointer.as_ptr(), data.length) }
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self.data.as_ref().unwrap().pointer.as_ptr(), self.raw)
+        }
+    }
+}
+impl Drop for Record {
+    fn drop(&mut self) {
+        let data = self.data.take().unwrap();
+        let mut buffers = self.pool.lock().unwrap();
+        if buffers.free.len() < 32 {
+            buffers.free.push(data);
+        }
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    #[test]
+    fn returned_buffers_are_overwritten_before_reuse() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geometry = Geometry {
+            native_version: 1,
+            layers: 1,
+            experts: 3,
+            hidden: 64,
+            intermediate: 64,
+            down_bits: 4,
+        };
+        let mut writer = Writer::create(dir.path(), geometry.clone(), vec![], PAGE)?;
+        for expert in 0..3 {
+            writer.write(0, expert, &vec![expert as u8; PAGE])?;
+        }
+        writer.finish()?;
+        let store = Store::open(dir.path(), &geometry, &[], false)?;
+        for expert in [2, 0, 1, 2] {
+            let record = store.read(0, expert)?;
+            assert_eq!(
+                record.data.as_ref().unwrap().pointer.as_ptr() as usize % PAGE,
+                0
+            );
+            assert_eq!(record.as_bytes(), vec![expert as u8; PAGE]);
+        }
+        assert_eq!(store.buffer_stats().allocations, 1);
+        assert_eq!(store.buffer_stats().reuses, 3);
+        let records = store.read_batch(0, 0, 3)?;
+        for (expert, record) in records.iter().enumerate() {
+            assert_eq!(record.as_bytes(), vec![expert as u8; PAGE]);
+        }
+        assert_eq!(store.buffer_stats().allocations, 3);
+        drop(records);
+        assert_eq!(store.buffer_stats().idle_buffers, 3);
+        Ok(())
     }
 }
 

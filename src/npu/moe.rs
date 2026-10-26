@@ -13,6 +13,59 @@ pub struct Moe {
     key: Key,
 }
 
+/// Main-thread owner of staging storage; no compute workspace is allocated.
+pub(crate) struct ImportBank {
+    weights: Handle<rk_npu_moe_w8_weights>,
+    owner: Backend,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportTarget(*mut rk_npu_moe_w8_weights);
+// The reader loans distinct staging slots to its workers. It joins all workers
+// before dropping the ImportBanks and their owning contexts.
+unsafe impl Send for ImportTarget {}
+pub(crate) struct ImportTiming {
+    pub copy_ms: f64,
+    pub validate_ms: f64,
+    pub sync_ms: f64,
+    pub total_ms: f64,
+}
+impl ImportTarget {
+    /// The bank/context must remain alive; this slot must be exclusively loaned.
+    pub unsafe fn import(self, slot: usize, data: &[u8]) -> Result<ImportTiming> {
+        let mut timing = rk_npu_moe_import_timings::default();
+        check(
+            unsafe {
+                rk_npu_moe_quant_import_expert_timed(
+                    self.0,
+                    slot as i32,
+                    data.as_ptr().cast(),
+                    data.len() as u64,
+                    &mut timing,
+                )
+            },
+            "stage packed expert",
+        )?;
+        Ok(ImportTiming {
+            copy_ms: timing.copy_us / 1000.,
+            validate_ms: timing.validate_us / 1000.,
+            sync_ms: (timing.gate_sync_us + timing.down_sync_us) / 1000.,
+            total_ms: timing.total_us / 1000.,
+        })
+    }
+}
+impl ImportBank {
+    /// The reader must join its workers before this owner is destroyed.
+    pub unsafe fn target(&self) -> ImportTarget {
+        ImportTarget(self.weights.raw)
+    }
+    pub fn weight_bytes(&self) -> u64 {
+        unsafe { rk_npu_moe_w8_weights_device_bytes(self.weights.raw) }
+    }
+    pub fn shares_context(&self, moe: &Moe) -> bool {
+        Rc::ptr_eq(&self.owner.0, &moe.owner.0)
+    }
+}
+
 impl Backend {
     pub fn load_moe(&self, gate: &[QuantMatrix], down: &[QuantMatrix], top: usize) -> Result<Moe> {
         ensure!(
@@ -108,6 +161,43 @@ impl Backend {
 }
 
 impl Moe {
+    pub(crate) fn import_bank(&self, slots: usize) -> Result<ImportBank> {
+        let mut b = self.owner.0.borrow_mut();
+        let config = rk_npu_moe_w8_weight_config {
+            hidden: self.key.0 as i32,
+            intermediate: self.key.1 as i32,
+            routed_experts: slots as i32,
+            shared_expert: 0,
+        };
+        let weights = Handle::new(
+            unsafe { rk_npu_moe_quant_slots_create(b.domain.raw, &config) },
+            rk_npu_moe_w8_weights_free,
+            "expert staging bank",
+        )?;
+        b.weight_bytes += unsafe { rk_npu_moe_w8_weights_device_bytes(weights.raw) };
+        Ok(ImportBank {
+            weights,
+            owner: self.owner.clone(),
+        })
+    }
+    pub(crate) fn promote(
+        &mut self,
+        slot: usize,
+        bank: &mut ImportBank,
+        staged: usize,
+    ) -> Result<()> {
+        check(
+            unsafe {
+                rk_npu_moe_quant_swap_slots(
+                    self.weights.raw,
+                    slot as i32,
+                    bank.weights.raw,
+                    staged as i32,
+                )
+            },
+            "promote staged expert",
+        )
+    }
     pub fn weight_bytes(&self) -> u64 {
         unsafe { rk_npu_moe_w8_weights_device_bytes(self.weights.raw) }
     }

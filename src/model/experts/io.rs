@@ -2,6 +2,7 @@
 //! Demand reads precede speculative reads; see Strata-LICENSE.
 use super::store::{Record, Store};
 use super::timeline::Timeline;
+use crate::npu::ImportTarget;
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use serde_json::json;
@@ -13,6 +14,8 @@ use std::{
 };
 
 type Key = (usize, usize);
+const READ_BUFFER_LIMIT: usize = 32;
+const IO_WORKERS: usize = 2;
 #[derive(Default, Clone, Serialize)]
 pub struct Stats {
     pub read_records: u64,
@@ -23,6 +26,7 @@ pub struct Stats {
     pub prediction_requests: u64,
     pub predicted_demand: u64,
     pub predicted_ready: u64,
+    pub predicted_ram_ready: u64,
     pub predicted_in_flight: u64,
     pub predicted_queued: u64,
     pub unused_predictions: u64,
@@ -31,23 +35,61 @@ pub struct Stats {
     pub canceled_ready: u64,
     pub discarded_read_bytes: u64,
     pub max_ready_records: usize,
+    pub max_outstanding_records: usize,
+    pub staged_records: u64,
+    pub staged_copy_ms: f64,
+    pub staged_validate_ms: f64,
+    pub staged_sync_ms: f64,
+    pub staged_import_ms: f64,
+    pub staging_main_takeovers: u64,
+}
+pub(super) struct Loaded {
+    pub record: Record,
+    pub staged: Option<StageSlot>,
+}
+pub(super) struct StageSlot {
+    pub slot: usize,
+    pub bank: usize,
+    pool: Arc<Mutex<Vec<usize>>>,
+}
+impl Drop for StageSlot {
+    fn drop(&mut self) {
+        self.pool.lock().unwrap().push(self.slot);
+    }
+}
+#[derive(Clone)]
+struct Stager {
+    target: ImportTarget,
+    bank: usize,
+    pool: Arc<Mutex<Vec<usize>>>,
+}
+struct ImportJob {
+    key: Key,
+    generation: u64,
+    record: Record,
+    target: ImportTarget,
+    lease: StageSlot,
 }
 #[derive(Default)]
 struct State {
     demand: VecDeque<Key>,
     speculative: VecDeque<Key>,
     pending: HashSet<Key>,
-    in_flight: HashSet<Key>,
+    in_flight: HashMap<Key, u64>,
     generation: u64,
     predictions: HashSet<Key>,
-    ready: HashMap<Key, Result<Record, String>>,
+    ready: HashMap<Key, Result<Loaded, String>>,
+    ram_ready: HashSet<Key>,
+    staging: HashMap<usize, Stager>,
+    staging_requests: HashSet<Key>,
+    imports: VecDeque<ImportJob>,
     stopped: bool,
     stats: Stats,
 }
 type Shared = Arc<(Mutex<State>, Condvar)>;
 pub struct Reader {
     shared: Shared,
-    worker: Option<JoinHandle<()>>,
+    workers: Vec<JoinHandle<()>>,
     timeline: Timeline,
     record_stride: u64,
 }
@@ -55,114 +97,228 @@ impl Reader {
     pub fn new(store: Arc<Store>, timeline: Timeline) -> Result<Self> {
         let record_stride = store.record_stride() as u64;
         let shared = Shared::default();
-        let work = shared.clone();
-        let trace = timeline.clone();
-        let worker = std::thread::Builder::new()
-            .name("expert-io".into())
-            .spawn(move || {
-                let (lock, wake) = &*work;
-                loop {
-                    let (keys, prefetch, generation) = {
-                        let mut s = lock.lock().unwrap();
-                        while !s.stopped
-                            && (s.ready.len() >= 32
-                                || (s.demand.is_empty() && s.speculative.is_empty()))
-                        {
-                            s = wake.wait(s).unwrap();
-                        }
-                        if s.stopped {
-                            break;
-                        }
-                        let mut keys = Vec::new();
-                        let prefetch = if let Some(first) = s.demand.pop_front() {
-                            keys.push(first);
-                            // Strata's file-backed stager claims up to eight
-                            // neighbouring jobs in one batch. Never read gaps.
-                            while keys.len() < 8 && s.ready.len() + keys.len() < 32 {
-                                let previous = *keys.last().unwrap();
-                                if s.demand.front() != Some(&(previous.0, previous.1 + 1)) {
-                                    break;
-                                }
-                                keys.push(s.demand.pop_front().unwrap());
+        let mut workers = Vec::new();
+        for thread in 1..=IO_WORKERS {
+            let work = shared.clone();
+            let trace = timeline.clone();
+            let store = store.clone();
+            let worker = std::thread::Builder::new()
+                .name(format!("expert-io-{thread}"))
+                .spawn(move || {
+                    let (lock, wake) = &*work;
+                    loop {
+                        let (keys, prefetch, generation) = {
+                            let mut s = lock.lock().unwrap();
+                            while !s.stopped
+                                && (s.ready.len() + s.in_flight.len() >= READ_BUFFER_LIMIT
+                                    || (s.demand.is_empty() && s.speculative.is_empty()))
+                            {
+                                s = wake.wait(s).unwrap();
                             }
-                            false
-                        } else {
-                            keys.push(s.speculative.pop_front().unwrap());
-                            true
-                        };
-                        for &key in &keys {
-                            s.in_flight.insert(key);
-                            trace.mark_thread("read issued", 1, || {
-                                json!({
+                            if s.stopped {
+                                break;
+                            }
+                            let mut keys = Vec::new();
+                            let prefetch = if let Some(first) = s.demand.pop_front() {
+                                keys.push(first);
+                                // Strata's file-backed stager claims up to eight
+                                // neighbouring jobs in one batch. Never read gaps.
+                                while keys.len() < 8
+                                    && s.ready.len() + s.in_flight.len() + keys.len()
+                                        < READ_BUFFER_LIMIT
+                                {
+                                    let previous = *keys.last().unwrap();
+                                    if s.demand.front() != Some(&(previous.0, previous.1 + 1)) {
+                                        break;
+                                    }
+                                    keys.push(s.demand.pop_front().unwrap());
+                                }
+                                false
+                            } else {
+                                keys.push(s.speculative.pop_front().unwrap());
+                                true
+                            };
+                            let generation = s.generation;
+                            for &key in &keys {
+                                s.in_flight.insert(key, generation);
+                                trace.mark_thread("read issued", thread, || {
+                                    json!({
                                 "layer":key.0,"expert":key.1,"prefetch":prefetch,
                                 "queued_demands":s.demand.len(),"batch_records":keys.len()})
-                            });
-                        }
-                        (keys, prefetch, s.generation)
-                    };
-                    let start = Instant::now();
-                    let result = if keys.len() == 1 {
-                        store.read(keys[0].0, keys[0].1).map(|record| vec![record])
-                    } else {
-                        store.read_batch(keys[0].0, keys[0].1, keys.len())
-                    };
-                    let results: Vec<_> = match result {
-                        Ok(records) => records.into_iter().map(Ok).collect(),
-                        Err(error) => keys.iter().map(|_| Err(format!("{error:#}"))).collect(),
-                    };
-                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
-                    for &key in &keys {
-                        trace.span("pread", 1, start, || {
-                            json!({
+                                });
+                            }
+                            s.stats.max_outstanding_records = s
+                                .stats
+                                .max_outstanding_records
+                                .max(s.ready.len() + s.in_flight.len());
+                            (keys, prefetch, generation)
+                        };
+                        let start = Instant::now();
+                        let result = if keys.len() == 1 {
+                            store.read(keys[0].0, keys[0].1).map(|record| vec![record])
+                        } else {
+                            store.read_batch(keys[0].0, keys[0].1, keys.len())
+                        };
+                        let records: Vec<_> = match result {
+                            Ok(records) => records.into_iter().map(Ok).collect(),
+                            Err(error) => keys.iter().map(|_| Err(format!("{error:#}"))).collect(),
+                        };
+                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
+                        for &key in &keys {
+                            trace.span("pread", thread, start, || {
+                                json!({
                             "layer":key.0,"expert":key.1,"prefetch":prefetch,
                             "bytes":store.record_stride(),"batch_records":keys.len()})
-                        });
-                    }
-                    let mut s = lock.lock().unwrap();
-                    s.in_flight.clear();
-                    s.stats.read_records += keys.len() as u64;
-                    s.stats.read_batches += 1;
-                    s.stats.read_bytes += keys.len() as u64 * store.record_stride() as u64;
-                    s.stats.read_ms += elapsed_ms;
-                    for (key, result) in keys.into_iter().zip(results) {
-                        // A reset owns a new generation. An old read cannot
-                        // satisfy a same-key request submitted after that reset.
-                        if s.generation == generation && s.pending.contains(&key) {
-                            s.ready.insert(key, result);
-                            s.stats.max_ready_records =
-                                s.stats.max_ready_records.max(s.ready.len());
-                            trace.mark_thread(
-                                "read ready",
-                                1,
-                                || json!({"layer":key.0,"expert":key.1}),
-                            );
-                        } else {
-                            s.stats.discarded_read_bytes += store.record_stride() as u64;
-                            trace.mark_thread(
-                                "read discarded",
-                                1,
-                                || json!({"layer":key.0,"expert":key.1}),
-                            );
+                            });
                         }
+                        let mut s = lock.lock().unwrap();
+                        s.stats.read_records += keys.len() as u64;
+                        s.stats.read_batches += 1;
+                        s.stats.read_bytes += keys.len() as u64 * store.record_stride() as u64;
+                        s.stats.read_ms += elapsed_ms;
+                        for (&key, record) in keys.iter().zip(records) {
+                            if record.is_ok()
+                                && s.generation == generation
+                                && s.pending.contains(&key)
+                            {
+                                s.ram_ready.insert(key);
+                                trace.mark_thread(
+                                    "RAM ready",
+                                    thread,
+                                    || json!({"layer":key.0,"expert":key.1}),
+                                );
+                            }
+                            let target = (s.generation == generation
+                                && s.pending.contains(&key)
+                                && s.staging_requests.contains(&key))
+                            .then(|| s.staging.get(&key.0))
+                            .flatten()
+                            .and_then(|stager| {
+                                let slot = stager.pool.lock().unwrap().pop()?;
+                                Some((
+                                    stager.target,
+                                    StageSlot {
+                                        slot,
+                                        bank: stager.bank,
+                                        pool: stager.pool.clone(),
+                                    },
+                                ))
+                            });
+                            match (record, target) {
+                                (Ok(record), Some((target, lease))) => {
+                                    s.imports.push_back(ImportJob {
+                                        key,
+                                        generation,
+                                        record,
+                                        target,
+                                        lease,
+                                    });
+                                    trace.mark_thread("stage queued", thread, || {
+                                        json!({
+                                            "layer":key.0,"expert":key.1,"queue":s.imports.len()
+                                        })
+                                    });
+                                }
+                                (record, _) => publish(
+                                    &mut s,
+                                    key,
+                                    generation,
+                                    record.map(|record| Loaded {
+                                        record,
+                                        staged: None,
+                                    }),
+                                    &trace,
+                                    thread,
+                                    store.record_stride() as u64,
+                                ),
+                            }
+                        }
+                        wake.notify_all();
                     }
-                    wake.notify_all();
-                }
-            })?;
+                })?;
+            workers.push(worker);
+        }
+        let work = shared.clone();
+        let trace = timeline.clone();
+        workers.push(std::thread::Builder::new().name("expert-import".into()).spawn(move || {
+            let (lock,wake) = &*work;
+            loop {
+                let job = {
+                    let mut s = lock.lock().unwrap();
+                    while !s.stopped && s.imports.is_empty() { s = wake.wait(s).unwrap(); }
+                    if s.stopped { break; }
+                    // Confirmed routes precede speculative imports.
+                    let next = s.imports.iter().position(|job| !s.predictions.contains(&job.key)).unwrap_or(0);
+                    let job = s.imports.remove(next).unwrap();
+                    if s.generation != job.generation || !s.pending.contains(&job.key) {
+                        publish(&mut s,job.key,job.generation,Ok(Loaded {record:job.record,staged:None}),
+                            &trace,3,record_stride);
+                        wake.notify_all();
+                        continue;
+                    }
+                    job
+                };
+                let start = Instant::now();
+                // The independent slot is exclusively loaned until promotion or discard.
+                // Reader::drop joins this worker before its owning bank/context drops.
+                let imported = unsafe {job.target.import(job.lease.slot,job.record.as_bytes())};
+                trace.span("stage import",3,start,||json!({
+                    "layer":job.key.0,"expert":job.key.1,"slot":job.lease.slot,"staging_bank":job.lease.bank,
+                    "copy_ms":imported.as_ref().ok().map(|t|t.copy_ms),
+                    "validate_ms":imported.as_ref().ok().map(|t|t.validate_ms),
+                    "sync_ms":imported.as_ref().ok().map(|t|t.sync_ms),
+                    "total_ms":imported.as_ref().ok().map(|t|t.total_ms)}));
+                let mut s = lock.lock().unwrap();
+                let result = imported.map(|timing| {
+                    s.stats.staged_records += 1;
+                    s.stats.staged_copy_ms += timing.copy_ms;
+                    s.stats.staged_validate_ms += timing.validate_ms;
+                    s.stats.staged_sync_ms += timing.sync_ms;
+                    s.stats.staged_import_ms += timing.total_ms;
+                    Loaded {record:job.record,staged:Some(job.lease)}
+                }).map_err(|e|format!("{e:#}"));
+                publish(&mut s,job.key,job.generation,result,&trace,3,record_stride);
+                wake.notify_all();
+            }
+        })?);
         Ok(Self {
             shared,
-            worker: Some(worker),
+            workers,
             timeline,
             record_stride,
         })
     }
+    pub fn worker_count(&self) -> usize {
+        IO_WORKERS
+    }
+    pub fn register_staging(&self, layer: usize, target: ImportTarget, slots: usize) {
+        let mut s = self.shared.0.lock().unwrap();
+        let stager = s
+            .staging
+            .values()
+            .find(|stager| stager.target == target)
+            .cloned()
+            .unwrap_or_else(|| Stager {
+                target,
+                bank: s
+                    .staging
+                    .values()
+                    .map(|stager| stager.bank + 1)
+                    .max()
+                    .unwrap_or(0),
+                pool: Arc::new(Mutex::new((0..slots).rev().collect())),
+            });
+        s.staging.insert(layer, stager);
+    }
     pub fn predict(&self, layer: usize, experts: &[usize]) {
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();
+        s.staging_requests.retain(|key| key.0 != layer);
         for &expert in experts {
             let key = (layer, expert);
             if s.pending.insert(key) {
                 s.predictions.insert(key);
-                if !s.in_flight.contains(&key) {
+                if !s.in_flight.contains_key(&key) {
                     s.speculative.push_back(key);
                 }
                 s.stats.prediction_requests += 1;
@@ -184,9 +340,12 @@ impl Reader {
                 s.predictions.insert(key);
             } else if wanted.contains(&key) {
                 s.stats.predicted_demand += 1;
+                if s.ram_ready.contains(&key) || s.ready.contains_key(&key) {
+                    s.stats.predicted_ram_ready += 1;
+                }
                 if s.ready.contains_key(&key) {
                     s.stats.predicted_ready += 1;
-                } else if s.in_flight.contains(&key) {
+                } else if s.in_flight.contains_key(&key) {
                     s.stats.predicted_in_flight += 1;
                 } else {
                     s.stats.predicted_queued += 1;
@@ -194,13 +353,14 @@ impl Reader {
             } else {
                 self.timeline.mark("cancel prefetch", || {
                     json!({"layer":key.0,"expert":key.1,
-                    "ready":s.ready.contains_key(&key),"in_flight":s.in_flight.contains(&key)})
+                    "ready":s.ready.contains_key(&key),"in_flight":s.in_flight.contains_key(&key)})
                 });
                 s.pending.remove(&key);
+                s.ram_ready.remove(&key);
                 if s.ready.remove(&key).is_some() {
                     s.stats.canceled_ready += 1;
                     s.stats.discarded_read_bytes += self.record_stride;
-                } else if s.in_flight.contains(&key) {
+                } else if s.in_flight.contains_key(&key) {
                     s.stats.canceled_in_flight += 1;
                 } else {
                     s.stats.canceled_before_io += 1;
@@ -215,7 +375,7 @@ impl Reader {
             // when no new I/O needs to be queued, so completion is retained.
             s.pending.insert(key);
             if !s.ready.contains_key(&key)
-                && !s.in_flight.contains(&key)
+                && !s.in_flight.contains_key(&key)
                 && !s.demand.contains(&key)
             {
                 s.demand.push_back(key);
@@ -225,25 +385,108 @@ impl Reader {
         }
         wake.notify_all();
     }
+    /// Keep speculative reads in RAM; import only after the router confirms use.
+    pub fn stage_demand(&self, layer: usize, experts: &[usize]) {
+        let (lock, wake) = &*self.shared;
+        let mut s = lock.lock().unwrap();
+        let Some(stager) = s.staging.get(&layer).cloned() else {
+            return;
+        };
+        let generation = s.generation;
+        for &expert in experts {
+            let key = (layer, expert);
+            s.staging_requests.insert(key);
+            let Some(Ok(loaded)) = s.ready.get(&key) else {
+                continue;
+            };
+            if loaded.staged.is_some() {
+                continue;
+            }
+            let Some(slot) = stager.pool.lock().unwrap().pop() else {
+                continue;
+            };
+            let loaded = s.ready.remove(&key).unwrap().unwrap();
+            s.in_flight.insert(key, generation);
+            s.imports.push_back(ImportJob {
+                key,
+                generation,
+                record: loaded.record,
+                target: stager.target,
+                lease: StageSlot {
+                    slot,
+                    bank: stager.bank,
+                    pool: stager.pool.clone(),
+                },
+            });
+            self.timeline.mark("stage queued", || {
+                json!({
+                    "layer":layer,"expert":expert,"queue":s.imports.len()
+                })
+            });
+        }
+        wake.notify_all();
+    }
     pub fn take(&self, layer: usize, expert: usize) -> Result<Record> {
+        Ok(self.take_loaded(layer, expert)?.record)
+    }
+    pub fn take_loaded(&self, layer: usize, expert: usize) -> Result<Loaded> {
+        Ok(self.take_any(layer, &[expert])?.1)
+    }
+    /// Consume ready demand before waiting for another record in a bounded pool.
+    pub fn take_any(&self, layer: usize, experts: &[usize]) -> Result<(usize, Loaded)> {
         let start = Instant::now();
-        let key = (layer, expert);
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();
         loop {
-            if let Some(result) = s.ready.remove(&key) {
+            if let Some(&expert) = experts
+                .iter()
+                .find(|&&id| s.ready.contains_key(&(layer, id)))
+            {
+                let key = (layer, expert);
+                let result = s.ready.remove(&key).unwrap();
                 s.pending.remove(&key);
+                s.ram_ready.remove(&key);
                 s.stats.wait_ms += start.elapsed().as_secs_f64() * 1000.;
-                self.timeline.span(
-                    "wait record",
-                    0,
-                    start,
-                    || json!({"layer":layer,"expert":expert}),
-                );
+                self.timeline.span("wait record", 0, start, || {
+                    json!({"layer":layer,"expert":expert,"wanted":experts,
+                        "staged":result.as_ref().ok().is_some_and(|l|l.staged.is_some())})
+                });
                 wake.notify_all();
-                return result.map_err(|e| anyhow!(e));
+                return result
+                    .map(|loaded| (expert, loaded))
+                    .map_err(|e| anyhow!(e));
             }
+            if let Some(index) = s.imports.iter().position(|job| {
+                job.key.0 == layer && experts.contains(&job.key.1) && job.generation == s.generation
+            }) {
+                // If the importer has not started, the main thread can use RAM
+                // immediately instead of waiting behind speculative copies.
+                let job = s.imports.remove(index).unwrap();
+                let (key, expert) = (job.key, job.key.1);
+                s.stats.staging_main_takeovers += 1;
+                self.timeline
+                    .mark("stage bypass", || json!({"layer":layer,"expert":expert}));
+                publish(
+                    &mut s,
+                    key,
+                    job.generation,
+                    Ok(Loaded {
+                        record: job.record,
+                        staged: None,
+                    }),
+                    &self.timeline,
+                    0,
+                    self.record_stride,
+                );
+                continue;
+            }
+            let sleep = Instant::now();
             s = wake.wait(s).unwrap();
+            self.timeline.span("record sleep", 0, sleep, || {
+                json!({
+                    "layer":layer,"wanted":experts,"ready":s.ready.len(),"imports":s.imports.len()
+                })
+            });
         }
     }
     pub fn stats(&self) -> Stats {
@@ -259,9 +502,47 @@ impl Reader {
         s.speculative.clear();
         s.pending.clear();
         s.predictions.clear();
-        s.stats.discarded_read_bytes += s.ready.len() as u64 * self.record_stride;
+        s.ram_ready.clear();
+        s.staging_requests.clear();
+        s.stats.discarded_read_bytes +=
+            (s.ready.len() + s.imports.len()) as u64 * self.record_stride;
         s.ready.clear();
+        s.imports.clear();
         wake.notify_all();
+    }
+}
+fn publish(
+    s: &mut State,
+    key: Key,
+    generation: u64,
+    result: Result<Loaded, String>,
+    trace: &Timeline,
+    thread: usize,
+    stride: u64,
+) {
+    if s.in_flight.get(&key) == Some(&generation) {
+        s.in_flight.remove(&key);
+    }
+    // Completion from an old generation cannot satisfy a request after reset.
+    if s.generation == generation && s.pending.contains(&key) {
+        let staged = result.as_ref().ok().is_some_and(|l| l.staged.is_some());
+        s.ready.insert(key, result);
+        s.stats.max_ready_records = s.stats.max_ready_records.max(s.ready.len());
+        trace.mark_thread(
+            "read ready",
+            thread,
+            || json!({"layer":key.0,"expert":key.1,"staged":staged}),
+        );
+    } else {
+        if s.generation == generation {
+            s.ram_ready.remove(&key);
+        }
+        s.stats.discarded_read_bytes += stride;
+        trace.mark_thread(
+            "read discarded",
+            thread,
+            || json!({"layer":key.0,"expert":key.1}),
+        );
     }
 }
 impl Drop for Reader {
@@ -269,7 +550,7 @@ impl Drop for Reader {
         let (lock, wake) = &*self.shared;
         lock.lock().unwrap().stopped = true;
         wake.notify_all();
-        if let Some(worker) = self.worker.take() {
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
         if let Err(error) = self.timeline.save() {
@@ -284,16 +565,102 @@ mod tests {
     use crate::model::experts::store::{Geometry, Writer};
 
     #[test]
+    fn parallel_reads_stay_bounded_across_reset_and_cancellation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geometry = Geometry {
+            native_version: 1,
+            layers: 2,
+            experts: 96,
+            hidden: 64,
+            intermediate: 64,
+            down_bits: 4,
+        };
+        let mut writer = Writer::create(dir.path(), geometry.clone(), vec![], 4096)?;
+        for layer in 0..2 {
+            for expert in 0..96 {
+                writer.write(layer, expert, &vec![(layer * 96 + expert) as u8; 4096])?;
+            }
+        }
+        writer.finish()?;
+        let store = Arc::new(Store::open(dir.path(), &geometry, &[], false)?);
+        let reader = Reader::new(store.clone(), Timeline::default())?;
+        for pass in 0..8 {
+            reader.predict(0, &[0, 1, 2, 3, 4, 5, 6, 7]);
+            reader.reset();
+            let layer = pass % 2;
+            let demand: Vec<_> = (0..96).collect();
+            reader.predict(layer, &[0, 2, 4, 6]);
+            reader.demand(layer, &demand);
+            for expert in demand {
+                assert_eq!(
+                    reader.take(layer, expert)?.as_bytes(),
+                    vec![(layer * 96 + expert) as u8; 4096]
+                );
+            }
+        }
+        assert!(reader.stats().max_outstanding_records <= READ_BUFFER_LIMIT);
+        assert!(store.buffer_stats().reuses > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_demand_drains_prefetched_records_before_waiting_for_unread_experts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geometry = Geometry {
+            native_version: 1,
+            layers: 1,
+            experts: 96,
+            hidden: 64,
+            intermediate: 64,
+            down_bits: 4,
+        };
+        let mut writer = Writer::create(dir.path(), geometry.clone(), vec![], 4096)?;
+        for expert in 0..96 {
+            writer.write(0, expert, &vec![expert as u8; 4096])?;
+        }
+        writer.finish()?;
+        let store = Arc::new(Store::open(dir.path(), &geometry, &[], false)?);
+        let reader = Reader::new(store, Timeline::default())?;
+        let predicted: Vec<_> = (1..64).step_by(2).collect();
+        reader.predict(0, &predicted);
+        {
+            let (lock, wake) = &*reader.shared;
+            let (state, timeout) = wake
+                .wait_timeout_while(
+                    lock.lock().unwrap(),
+                    std::time::Duration::from_secs(5),
+                    |s| s.ready.len() < READ_BUFFER_LIMIT,
+                )
+                .unwrap();
+            assert!(!timeout.timed_out());
+            assert_eq!(state.ready.len(), READ_BUFFER_LIMIT);
+        }
+        let mut remaining: Vec<_> = (0..96).collect();
+        reader.demand(0, &remaining);
+        let (expert, loaded) = reader.take_any(0, &remaining)?;
+        assert!(predicted.contains(&expert));
+        assert_eq!(loaded.record.as_bytes(), vec![expert as u8; 4096]);
+        remaining.retain(|&id| id != expert);
+        while !remaining.is_empty() {
+            let (expert, loaded) = reader.take_any(0, &remaining)?;
+            assert_eq!(loaded.record.as_bytes(), vec![expert as u8; 4096]);
+            remaining.retain(|&id| id != expert);
+        }
+        assert!(reader.stats().max_outstanding_records <= READ_BUFFER_LIMIT);
+        Ok(())
+    }
+
+    #[test]
     fn canceled_in_flight_prediction_can_be_requested_again() {
         for predict_again in [false, true] {
             let key = (0, 2);
             let mut state = State::default();
             state.pending.insert(key);
             state.predictions.insert(key);
-            state.in_flight.insert(key);
+            state.in_flight.insert(key, 0);
             let reader = Reader {
                 shared: Arc::new((Mutex::new(state), Condvar::new())),
-                worker: None,
+                workers: Vec::new(),
                 timeline: Timeline::default(),
                 record_stride: 4096,
             };
@@ -306,7 +673,7 @@ mod tests {
             {
                 let state = reader.shared.0.lock().unwrap();
                 assert!(state.pending.contains(&key));
-                assert!(state.in_flight.contains(&key));
+                assert!(state.in_flight.contains_key(&key));
                 assert!(state.demand.is_empty());
                 assert!(state.speculative.is_empty());
             }
@@ -342,13 +709,25 @@ mod tests {
         let mut state = State::default();
         state.predictions.extend((0..6).map(|e| (0, e)));
         state.pending = state.predictions.clone();
-        state.ready.insert((0, 0), Ok(store.read(0, 0)?));
-        state.ready.insert((0, 3), Ok(store.read(0, 3)?));
-        state.in_flight.extend([(0, 1), (0, 4)]);
+        state.ready.insert(
+            (0, 0),
+            Ok(Loaded {
+                record: store.read(0, 0)?,
+                staged: None,
+            }),
+        );
+        state.ready.insert(
+            (0, 3),
+            Ok(Loaded {
+                record: store.read(0, 3)?,
+                staged: None,
+            }),
+        );
+        state.in_flight.extend([((0, 1), 0), ((0, 4), 0)]);
         state.speculative.extend([(0, 2), (0, 5)]);
         let reader = Reader {
             shared: Arc::new((Mutex::new(state), Condvar::new())),
-            worker: None,
+            workers: Vec::new(),
             timeline: Timeline::default(),
             record_stride: store.record_stride() as u64,
         };

@@ -11,6 +11,7 @@ use anyhow::{Result, ensure};
 use std::path::PathBuf;
 
 pub const DEFAULT_CACHE_PERCENT: f64 = 8.;
+pub(crate) const DECODE_BATCH_MAX_ROWS: usize = 16;
 
 fn validate_percent(percent: f64) -> Result<()> {
     ensure!(

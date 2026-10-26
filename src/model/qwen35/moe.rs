@@ -8,7 +8,7 @@ use crate::{
     model::{
         checkpoint::{QuantLoader, Tensor},
         cpu::Cpu,
-        experts::{Paged, Paging, store::Store},
+        experts::{DECODE_BATCH_MAX_ROWS, Paged, Paging, store::Store},
         projection::{Linear, Projection},
     },
     npu::{Backend, Moe},
@@ -210,12 +210,16 @@ impl Routed {
                 Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
                 Bank::Resident(_) => None,
             };
-            if rows == 1
+            if rows <= DECODE_BATCH_MAX_ROWS
                 && let Some((router, paging, next)) = &self.prediction
             {
                 let mut logits = vec![0.; self.count];
-                e.cpu.dense_head(router, &input[..self.h], &mut logits);
-                paging.predict(*next, &routes(&logits, self.top)?.0);
+                let mut predicted = Vec::with_capacity(rows * self.top);
+                for x in input.chunks_exact(self.h) {
+                    e.cpu.dense_head(router, x, &mut logits);
+                    predicted.extend(routes(&logits, self.top)?.0);
+                }
+                paging.predict(*next, &predicted);
             }
             Ok(request)
         })?;

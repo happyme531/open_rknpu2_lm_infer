@@ -1,21 +1,27 @@
 //! Hot expert banks with one shared cold bank and bounded read-ahead buffers.
 use super::timeline::Timeline;
 use super::{
+    DECODE_BATCH_MAX_ROWS,
     io::Reader,
     store::Store,
     window::{Window, tail_experts},
 };
 use crate::{
     model::ModelOptions,
-    npu::{Backend, Moe},
+    npu::{Backend, ImportBank, Moe},
 };
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc, time::Instant};
 
+const STAGING_SLOTS: usize = 32;
+
 pub(crate) struct Paging {
+    // Reader joins workers before the staging banks and their contexts drop.
     reader: Reader,
+    staging: Vec<RefCell<Option<Rc<RefCell<ImportBank>>>>>,
+    store: Arc<Store>,
     cold: RefCell<Moe>,
     hot: Option<RefCell<Vec<HashSet<usize>>>>,
     slots: usize,
@@ -36,7 +42,9 @@ impl Paging {
         let (layers, experts) = (g.layers, g.experts);
         let timeline = Timeline::from_environment();
         Ok(Rc::new(Self {
-            reader: Reader::new(store, timeline.clone())?,
+            reader: Reader::new(store.clone(), timeline.clone())?,
+            staging: (0..layers).map(|_| RefCell::new(None)).collect(),
+            store,
             cold: RefCell::new(cold),
             hot: options
                 .experts
@@ -54,21 +62,43 @@ impl Paging {
         let Some(hot) = &self.hot else { return };
         self.timeline
             .mark("LES prediction", || json!({"layer":layer,"experts":ids}));
-        self.predictions.borrow_mut()[layer] = Some(ids.iter().map(|&id| id as usize).collect());
+        let mut seen = HashSet::new();
+        let ids: Vec<_> = ids
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&id| seen.insert(id))
+            .collect();
+        self.predictions.borrow_mut()[layer] = Some(ids.clone());
         let hot = hot.borrow();
         let ids: Vec<_> = ids
             .iter()
-            .map(|&i| i as usize)
+            .copied()
             .filter(|id| !hot[layer].contains(id))
             .collect();
         self.reader.predict(layer, &ids);
     }
     pub fn stats(&self) -> Value {
         let (correct, total) = *self.prediction_counts.borrow();
-        json!({"io":self.reader.stats(),"cold_bank_weight_bytes":self.cold.borrow().weight_bytes(),
+        let mut banks = HashSet::new();
+        let staging_bytes: u64 = self
+            .staging
+            .iter()
+            .filter_map(|bank| {
+                let bank = bank.borrow();
+                let bank = bank.as_ref()?;
+                banks
+                    .insert(Rc::as_ptr(bank))
+                    .then(|| bank.borrow().weight_bytes())
+            })
+            .sum();
+        json!({"io":self.reader.stats(),"read_buffers":self.store.buffer_stats(),
+            "cold_bank_weight_bytes":self.cold.borrow().weight_bytes(),"io_workers":self.reader.worker_count(),
             "cache_percent":self.cache_percent,"slots_per_layer":self.slots,
             "effective_cache_percent":100. * self.slots as f64 / self.experts as f64,
-            "prefetch":self.hot.is_some(),"read_buffer_limit":32,"les_correct":correct,"les_total":total})
+            "prefetch":self.hot.is_some(),"read_buffer_limit":32,"les_correct":correct,"les_total":total,
+            "staged_imports":self.hot.is_some(),"staging_policy":"confirmed-demand",
+            "import_workers":1,"staging_slots_per_bank":STAGING_SLOTS,
+            "staging_banks":banks.len(),"staging_weight_bytes":staging_bytes})
     }
     #[cfg(test)]
     pub fn save_timeline(&self) -> Result<()> {
@@ -97,6 +127,7 @@ struct Stats {
     imports: u64,
     import_ms: f64,
     compute_ms: f64,
+    staged_promotions: u64,
 }
 pub(crate) struct Paged {
     hot: Moe,
@@ -120,8 +151,31 @@ impl Paged {
             shared.slots > 0 && shared.slots <= g.experts,
             "invalid hot expert slot count"
         );
+        let hot = backend.moe_slots(g.hidden, g.intermediate, shared.slots)?;
+        if shared.hot.is_some() {
+            let bank = shared
+                .staging
+                .iter()
+                .find_map(|entry| {
+                    entry
+                        .borrow()
+                        .as_ref()
+                        .filter(|bank| bank.borrow().shares_context(&hot))
+                        .cloned()
+                })
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    hot.import_bank(STAGING_SLOTS)
+                        .map(|bank| Rc::new(RefCell::new(bank)))
+                })?;
+            // Paging drops reader before staging; workers only access loaned slots.
+            shared
+                .reader
+                .register_staging(layer, unsafe { bank.borrow().target() }, STAGING_SLOTS);
+            *shared.staging[layer].borrow_mut() = Some(bank);
+        }
         Ok(Self {
-            hot: backend.moe_slots(g.hidden, g.intermediate, shared.slots)?,
+            hot,
             window: Window::new(shared.slots),
             experts: g.experts,
             layer,
@@ -154,6 +208,9 @@ impl Paged {
             "rows":rows,"experts":ids,"cold":cold})
         });
         self.shared.reader.demand(self.layer, &cold);
+        if rows <= DECODE_BATCH_MAX_ROWS {
+            self.shared.reader.stage_demand(self.layer, &cold);
+        }
         Request {
             rows,
             position,
@@ -196,7 +253,7 @@ impl Paged {
                 .all(|&id| id >= 0 && (id as usize) < self.experts),
             "paged expert id out of range"
         );
-        let prediction = if rows == 1 {
+        let prediction = if rows <= DECODE_BATCH_MAX_ROWS {
             self.shared.predictions.borrow_mut()[self.layer].take()
         } else {
             None
@@ -236,59 +293,112 @@ impl Paged {
         let mut compute_ms = timer.elapsed().as_secs_f64() * 1000.;
         let mut import_ms = 0.;
         let mut imports = 0;
-        if rows == 1 {
-            // llama.cpp-omni: every real miss enters the persistent per-layer
-            // window. Actual requests are pinned; prediction protection is tried
-            // before the ordinary LRU fallback. Publish only after import.
-            let plan = self.window.plan(&demand, &predicted)?;
-            for &(id, slot) in &plan {
-                let record = self.shared.reader.take(self.layer, id)?;
-                self.window.invalidate(slot);
-                import_ms += import(
-                    &mut self.hot,
-                    slot,
-                    record.as_bytes(),
-                    (&self.shared.timeline, self.layer, id, "hot"),
+        let mut staged_promotions = 0;
+        if rows <= DECODE_BATCH_MAX_ROWS {
+            // Reuse the persistent window for speculative verification. Its
+            // routed union can exceed the window; initial hot work is already
+            // complete, so successive cold groups may replace those slots.
+            let capacity = self.window.contents().len();
+            let pinned = (demand.len() <= capacity)
+                .then(|| self.window.plan(&demand, &predicted))
+                .transpose()?;
+            let mut remaining = cold.clone();
+            while !remaining.is_empty() {
+                let count = remaining.len().min(capacity);
+                let mut group = Vec::with_capacity(count);
+                let mut plan = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (id, loaded) = self.shared.reader.take_any(self.layer, &remaining)?;
+                    remaining.retain(|&expert| expert != id);
+                    group.push(id);
+                    // Pin the full request when it fits. Larger unions pin
+                    // this group's already imported experts until execution.
+                    let slot = if let Some(pinned) = &pinned {
+                        pinned.iter().find(|&&(expert, _)| expert == id).unwrap().1
+                    } else {
+                        self.window.plan(&group, &predicted)?[0].1
+                    };
+                    plan.push((id, slot));
+                    self.window.invalidate(slot);
+                    if let Some(staged) = &loaded.staged {
+                        let start = Instant::now();
+                        self.hot.promote(
+                            slot,
+                            &mut self.shared.staging[self.layer]
+                                .borrow()
+                                .as_ref()
+                                .unwrap()
+                                .borrow_mut(),
+                            staged.slot,
+                        )?;
+                        self.shared.timeline.span("import",0,start,||json!({
+                            "layer":self.layer,"expert":id,"slot":slot,"bank":"hot","staged_slot":staged.slot,"staging_bank":staged.bank}));
+                        import_ms += start.elapsed().as_secs_f64() * 1000.;
+                        staged_promotions += 1;
+                    } else {
+                        import_ms += import(
+                            &mut self.hot,
+                            slot,
+                            loaded.record.as_bytes(),
+                            (&self.shared.timeline, self.layer, id, "hot"),
+                        )?;
+                    }
+                    imports += 1;
+                    self.window.publish(slot, id);
+                }
+                let timer = Instant::now();
+                execute(
+                    &self.hot,
+                    &plan,
+                    input,
+                    ids,
+                    h,
+                    &mut contributions,
+                    (&self.shared.timeline, self.layer, "hot"),
                 )?;
-                imports += 1;
-                self.window.publish(slot, id);
+                compute_ms += timer.elapsed().as_secs_f64() * 1000.;
             }
-            let timer = Instant::now();
-            execute(
-                &self.hot,
-                &plan,
-                input,
-                ids,
-                h,
-                &mut contributions,
-                (&self.shared.timeline, self.layer, "hot"),
-            )?;
-            compute_ms += timer.elapsed().as_secs_f64() * 1000.;
         } else {
             // Strata's short-prompt staged walk: visit the routed expert union
-            // in file order, then reuse each loaded group for all logical rows.
-            // The prompt tail seeds omni's decode window.
+            // in file order. Prompt-tail experts go directly to their final
+            // hot slots, avoiding a second weight copy after cold execution.
             let wanted = tail_experts(ids, self.window.contents().len());
             for group in cold.chunks(16) {
+                let mut seeded = Vec::new();
                 let records: Vec<_> = group
                     .iter()
                     .map(|&id| self.shared.reader.take(self.layer, id))
                     .collect::<Result<_>>()?;
                 let mut bank = self.shared.cold.borrow_mut();
-                for (slot, record) in records.iter().enumerate() {
+                let mut map = Vec::new();
+                for (&id, record) in group.iter().zip(&records) {
+                    if wanted.contains(&id) {
+                        let slot = self
+                            .window
+                            .victim(&wanted, &HashSet::new(), &HashSet::new())?;
+                        self.window.invalidate(slot);
+                        import_ms += import(
+                            &mut self.hot,
+                            slot,
+                            record.as_bytes(),
+                            (&self.shared.timeline, self.layer, id, "hot"),
+                        )?;
+                        imports += 1;
+                        self.window.publish(slot, id);
+                        seeded.push((id, slot));
+                        continue;
+                    }
+                    let slot = map.len();
                     import_ms += import(
                         &mut bank,
                         slot,
                         record.as_bytes(),
-                        (&self.shared.timeline, self.layer, group[slot], "cold"),
+                        (&self.shared.timeline, self.layer, id, "cold"),
                     )?;
                     imports += 1;
+                    map.push((id, slot));
                 }
-                let map: Vec<_> = group
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &id)| (id, slot))
-                    .collect();
+                drop(records);
                 let timer = Instant::now();
                 execute(
                     &bank,
@@ -300,24 +410,17 @@ impl Paged {
                     (&self.shared.timeline, self.layer, "cold"),
                 )?;
                 compute_ms += timer.elapsed().as_secs_f64() * 1000.;
-                drop(bank);
-                for (&id, record) in group.iter().zip(&records) {
-                    if !wanted.contains(&id) {
-                        continue;
-                    }
-                    let slot = self
-                        .window
-                        .victim(&wanted, &HashSet::new(), &HashSet::new())?;
-                    self.window.invalidate(slot);
-                    import_ms += import(
-                        &mut self.hot,
-                        slot,
-                        record.as_bytes(),
-                        (&self.shared.timeline, self.layer, id, "hot"),
-                    )?;
-                    imports += 1;
-                    self.window.publish(slot, id);
-                }
+                let timer = Instant::now();
+                execute(
+                    &self.hot,
+                    &seeded,
+                    input,
+                    ids,
+                    h,
+                    &mut contributions,
+                    (&self.shared.timeline, self.layer, "hot"),
+                )?;
+                compute_ms += timer.elapsed().as_secs_f64() * 1000.;
             }
         }
         for &id in ids {
@@ -339,7 +442,7 @@ impl Paged {
         }
         for stats in [&mut self.stats, &mut self.decode]
             .into_iter()
-            .take(if rows == 1 { 2 } else { 1 })
+            .take(if rows <= DECODE_BATCH_MAX_ROWS { 2 } else { 1 })
         {
             stats.calls += 1;
             stats.assignments += ids.len() as u64;
@@ -349,6 +452,7 @@ impl Paged {
             stats.imports += imports;
             stats.import_ms += import_ms;
             stats.compute_ms += compute_ms;
+            stats.staged_promotions += staged_promotions;
         }
         self.shared.timeline.span(
             "routed",
