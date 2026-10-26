@@ -2,6 +2,7 @@
 mod io;
 mod paged;
 pub(crate) mod prepare;
+pub(crate) mod pruning;
 pub mod store;
 mod timeline;
 mod window;
@@ -42,6 +43,7 @@ pub struct Options {
     pub cache_percent: f64,
     pub prefetch: bool,
     pub direct: bool,
+    pub min_weight: f32,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -51,6 +53,7 @@ impl Default for Options {
             cache_percent: DEFAULT_CACHE_PERCENT,
             prefetch: true,
             direct: true,
+            min_weight: 0.,
         }
     }
 }

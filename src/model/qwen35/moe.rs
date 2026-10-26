@@ -8,7 +8,7 @@ use crate::{
     model::{
         checkpoint::{QuantLoader, Tensor},
         cpu::Cpu,
-        experts::{DECODE_BATCH_MAX_ROWS, Paged, Paging, store::Store},
+        experts::{DECODE_BATCH_MAX_ROWS, Paged, Paging, pruning, store::Store},
         projection::{Linear, Projection},
     },
     npu::{Backend, Moe},
@@ -38,6 +38,9 @@ pub(super) struct Routed {
     f: usize,
     count: usize,
     top: usize,
+    min_weight: f32,
+    pruning: pruning::Stats,
+    pruning_decode: pruning::Stats,
 }
 
 pub(super) fn routes(logits: &[f32], top: usize) -> Result<(Vec<i32>, Vec<f32>)> {
@@ -66,10 +69,13 @@ impl Routed {
         }
     }
     pub(super) fn statistics(&self) -> serde_json::Value {
-        match &self.experts {
-            Bank::Resident(_) => serde_json::Value::Null,
+        let mut stats = match &self.experts {
+            Bank::Resident(_) => serde_json::json!({}),
             Bank::Paged(p) => p.stats(),
-        }
+        };
+        stats["pruning"] = serde_json::json!({"minimum_weight":self.min_weight,
+            "all":self.pruning,"decode":self.pruning_decode});
+        stats
     }
     pub(super) fn load(
         backend: &Backend,
@@ -85,6 +91,7 @@ impl Routed {
             store,
             paging,
         } = storage;
+        pruning::validate(options.experts.min_weight)?;
         let m = c.moe.as_ref().expect("MoE configuration");
         let h = c.hidden_size;
         let experts = if let Some(paging) = paging {
@@ -167,6 +174,9 @@ impl Routed {
             f,
             count: m.experts,
             top: m.top_k,
+            min_weight: options.experts.min_weight,
+            pruning: pruning::Stats::default(),
+            pruning_decode: pruning::Stats::default(),
         })
     }
 
@@ -206,9 +216,18 @@ impl Routed {
             }
             Ok(())
         })?;
+        let original_weights = weights.clone();
+        for row in weights.chunks_exact_mut(self.top) {
+            pruning::apply(row, self.min_weight);
+        }
+        self.pruning.record(&original_weights, &weights, rows);
+        if rows <= DECODE_BATCH_MAX_ROWS {
+            self.pruning_decode
+                .record(&original_weights, &weights, rows);
+        }
         let request = timings.stage(Phase::Cpu, "target demand bookkeeping", || {
             match &self.experts {
-                Bank::Paged(bank) => Some(bank.request(&ids, e.position, rows)),
+                Bank::Paged(bank) => Some(bank.request(&ids, &weights, e.position, rows)),
                 Bank::Resident(_) => None,
             }
         });
@@ -219,7 +238,13 @@ impl Routed {
                 let mut predicted = Vec::with_capacity(rows * self.top);
                 e.cpu.dense_head_batch(router, input, &mut logits);
                 for row in logits.chunks_exact(self.count) {
-                    predicted.extend(routes(row, self.top)?.0);
+                    let (ids, mut weights) = routes(row, self.top)?;
+                    pruning::apply(&mut weights, self.min_weight);
+                    predicted.extend(
+                        ids.into_iter()
+                            .zip(weights)
+                            .filter_map(|(id, weight)| (weight > 0.).then_some(id)),
+                    );
                 }
                 Ok(predicted)
             })?;
@@ -228,6 +253,12 @@ impl Routed {
             });
         }
         if e.trace.enabled() {
+            e.trace.save(
+                e.position,
+                e.index,
+                "router_weights_original",
+                &original_weights,
+            )?;
             e.trace.save(
                 e.position,
                 e.index,

@@ -98,9 +98,12 @@ impl Window {
 
 /// Final LRU working set after chronological prompt requests. The staged walk
 /// only imports this final set into the persistent window.
-pub(super) fn tail_experts(ids: &[i32], capacity: usize) -> HashSet<usize> {
+pub(super) fn tail_experts(ids: &[i32], weights: &[f32], capacity: usize) -> HashSet<usize> {
     let mut result = HashSet::new();
-    for &id in ids.iter().rev() {
+    for (&id, &weight) in ids.iter().zip(weights).rev() {
+        if weight == 0. {
+            continue;
+        }
         result.insert(id as usize);
         if result.len() == capacity {
             break;
@@ -138,9 +141,16 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn skipped_routes_do_not_displace_the_prompt_tail() {
+        assert_eq!(
+            tail_experts(&[1, 2, 3, 4, 5], &[1., 1., 0., 0., 0.], 2),
+            HashSet::from([1, 2])
+        );
+    }
+    #[test]
     fn prompt_seed_uses_recent_unique_experts() {
         assert_eq!(
-            tail_experts(&[0, 0, 0, 1, 2, 3, 2], 3),
+            tail_experts(&[0, 0, 0, 1, 2, 3, 2], &[1.; 7], 3),
             HashSet::from([1, 2, 3])
         );
     }

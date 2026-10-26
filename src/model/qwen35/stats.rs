@@ -34,6 +34,8 @@ impl Qwen35 {
             "position":self.position,"layers":self.layers.len(),"architecture":self.info.architecture,
             "routed_experts":self.config.moe.as_ref().map(|m| m.experts),
             "experts_per_token":self.config.moe.as_ref().map(|m| m.top_k),
+            "expert_min_weight":self.options.experts.min_weight,
+            "expert_pruning_renormalize":false,
             "expert_storage":self.config.moe.as_ref().map(|_| if self.paging.is_some() {"stream"} else {"resident"}),
             "prefill_logical_chunk":self.prompt_chunk_rows(),
             "expert_cache_policy":self.paging.as_ref().map(|_| "per-layer LRU; requested and predicted protection; prompt-tail seed"),

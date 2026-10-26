@@ -59,6 +59,7 @@ pub fn run(
         "window_size":length,"scored_target_positions":[score_start,length - 1],
         "chunk":options.chunk,"attention_tile":options.attention_tile,
         "context":options.context,"cpu_threads":options.threads,
+        "expert_min_weight":options.experts.min_weight,
         "cpu_core_mask":options.cpu_mask,"npu_core_mask":options.npu_mask,
         "kv_reset_per_window":true,"chat_template":false,"added_bos_eos":false,
         "arithmetic":"INT32 W4/W8 Linear, native FP16 GQA, FP32 exp and FP64 NLL reduction"});

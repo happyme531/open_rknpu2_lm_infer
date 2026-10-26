@@ -26,3 +26,9 @@ The DSpark Markov correction and confidence head follow DeepSeek's DeepSpec
 `deepspec/modeling/dspark/markov_head.py` and `common.py`
 (https://github.com/deepseek-ai/DeepSpec). Its MIT notice is retained in
 [src/model/dflash/DeepSpec-LICENSE](src/model/dflash/DeepSpec-LICENSE).
+
+The optional low-weight route pruning follows Strata `src/dsv41/ds4_model.cu`
+(`STRATA_DS4_DISK_SKIP_W`), revision `4b9e05a2a806a3fe24f7b2560d98626c37dade35`.
+This implementation extends pruning to resident routes and prefill, and always
+keeps the strongest route. It retains the same unnormalized remaining weights.
+The MIT notice is retained in [Strata-LICENSE](src/model/experts/Strata-LICENSE).

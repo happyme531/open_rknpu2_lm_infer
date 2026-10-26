@@ -127,6 +127,7 @@ impl Paging {
 struct Stats {
     calls: u64,
     assignments: u64,
+    skipped_assignments: u64,
     hot_assignments: u64,
     unique_demand: u64,
     cold_experts: u64,
@@ -194,11 +195,12 @@ impl Paged {
         json!({"all":self.stats,"decode":self.decode,"slots":self.window.contents()})
     }
     /// Queue known demand before the caller starts next-layer prediction.
-    pub fn request(&self, ids: &[i32], position: usize, rows: usize) -> Request {
+    pub fn request(&self, ids: &[i32], routes: &[f32], position: usize, rows: usize) -> Request {
         let mut seen = HashSet::new();
         let demand: Vec<_> = ids
             .iter()
-            .map(|&id| id as usize)
+            .zip(routes)
+            .filter_map(|(&id, &weight)| (weight > 0.).then_some(id as usize))
             .filter(|&id| seen.insert(id))
             .collect();
         let mut cold: Vec<_> = demand
@@ -211,7 +213,7 @@ impl Paged {
         }
         self.shared.timeline.mark("actual routes", || {
             json!({"layer":self.layer,"position":position,
-            "rows":rows,"experts":ids,"cold":cold})
+            "rows":rows,"experts":ids.iter().zip(routes).filter_map(|(&id,&weight)|(weight>0.).then_some(id)).collect::<Vec<_>>(),"route_ids":ids,"route_weights":routes,"cold":cold})
         });
         self.shared.reader.demand(self.layer, &cold);
         if rows <= DECODE_BATCH_MAX_ROWS {
@@ -269,9 +271,10 @@ impl Paged {
             let mut counts = self.shared.prediction_counts.borrow_mut();
             counts.0 += ids
                 .iter()
-                .filter(|&&id| predicted.contains(&(id as usize)))
+                .zip(routes)
+                .filter(|&(id, weight)| *weight > 0. && predicted.contains(&(*id as usize)))
                 .count() as u64;
-            counts.1 += ids.len() as u64;
+            counts.1 += routes.iter().filter(|&&weight| weight > 0.).count() as u64;
         }
         let predicted: HashSet<_> = prediction.into_iter().flatten().collect();
         let hot: Vec<_> = self
@@ -281,13 +284,15 @@ impl Paged {
             .enumerate()
             .filter_map(|(slot, &id)| id.map(|id| (id, slot)))
             .collect();
+        let active = routes.iter().filter(|&&weight| weight > 0.).count();
         let hits = ids
             .iter()
-            .filter(|&&id| self.window.slot(id as usize).is_some())
+            .zip(routes)
+            .filter(|&(id, weight)| *weight > 0. && self.window.slot(*id as usize).is_some())
             .count();
         // Every contribution keeps its original token/rank until FP32 reduction.
         let mut workspace = self.shared.workspace.borrow_mut();
-        // Hot and cold passes overwrite every token/rank before reduction.
+        // Hot and cold passes overwrite every retained token/rank before reduction.
         // Retained entries need no clearing between requests or row counts.
         workspace.contributions.resize(ids.len() * h, 0.);
         self.shared.timeline.span(
@@ -301,7 +306,7 @@ impl Paged {
             &self.hot,
             &hot,
             input,
-            ids,
+            (ids, routes),
             h,
             (&self.shared.timeline, self.layer, "hot"),
         )?;
@@ -400,7 +405,7 @@ impl Paged {
                     &self.hot,
                     &plan,
                     input,
-                    ids,
+                    (ids, routes),
                     h,
                     (&self.shared.timeline, self.layer, "hot"),
                 )?;
@@ -410,7 +415,7 @@ impl Paged {
             // Strata's short-prompt staged walk: visit the routed expert union
             // in file order. Prompt-tail experts go directly to their final
             // hot slots, avoiding a second weight copy after cold execution.
-            let wanted = tail_experts(ids, self.window.contents().len());
+            let wanted = tail_experts(ids, routes, self.window.contents().len());
             for group in cold.chunks(16) {
                 let mut seeded = Vec::new();
                 let records: Vec<_> = group
@@ -452,7 +457,7 @@ impl Paged {
                     &bank,
                     &map,
                     input,
-                    ids,
+                    (ids, routes),
                     h,
                     (&self.shared.timeline, self.layer, "cold"),
                 )?;
@@ -462,7 +467,7 @@ impl Paged {
                     &self.hot,
                     &seeded,
                     input,
-                    ids,
+                    (ids, routes),
                     h,
                     (&self.shared.timeline, self.layer, "hot"),
                 )?;
@@ -470,8 +475,10 @@ impl Paged {
             }
         }
         let update_start = Instant::now();
-        for &id in ids {
-            self.window.touch(id as usize);
+        for (&id, &weight) in ids.iter().zip(routes) {
+            if weight > 0. {
+                self.window.touch(id as usize);
+            }
         }
         self.shared.timeline.span(
             "paged cache touch",
@@ -485,8 +492,11 @@ impl Paged {
                 let mut sum = 0.;
                 for rank in 0..top {
                     let assignment = row * top + rank;
-                    sum = workspace.contributions[assignment * h + col]
-                        .mul_add(routes[assignment], sum);
+                    // Skipped entries can retain stale data from an earlier call.
+                    if routes[assignment] > 0. {
+                        sum = workspace.contributions[assignment * h + col]
+                            .mul_add(routes[assignment], sum);
+                    }
                 }
                 output[row * h + col] = sum;
             }
@@ -513,7 +523,8 @@ impl Paged {
             .take(if rows <= DECODE_BATCH_MAX_ROWS { 2 } else { 1 })
         {
             stats.calls += 1;
-            stats.assignments += ids.len() as u64;
+            stats.assignments += active as u64;
+            stats.skipped_assignments += (ids.len() - active) as u64;
             stats.hot_assignments += hits as u64;
             stats.unique_demand += demand.len() as u64;
             stats.cold_experts += cold.len() as u64;
@@ -563,16 +574,20 @@ impl Workspace {
         bank: &Moe,
         map: &[(usize, usize)],
         input: &[f32],
-        ids: &[i32],
+        routing: (&[i32], &[f32]),
         h: usize,
         timeline: (&Timeline, usize, &'static str),
     ) -> Result<()> {
+        let (ids, routes) = routing;
         let execute_start = Instant::now();
         let top = ids.len() / (input.len() / h);
         let jobs_start = Instant::now();
         self.jobs.clear();
         self.jobs
             .extend(ids.iter().enumerate().filter_map(|(assignment, &id)| {
+                if routes[assignment] == 0. {
+                    return None;
+                }
                 map.iter()
                     .find(|&&(e, _)| e == id as usize)
                     .map(|&(_, slot)| (assignment, slot))

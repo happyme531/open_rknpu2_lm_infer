@@ -92,6 +92,14 @@ pub struct ModelArgs {
         help = "Percentage of routed experts kept in NPU cache per layer (0 < P <= 100; at least top-k)"
     )]
     pub expert_cache_percent: f64,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 0.,
+        value_parser = crate::model::experts::pruning::parse,
+        help = "Approximate MoE: skip top-k normalized weights below this threshold (0 disables; best always kept; no renormalization)"
+    )]
+    pub expert_min_weight: f32,
     #[arg(long, global = true)]
     pub no_expert_prefetch: bool,
     #[arg(long, global = true, help = "Allow the OS page cache for expert reads")]
@@ -206,6 +214,7 @@ impl ModelArgs {
                 cache_percent: self.expert_cache_percent,
                 prefetch: !self.no_expert_prefetch,
                 direct: !self.expert_buffered_io,
+                min_weight: self.expert_min_weight,
             },
             speculation,
         };
@@ -678,6 +687,8 @@ mod tests {
             "records",
             "--expert-cache-percent",
             "25",
+            "--expert-min-weight",
+            "0.05",
         ]);
         let options = cli.model.options().unwrap();
         assert_eq!(options.speculation.kind, SpeculativeType::DraftDspark);
@@ -687,6 +698,7 @@ mod tests {
             crate::model::experts::Storage::Stream
         );
         assert_eq!(options.experts.cache_percent, 25.);
+        assert_eq!(options.experts.min_weight, 0.05);
         assert_eq!(options.experts.slots(256, 8).unwrap(), 64);
         assert!(options.experts.prefetch && options.experts.direct);
         assert_eq!(options.experts.cache, Some(PathBuf::from("records")));
