@@ -30,6 +30,8 @@ pub(crate) struct Paging {
     predictions: RefCell<Vec<Option<Vec<usize>>>>,
     prediction_counts: RefCell<(u64, u64)>,
     timeline: Timeline,
+    // Layers execute serially; retain the large prompt workspace only once.
+    workspace: RefCell<Workspace>,
 }
 impl Paging {
     pub fn reset(&self) {
@@ -56,6 +58,7 @@ impl Paging {
             predictions: RefCell::new(vec![None; layers]),
             prediction_counts: RefCell::new((0, 0)),
             timeline,
+            workspace: RefCell::new(Workspace::default()),
         }))
     }
     pub fn predict(&self, layer: usize, ids: &[i32]) {
@@ -233,6 +236,7 @@ impl Paged {
             cold,
         } = request;
         let layer_start = Instant::now();
+        let prepare_start = Instant::now();
         self.shared.timeline.mark(
             "routed begin",
             || json!({"layer":self.layer,"position":position,"rows":rows}),
@@ -279,15 +283,23 @@ impl Paged {
             .filter(|&&id| self.window.slot(id as usize).is_some())
             .count();
         // Every contribution keeps its original token/rank until FP32 reduction.
-        let mut contributions = vec![0.; ids.len() * h];
+        let mut workspace = self.shared.workspace.borrow_mut();
+        // Hot and cold passes overwrite every token/rank before reduction.
+        // Retained entries need no clearing between requests or row counts.
+        workspace.contributions.resize(ids.len() * h, 0.);
+        self.shared.timeline.span(
+            "paged prepare",
+            0,
+            prepare_start,
+            || json!({"layer":self.layer,"rows":rows,"position":position}),
+        );
         let timer = Instant::now();
-        execute(
+        workspace.execute(
             &self.hot,
             &hot,
             input,
             ids,
             h,
-            &mut contributions,
             (&self.shared.timeline, self.layer, "hot"),
         )?;
         let mut compute_ms = timer.elapsed().as_secs_f64() * 1000.;
@@ -299,9 +311,16 @@ impl Paged {
             // routed union can exceed the window; initial hot work is already
             // complete, so successive cold groups may replace those slots.
             let capacity = self.window.contents().len();
+            let plan_start = Instant::now();
             let pinned = (demand.len() <= capacity)
                 .then(|| self.window.plan(&demand, &predicted))
                 .transpose()?;
+            self.shared.timeline.span(
+                "paged cache plan",
+                0,
+                plan_start,
+                || json!({"layer":self.layer,"rows":rows,"position":position}),
+            );
             let mut remaining = cold.clone();
             while !remaining.is_empty() {
                 let count = remaining.len().min(capacity);
@@ -309,6 +328,7 @@ impl Paged {
                 let mut plan = Vec::with_capacity(count);
                 for _ in 0..count {
                     let (id, loaded) = self.shared.reader.take_any(self.layer, &remaining)?;
+                    let selection_start = Instant::now();
                     remaining.retain(|&expert| expert != id);
                     group.push(id);
                     // Pin the full request when it fits. Larger unions pin
@@ -320,6 +340,12 @@ impl Paged {
                     };
                     plan.push((id, slot));
                     self.window.invalidate(slot);
+                    self.shared.timeline.span(
+                        "paged slot selection",
+                        0,
+                        selection_start,
+                        || json!({"layer":self.layer,"expert":id}),
+                    );
                     if let Some(staged) = &loaded.staged {
                         let start = Instant::now();
                         self.hot.promote(
@@ -347,13 +373,12 @@ impl Paged {
                     self.window.publish(slot, id);
                 }
                 let timer = Instant::now();
-                execute(
+                workspace.execute(
                     &self.hot,
                     &plan,
                     input,
                     ids,
                     h,
-                    &mut contributions,
                     (&self.shared.timeline, self.layer, "hot"),
                 )?;
                 compute_ms += timer.elapsed().as_secs_f64() * 1000.;
@@ -400,46 +425,66 @@ impl Paged {
                 }
                 drop(records);
                 let timer = Instant::now();
-                execute(
+                workspace.execute(
                     &bank,
                     &map,
                     input,
                     ids,
                     h,
-                    &mut contributions,
                     (&self.shared.timeline, self.layer, "cold"),
                 )?;
                 compute_ms += timer.elapsed().as_secs_f64() * 1000.;
                 let timer = Instant::now();
-                execute(
+                workspace.execute(
                     &self.hot,
                     &seeded,
                     input,
                     ids,
                     h,
-                    &mut contributions,
                     (&self.shared.timeline, self.layer, "hot"),
                 )?;
                 compute_ms += timer.elapsed().as_secs_f64() * 1000.;
             }
         }
+        let update_start = Instant::now();
         for &id in ids {
             self.window.touch(id as usize);
         }
+        self.shared.timeline.span(
+            "paged cache touch",
+            0,
+            update_start,
+            || json!({"layer":self.layer,"rows":rows,"position":position}),
+        );
+        let reduce_start = Instant::now();
         for row in 0..rows {
             for col in 0..h {
                 let mut sum = 0.;
                 for rank in 0..top {
                     let assignment = row * top + rank;
-                    sum = contributions[assignment * h + col].mul_add(routes[assignment], sum);
+                    sum = workspace.contributions[assignment * h + col]
+                        .mul_add(routes[assignment], sum);
                 }
                 output[row * h + col] = sum;
             }
         }
+        self.shared.timeline.span(
+            "paged reduction",
+            0,
+            reduce_start,
+            || json!({"layer":self.layer,"rows":rows,"position":position}),
+        );
+        let publish_start = Instant::now();
         if let Some(hot) = &self.shared.hot {
             hot.borrow_mut()[self.layer] =
                 self.window.contents().iter().flatten().copied().collect();
         }
+        self.shared.timeline.span(
+            "paged cache snapshot",
+            0,
+            publish_start,
+            || json!({"layer":self.layer,"rows":rows,"position":position}),
+        );
         for stats in [&mut self.stats, &mut self.decode]
             .into_iter()
             .take(if rows <= DECODE_BATCH_MAX_ROWS { 2 } else { 1 })
@@ -479,48 +524,84 @@ fn import(
     Ok(start.elapsed().as_secs_f64() * 1000.)
 }
 
-fn execute(
-    bank: &Moe,
-    map: &[(usize, usize)],
-    input: &[f32],
-    ids: &[i32],
-    h: usize,
-    contributions: &mut [f32],
-    timeline: (&Timeline, usize, &'static str),
-) -> Result<()> {
-    let top = ids.len() / (input.len() / h);
-    let jobs: Vec<_> = ids
-        .iter()
-        .enumerate()
-        .filter_map(|(assignment, &id)| {
-            map.iter()
-                .find(|&&(e, _)| e == id as usize)
-                .map(|&(_, slot)| (assignment, slot))
-        })
-        .collect();
-    for group in jobs.chunks(bank.max_rows()) {
-        let mut x = Vec::with_capacity(group.len() * h);
-        let mut physical = Vec::with_capacity(group.len());
-        for &(assignment, slot) in group {
-            let row = assignment / top;
-            x.extend_from_slice(&input[row * h..(row + 1) * h]);
-            physical.push(slot as i32);
+#[derive(Default)]
+struct Workspace {
+    contributions: Vec<f32>,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    physical: Vec<i32>,
+    routes: Vec<f32>,
+    jobs: Vec<(usize, usize)>,
+}
+
+impl Workspace {
+    fn execute(
+        &mut self,
+        bank: &Moe,
+        map: &[(usize, usize)],
+        input: &[f32],
+        ids: &[i32],
+        h: usize,
+        timeline: (&Timeline, usize, &'static str),
+    ) -> Result<()> {
+        let execute_start = Instant::now();
+        let top = ids.len() / (input.len() / h);
+        let jobs_start = Instant::now();
+        self.jobs.clear();
+        self.jobs
+            .extend(ids.iter().enumerate().filter_map(|(assignment, &id)| {
+                map.iter()
+                    .find(|&&(e, _)| e == id as usize)
+                    .map(|&(_, slot)| (assignment, slot))
+            }));
+        timeline.0.span(
+            "paged jobs",
+            0,
+            jobs_start,
+            || json!({"layer":timeline.1,"bank":timeline.2,"assignments":self.jobs.len()}),
+        );
+        for group in self.jobs.chunks(bank.max_rows()) {
+            let gather_start = Instant::now();
+            self.input.clear();
+            self.physical.clear();
+            for &(assignment, slot) in group {
+                let row = assignment / top;
+                self.input.extend_from_slice(&input[row * h..(row + 1) * h]);
+                self.physical.push(slot as i32);
+            }
+            self.output.resize(self.input.len(), 0.);
+            self.routes.resize(group.len(), 1.);
+            timeline.0.span(
+            "paged gather",
+            0,
+            gather_start,
+            || json!({"layer":timeline.1,"bank":timeline.2,"rows":group.len(),"bytes":self.input.len()*4}),
+        );
+            let start = Instant::now();
+            bank.run(
+                &self.input,
+                &self.physical,
+                &self.routes,
+                &mut self.output,
+                group.len(),
+            )?;
+            timeline.0.span("NPU experts",0,start,||json!({"layer":timeline.1,"bank":timeline.2,
+            "rows":group.len(),"slots":self.physical,"experts":group.iter().map(|&(assignment,_)|ids[assignment]).collect::<Vec<_>>()}));
+            let scatter_start = Instant::now();
+            for (row, &(assignment, _)) in group.iter().enumerate() {
+                self.contributions[assignment * h..(assignment + 1) * h]
+                    .copy_from_slice(&self.output[row * h..(row + 1) * h]);
+            }
+            timeline.0.span("paged scatter", 0, scatter_start, || {
+            json!({"layer":timeline.1,"bank":timeline.2,"rows":group.len(),"bytes":self.output.len()*4})
+        });
         }
-        let mut output = vec![0.; x.len()];
-        let start = Instant::now();
-        bank.run(
-            &x,
-            &physical,
-            &vec![1.; group.len()],
-            &mut output,
-            group.len(),
-        )?;
-        timeline.0.span("NPU experts",0,start,||json!({"layer":timeline.1,"bank":timeline.2,
-            "rows":group.len(),"slots":physical,"experts":group.iter().map(|&(assignment,_)|ids[assignment]).collect::<Vec<_>>()}));
-        for (row, &(assignment, _)) in group.iter().enumerate() {
-            contributions[assignment * h..(assignment + 1) * h]
-                .copy_from_slice(&output[row * h..(row + 1) * h]);
-        }
+        timeline.0.span(
+            "paged execute",
+            0,
+            execute_start,
+            || json!({"layer":timeline.1,"bank":timeline.2}),
+        );
+        Ok(())
     }
-    Ok(())
 }
