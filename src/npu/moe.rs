@@ -250,6 +250,36 @@ impl Moe {
         output: &mut [f32],
         rows: usize,
     ) -> Result<()> {
+        self.execute(input, ids, routes, output, rows, ptr::null_mut())
+    }
+    pub(crate) fn run_profiled(
+        &self,
+        input: &[f32],
+        ids: &[i32],
+        routes: &[f32],
+        output: &mut [f32],
+        rows: usize,
+    ) -> Result<Value> {
+        let mut t = rk_npu_moe_w8_timings::default();
+        self.execute(input, ids, routes, output, rows, &mut t)?;
+        Ok(json!({
+            "input_us":t.input_us,"schedule_us":t.schedule_us,"build_us":t.build_us,
+            "sync_us":t.sync_us,"gather_us":t.gather_us,"gate_us":t.gate_us,
+            "middle_npu_us":t.middle_npu_us,"middle_cpu_us":t.middle_cpu_us,
+            "down_us":t.down_us,"combine_us":t.combine_us,"lut_load_us":t.lut_load_us,
+            "total_us":t.total_us,"gather_tasks":t.gather_tasks,
+            "middle_tasks":t.middle_tasks,"gemm_tasks":t.gemm_tasks
+        }))
+    }
+    fn execute(
+        &self,
+        input: &[f32],
+        ids: &[i32],
+        routes: &[f32],
+        output: &mut [f32],
+        rows: usize,
+        timing: *mut rk_npu_moe_w8_timings,
+    ) -> Result<()> {
         let (h, _, _, top) = self.key;
         ensure!(
             input.len() == rows * h
@@ -270,7 +300,7 @@ impl Moe {
                     ids.as_ptr(),
                     routes.as_ptr(),
                     output.as_mut_ptr(),
-                    ptr::null_mut(),
+                    timing,
                 )
             },
             "grouped routed FFN",

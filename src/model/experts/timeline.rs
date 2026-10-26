@@ -1,5 +1,6 @@
 //! Opt-in Chrome/Perfetto timeline, shared by the submit and I/O threads.
 use anyhow::Result;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -14,7 +15,18 @@ struct Recording {
     path: PathBuf,
     events: Mutex<Vec<Value>>,
 }
+
+#[derive(Serialize)]
+struct Capture<'a> {
+    #[serde(rename = "traceEvents")]
+    events: &'a [Value],
+    #[serde(rename = "displayTimeUnit")]
+    unit: &'static str,
+}
 impl Timeline {
+    pub(crate) fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
     pub fn from_environment() -> Self {
         Self(std::env::var_os("RKNPU_EXPERT_TIMELINE").map(|path| {
             Arc::new(Recording {
@@ -58,10 +70,15 @@ impl Timeline {
                 std::fs::create_dir_all(parent)?;
             }
             let events = r.events.lock().unwrap();
-            std::fs::write(
-                &r.path,
-                serde_json::to_vec(&json!({"traceEvents":*events,"displayTimeUnit":"ms"}))?,
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&r.path)?);
+            serde_json::to_writer(
+                &mut writer,
+                &Capture {
+                    events: &events,
+                    unit: "ms",
+                },
             )?;
+            std::io::Write::flush(&mut writer)?;
         }
         Ok(())
     }

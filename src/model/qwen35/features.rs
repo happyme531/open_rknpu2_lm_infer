@@ -123,13 +123,19 @@ impl Qwen35 {
         let mut tokens = vec![mask; drafts + offset];
         tokens[0] = anchor;
         let embeddings = self.token_embeddings(&tokens)?;
+        self.phases.context(self.position, drafts, -1, false);
+        let network_start = Instant::now();
         let hidden =
             self.dflash
                 .as_mut()
                 .unwrap()
                 .draft(&[], &embeddings, self.position, cancel)?;
+        self.phases.span("draft network", network_start);
         let h = self.config.hidden_size;
-        Ok(Some(self.project_hidden(&hidden[offset * h..], drafts)?))
+        let head_start = Instant::now();
+        let logits = self.project_hidden(&hidden[offset * h..], drafts)?;
+        self.phases.span("draft shared head", head_start);
+        Ok(Some(logits))
     }
     pub fn capture_features(&mut self, layers: &[usize]) -> Result<()> {
         ensure!(

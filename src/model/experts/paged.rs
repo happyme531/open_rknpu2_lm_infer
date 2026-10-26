@@ -601,15 +601,26 @@ impl Workspace {
             || json!({"layer":timeline.1,"bank":timeline.2,"rows":group.len(),"bytes":self.input.len()*4}),
         );
             let start = Instant::now();
-            bank.run(
-                &self.input,
-                &self.physical,
-                &self.routes,
-                &mut self.output,
-                group.len(),
-            )?;
+            let native = if timeline.0.enabled() {
+                bank.run_profiled(
+                    &self.input,
+                    &self.physical,
+                    &self.routes,
+                    &mut self.output,
+                    group.len(),
+                )?
+            } else {
+                bank.run(
+                    &self.input,
+                    &self.physical,
+                    &self.routes,
+                    &mut self.output,
+                    group.len(),
+                )?;
+                Value::Null
+            };
             timeline.0.span("NPU experts",0,start,||json!({"layer":timeline.1,"bank":timeline.2,
-            "rows":group.len(),"slots":self.physical,"experts":group.iter().map(|&(assignment,_)|ids[assignment]).collect::<Vec<_>>()}));
+            "rows":group.len(),"slots":self.physical,"experts":group.iter().map(|&(assignment,_)|ids[assignment]).collect::<Vec<_>>(),"native":native}));
             let scatter_start = Instant::now();
             for (row, &(assignment, _)) in group.iter().enumerate() {
                 self.contributions[assignment * h..(assignment + 1) * h]

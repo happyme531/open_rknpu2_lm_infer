@@ -502,7 +502,9 @@ impl LanguageModel for Qwen35 {
         logits: &mut [f32],
     ) -> Result<Option<f64>> {
         match &self.dflash {
-            Some(draft) => draft.adjust(row, previous, logits),
+            Some(draft) => self
+                .phases
+                .trace("draft Markov", || draft.adjust(row, previous, logits)),
             None => Ok(None),
         }
     }
