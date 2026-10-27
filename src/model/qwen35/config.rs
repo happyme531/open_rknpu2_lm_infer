@@ -4,8 +4,6 @@ use serde_json::Value;
 
 use crate::ops::{gated_delta::GdnDimensions, rope::MRope};
 
-pub const MAX_CONTEXT: usize = 32768;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerType {
@@ -185,9 +183,9 @@ impl Config {
 
     pub fn validate_context(&self, context: usize) -> Result<()> {
         ensure!(
-            context > 0 && context <= MAX_CONTEXT.min(self.max_position_embeddings),
+            context > 0 && context <= self.max_position_embeddings,
             "Qwen3.5 context exceeds runtime/model limit ({} tokens)",
-            MAX_CONTEXT.min(self.max_position_embeddings)
+            self.max_position_embeddings
         );
         Ok(())
     }
@@ -219,7 +217,8 @@ mod tests {
         assert_eq!(c.rope.rotary_dim(), 64);
         assert_eq!(c.mtp_layers, 1);
         assert!(c.validate_context(32768).is_ok());
-        assert!(c.validate_context(32769).is_err());
+        assert!(c.validate_context(c.max_position_embeddings).is_ok());
+        assert!(c.validate_context(c.max_position_embeddings + 1).is_err());
         let names: Vec<String> = serde_json::from_str(include_str!(
             "../../../llm_generated_docs/evidence/qwen35_mtp/official_tensor_names.json"
         ))

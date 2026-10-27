@@ -82,8 +82,8 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         scale,
     )? as usize;
     let mut backends = vec![Backend::new(&options, 15)?];
-    let mut reserved_kv = 0;
-    let mut layers = Vec::with_capacity(config.layers.len());
+    let mut reserved_bytes = 0;
+    let mut pending = Vec::with_capacity(config.layers.len());
     for (i, kind) in config.layers.iter().enumerate() {
         let p = format!("{prefix}.layers.{i}");
         let h = config.hidden_size;
@@ -142,22 +142,20 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         } else {
             0
         };
-        let budget = if options.prefill_ubatches == 2 {
-            1usize << 30
-        } else {
-            (2usize << 30) - (128usize << 20)
-        };
+        // Payload is only part of the 32-bit IOVA footprint: shared projection,
+        // GDN and Attention workspaces and allocation alignment also need room.
+        let budget = 1usize << 30;
         ensure!(
             estimate + kv < budget,
             "Qwen3.5 layer exceeds IOMMU domain budget"
         );
-        if backends.last().unwrap().weight_bytes() as usize + reserved_kv + estimate + kv > budget {
+        if reserved_bytes + estimate + kv > budget {
             ensure!(
                 backends.len() < 15,
                 "Qwen3.5 exceeds available weight domains"
             );
             backends.push(Backend::new(&options, 15 - backends.len() as u32)?);
-            reserved_kv = 0;
+            reserved_bytes = 0;
         }
         let backend = backends.last().unwrap();
         let mixer = match kind {
@@ -190,25 +188,51 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                     state: Box::new(LayerState::new(config.gdn, config.conv_kernel, 8)?),
                 }
             }
-            LayerType::FullAttention => Mixer::Attention {
-                cache: backend.attention(
+            LayerType::FullAttention => {
+                // Reserve all large KV ranges before loading any projection
+                // weights/plans into these domains.
+                let cache = backend.attention(
                     config.num_attention_heads,
                     config.num_key_value_heads,
                     config.head_dim,
                     scale,
-                )?,
-                q_norm: vector(
-                    &loader,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    config.head_dim,
-                )?,
-                k_norm: vector(
-                    &loader,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    config.head_dim,
-                )?,
-            },
+                )?;
+                cache.reserve(options.context)?;
+                Mixer::Attention {
+                    cache,
+                    q_norm: vector(
+                        &loader,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        config.head_dim,
+                    )?,
+                    k_norm: vector(
+                        &loader,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        config.head_dim,
+                    )?,
+                }
+            }
         };
+        reserved_bytes += estimate + kv;
+        pending.push((
+            p,
+            inputs,
+            out,
+            out_k,
+            gu,
+            down,
+            mixer,
+            backends.len() - 1,
+            *kind,
+        ));
+    }
+    let mut layers = Vec::with_capacity(config.layers.len());
+    for (i, (p, inputs, out, out_k, gu, down, mixer, domain, kind)) in
+        pending.into_iter().enumerate()
+    {
+        let backend = &backends[domain];
+        let h = config.hidden_size;
+        let f = config.intermediate_size;
         layers.push(Layer {
             input_norm: vector(&loader, &format!("{p}.input_layernorm.weight"), h)?,
             post_norm: vector(&loader, &format!("{p}.post_attention_layernorm.weight"), h)?,
@@ -218,7 +242,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             down: linear(backend, &loader, &cpu, down, h, f)?.into(),
             mixer,
         });
-        reserved_kv += kv;
         eprintln!(
             "loaded Qwen3.5 layer {}/{} ({kind:?})",
             i + 1,
@@ -276,6 +299,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
     let trace = Trace::from_environment()?;
     let load_ms = start.elapsed().as_secs_f64() * 1000.0;
     let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
+    let reserved = options.context.div_ceil(32) * 32;
     Ok(Qwen35 {
         options,
         info,
@@ -292,7 +316,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         secondary_work,
         dual_groups: 0,
         position: 0,
-        reserved: 0,
+        reserved,
         logits: Vec::new(),
         trace,
         load_ms,

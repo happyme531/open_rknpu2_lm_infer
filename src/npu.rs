@@ -54,8 +54,8 @@ pub fn configure_cpu(options: &mut ModelOptions) -> Result<()> {
         "ubatch-size must be within 1..256"
     );
     ensure!(
-        (1..=32768).contains(&options.context),
-        "ctx-size must be within 1..32768"
+        options.context > 0 && options.context <= (i32::MAX as usize - 31),
+        "ctx-size must fit the native token count"
     );
     ensure!(
         [256, 512, 1024, 2048, 4096].contains(&options.attention_tile),
