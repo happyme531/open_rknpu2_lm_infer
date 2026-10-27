@@ -59,6 +59,7 @@ fn complete_target_commit_abort_and_next_output() -> Result<()> {
         cpu_mask: 0xf0,
         tune: false,
         tune_search: false,
+        compress_w8a8: false,
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),

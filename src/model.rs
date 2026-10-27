@@ -48,6 +48,8 @@ pub struct ModelOptions {
     pub tune: bool,
     /// Permit device search only in the explicit tuning command.
     pub tune_search: bool,
+    /// Lossless W8 storage; native tiles stay raw unless compression shrinks them.
+    pub compress_w8a8: bool,
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,

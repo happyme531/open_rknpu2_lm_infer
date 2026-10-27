@@ -55,6 +55,7 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         cpu_mask: 0xf0,
         tune: false,
         tune_search: false,
+        compress_w8a8: false,
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),

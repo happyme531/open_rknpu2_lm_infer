@@ -10,6 +10,9 @@ pub(crate) fn backend_stats<'a>(
         domains.push(head.stats());
     }
     let mut result = json!({"domains": domains});
+    for key in ["compress_w8a8", "weight_payload_bytes_estimated"] {
+        result[key] = json!(domains.iter().any(|d| d[key].as_bool() == Some(true)));
+    }
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for (prefix, key) in [("VmRSS:", "rss_kib"), ("VmHWM:", "peak_rss_kib")] {
             if let Some(kib) = status

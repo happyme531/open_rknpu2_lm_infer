@@ -114,6 +114,7 @@ impl Backend {
             weight_reload_calls: 0,
             loaded_w4: 0,
             loaded_w8: 0,
+            compression_scratch: source.compression_scratch.clone(),
             weight_bytes: 0,
             domain: source.domain.clone(),
             context: source.context.clone(),
@@ -145,7 +146,9 @@ mod tests {
         configure_cpu(&mut options)?;
         for mask in [1, 3, 7] {
             options.npu_mask = mask;
-            for bits in [4, 8] {
+            for (bits, compress) in [(4, false), (4, true), (8, false), (8, true)] {
+                options.compress_w8a8 = compress;
+                let compression = bits == 8 && compress;
                 let primary = Backend::new(&options, 0)?;
                 let (rows, k, n) = (128, 513, 512);
                 let linear = primary.load(
@@ -158,6 +161,8 @@ mod tests {
                     },
                     None,
                 )?;
+                assert_eq!(linear.compression_enabled(), compression);
+                assert_eq!(release_compression_scratch([&primary]), compression);
                 primary.prepare(rows)?;
                 let lane = ExecutionLane::new(std::slice::from_ref(&primary))?;
                 lane.prepare(rows)?;
@@ -171,6 +176,35 @@ mod tests {
                 let mut expected1 = expected0.clone();
                 linear.run(&input0, &mut expected0, rows)?;
                 lane.run(|| linear.run(&input1, &mut expected1, rows))?;
+                let seed_matches = primary
+                    .0
+                    .lock()
+                    .unwrap()
+                    .w8_strategies
+                    .get(&(linear.key, rows))
+                    .is_some_and(|strategy| strategy.n_tile as usize == n.div_ceil(32) * 32);
+                assert_eq!(
+                    release_compression_scratch([&primary]),
+                    compression && !seed_matches
+                );
+                if compression {
+                    let mut output = vec![0.; 3 * n];
+                    lane.run(|| linear.run(&input0, &mut output, 3))?;
+                    assert_eq!(output, expected0[..3 * n]);
+                    assert!(!release_compression_scratch([&primary]));
+                    {
+                        let mut b = other.0.lock().unwrap();
+                        let mut strategy = b.w8_strategy(linear.key, 4)?;
+                        strategy.n_tile = 64;
+                        strategy.n_groups = n.div_ceil(64) as i32;
+                        b.work.remove(&(linear.key, 4));
+                        b.w8_strategies.insert((linear.key, 4), strategy);
+                    }
+                    lane.run(|| linear.run(&input0, &mut output, 3))?;
+                    assert_eq!(output, expected0[..3 * n]);
+                    assert!(release_compression_scratch([&primary]));
+                    assert!(!release_compression_scratch([&primary]));
+                }
                 for _ in 0..3 {
                     let mut output0 = vec![0.; rows * n];
                     let mut output1 = output0.clone();
@@ -181,6 +215,7 @@ mod tests {
                         follower.join().expect("second lane panicked")?;
                         Ok(())
                     })?;
+                    assert!(!release_compression_scratch([&primary]));
                     assert!(
                         expected0
                             .iter()

@@ -92,7 +92,15 @@ impl OutputHead {
             "lm_head shape mismatch"
         );
         match &self.weights {
-            Weights::Quantized { linear, .. } => linear.run(input, output, rows),
+            Weights::Quantized {
+                backend, linear, ..
+            } => {
+                linear.run(input, output, rows)?;
+                if linear.compression_enabled() {
+                    crate::npu::release_compression_scratch(std::iter::once(backend));
+                }
+                Ok(())
+            }
             Weights::Floating(tensor) => {
                 for (x, y) in input.chunks(self.width).zip(output.chunks_mut(self.vocab)) {
                     cpu.dense_head(tensor, x, y);

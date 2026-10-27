@@ -91,6 +91,12 @@ pub struct ModelArgs {
         help = "Use built-in strategies instead of reading the tuning cache"
     )]
     pub no_tune: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Losslessly compress all W8A8 linear weights; keep tiles raw unless they shrink. Reduces memory usage but greatly increases weight loading time. Preserves accuracy; inference may be slightly faster or slower"
+    )]
+    pub compress_w8a8: bool,
     #[arg(long, global = true, default_value_t = 512)]
     pub attention_tile: usize,
     #[arg(
@@ -216,6 +222,7 @@ impl ModelArgs {
             cpu_mask: self.cpu_mask,
             tune: !self.no_tune,
             tune_search: false,
+            compress_w8a8: self.compress_w8a8,
             tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,

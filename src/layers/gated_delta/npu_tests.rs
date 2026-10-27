@@ -32,6 +32,7 @@ fn npu_prefill_threshold_state_handoff_and_layer_reuse() -> Result<()> {
         cpu_mask: 0xf0,
         tune: false,
         tune_search: false,
+        compress_w8a8: false,
         tune_cache: Default::default(),
         attention_tile: 512,
         vision_dtype: Default::default(),

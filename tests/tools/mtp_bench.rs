@@ -206,6 +206,7 @@ fn main() -> Result<()> {
         cpu_mask: 0xf0,
         tune: args.tune_cache.is_some(),
         tune_search: false,
+        compress_w8a8: false,
         tune_cache: args.tune_cache.unwrap_or_default(),
         attention_tile: 512,
         vision_dtype: Default::default(),

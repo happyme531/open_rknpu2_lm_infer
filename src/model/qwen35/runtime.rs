@@ -94,6 +94,13 @@ impl Qwen35 {
         {
             model.load_dflash()?;
         }
+        if model.options.compress_w8a8 {
+            let start = Instant::now();
+            crate::npu::release_compression_scratch(
+                model.backends.iter().chain(model.head.backend()),
+            );
+            model.load_ms += start.elapsed().as_secs_f64() * 1000.;
+        }
         Ok(model)
     }
 

@@ -126,6 +126,8 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
 
+Use `--compress-w8a8` to losslessly compress all W8A8 linear weights. Tiles stay raw unless their encoded size is smaller. See [W8A8 weight compression](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md) for startup and memory accounting details.
+
 ### Image Input and MTP
 
 Use a Qwen3.5-4B model directory containing both vision and MTP weights. The following command uses the K1 configuration from the image-text benchmark:

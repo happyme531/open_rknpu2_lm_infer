@@ -365,7 +365,7 @@ impl Dense {
         let batches = (0..options.prefill_ubatches)
             .map(|_| Batch::new(chunk, geometry, scatter_width))
             .collect();
-        Ok(Self {
+        let mut model = Self {
             trace,
             options,
             info,
@@ -391,7 +391,14 @@ impl Dense {
                 load: elapsed(start),
                 ..Default::default()
             },
-        })
+        };
+        if model.options.compress_w8a8 {
+            crate::npu::release_compression_scratch(
+                model.backends.iter().chain(model.head.backend()),
+            );
+            model.timings.load = elapsed(start);
+        }
+        Ok(model)
     }
 
     fn trace(&self, layer: i32, stage: &str, values: &[f32]) -> Result<()> {
@@ -445,6 +452,9 @@ impl Dense {
         self.position = position;
         if tokens.len() == 2 {
             self.batches.swap(0, 1);
+        }
+        if self.options.compress_w8a8 {
+            crate::npu::release_compression_scratch(&self.backends);
         }
         Ok(())
     }

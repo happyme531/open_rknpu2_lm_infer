@@ -15,6 +15,7 @@ fn narrow_w8_gdn_gates_match_integer_oracle() -> Result<()> {
         cpu_mask: 0xf0,
         tune: false,
         tune_search: false,
+        compress_w8a8: false,
         tune_cache: cache.path().into(),
         attention_tile: 512,
         vision_dtype: Default::default(),

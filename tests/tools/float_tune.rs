@@ -52,6 +52,7 @@ fn main() -> Result<()> {
         cpu_mask: 0xf0,
         tune: true,
         tune_search: !args.load_only,
+        compress_w8a8: false,
         tune_cache: args.tune_cache,
         attention_tile: 512,
         vision_dtype: Default::default(),

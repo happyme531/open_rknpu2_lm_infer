@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString},
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 #[allow(
@@ -27,6 +30,8 @@ mod floating;
 pub use floating::{FloatBackend, FloatLinear};
 mod lane;
 pub(crate) use lane::ExecutionLane;
+#[cfg(test)]
+mod compression_tests;
 mod policy;
 #[cfg(test)]
 mod vision_tests;
@@ -255,6 +260,7 @@ struct BackendInner {
     weight_reload_calls: usize,
     loaded_w4: usize,
     loaded_w8: usize,
+    compression_scratch: Arc<AtomicBool>,
     weight_bytes: u64,
     domain: Arc<Handle<rk_npu_iommu_domain>>,
     context: Arc<Handle<rk_npu_ctx>>,
@@ -268,6 +274,28 @@ pub struct Linear {
     w8: Option<Handle<rk_npu_f32i8f32_weights>>,
     key: Key,
     owner: Backend,
+    compressed_layout_generation: Option<AtomicU64>,
+}
+
+/// Reclaim freed codec/loading allocations once a complete group has finished.
+/// Execution lanes share the pending flag; callers must join them first.
+/// Returns whether malloc_trim was called, even if no pages were reclaimable.
+pub(crate) fn release_compression_scratch<'a>(
+    backends: impl IntoIterator<Item = &'a Backend>,
+) -> bool {
+    let mut pending = false;
+    for backend in backends {
+        pending |= backend
+            .0
+            .lock()
+            .unwrap()
+            .compression_scratch
+            .swap(false, Ordering::AcqRel);
+    }
+    if pending {
+        unsafe { libc::malloc_trim(0) };
+    }
+    pending
 }
 
 fn attention_config(
@@ -332,6 +360,10 @@ impl Backend {
             );
         }
         ensure!(
+            !options.compress_w8a8 || std::env::var("RK_NPU_I8_NPU_REDUCE").as_deref() != Ok("1"),
+            "--compress-w8a8 requires RK_NPU_I8_NPU_REDUCE to be unset or 0"
+        );
+        ensure!(
             domain_id < RK_NPU_IOMMU_DOMAIN_COUNT,
             "IOMMU domain must be within 0..15"
         );
@@ -370,6 +402,7 @@ impl Backend {
             weight_reload_calls: 0,
             loaded_w4: 0,
             loaded_w8: 0,
+            compression_scratch: Arc::new(AtomicBool::new(false)),
             weight_bytes: 0,
             domain: Arc::new(domain),
             context: Arc::new(context),
@@ -447,7 +480,14 @@ impl Backend {
             };
             let handle = Handle::new(
                 unsafe {
-                    rk_npu_f32i8f32_weights_create(
+                    // The lossless constructor compares complete encoded tile sizes
+                    // and retains native INT8 storage for tiles that do not shrink.
+                    let create = if b.options.compress_w8a8 {
+                        rk_npu_f32i8f32_weights_create_compress
+                    } else {
+                        rk_npu_f32i8f32_weights_create
+                    };
+                    create(
                         b.domain.raw,
                         &cfg,
                         matrix.codes.as_ptr(),
@@ -462,6 +502,8 @@ impl Backend {
                 unsafe { rk_npu_f32i8f32_weights_memory_query(&cfg, &mut info) },
                 "W8 weight memory",
             )?;
+            // The shape-only query describes raw storage, including when DCOMP
+            // is enabled. Keep this estimate for domain capacity planning.
             b.weight_bytes += info.bytes;
             b.loaded_w8 += 1;
             w8 = Some(handle);
@@ -486,11 +528,18 @@ impl Backend {
         if material.reload.is_some() {
             material.matrix.codes = Vec::new();
         }
+        let compressed_layout_generation = (key.0 == 8 && b.options.compress_w8a8).then(|| {
+            b.compression_scratch.store(true, Ordering::Release);
+            AtomicU64::new(unsafe {
+                rk_npu_f32i8f32_weights_compressed_layout_generation(w8.as_ref().unwrap().raw)
+            })
+        });
         Ok(Linear {
             w4,
             w8,
             key,
             owner: self.clone(),
+            compressed_layout_generation,
         })
     }
 
@@ -660,6 +709,8 @@ impl Backend {
             (w.q.capacity() + w.k.capacity() + w.v.capacity()) * 2 + w.output.capacity() * 4
         });
         json!({"backend": "open-rknpu2", "loaded_w4": b.loaded_w4, "loaded_w8": b.loaded_w8,
+            "compress_w8a8": b.options.compress_w8a8,
+            "weight_payload_bytes_estimated": b.options.compress_w8a8 && b.loaded_w8 > 0,
             "weight_payload_bytes": b.weight_bytes, "workspace_payload_bytes": workspace,
             "tuning_material_bytes": material, "workspace_count": b.work.len(),
             "swiglu_workspace_count": b.work.values().filter(|w| w.w4_swiglu.is_some()).count(),
@@ -1064,6 +1115,10 @@ impl BackendInner {
 }
 
 impl Linear {
+    pub(crate) fn compression_enabled(&self) -> bool {
+        self.compressed_layout_generation.is_some()
+    }
+
     pub fn k(&self) -> usize {
         self.key.1
     }
@@ -1132,6 +1187,18 @@ impl Linear {
         if m != rows {
             output[..rows * width].copy_from_slice(&work.output[..rows * width]);
         }
+        if let Some(observed) = &self.compressed_layout_generation {
+            let generation = unsafe {
+                rk_npu_f32i8f32_weights_compressed_layout_generation(self.w8.as_ref().unwrap().raw)
+            };
+            // Native layouts are cached by N tile and shared across execution
+            // lanes. Only actual cache creation requests scratch reclamation.
+            if generation > observed.load(Ordering::Relaxed)
+                && observed.fetch_max(generation, Ordering::Relaxed) < generation
+            {
+                b.compression_scratch.store(true, Ordering::Release);
+            }
+        }
         if b.fallbacks.contains(&(self.key, m)) {
             b.fallback_calls += 1;
         }
@@ -1154,6 +1221,7 @@ mod tests {
             cpu_mask: 0,
             tune: false,
             tune_search: false,
+            compress_w8a8: false,
             tune_cache: cache.into(),
             attention_tile: 256,
             vision_dtype: Default::default(),

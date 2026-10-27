@@ -123,6 +123,8 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
 
+可选 `--compress-w8a8` 对所有 W8A8 线性层权重做无损压缩，仅在 tile 体积严格变小时使用压缩存储，详见 [W8A8 权重无损压缩](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md)。
+
 ### 图像输入与MTP
 
 将 `MODEL` 指向包含视觉与 MTP 权重的 Qwen3.5-4B 模型目录。以下使用图文基准中的 K1 配置：

@@ -200,6 +200,9 @@ impl Qwen35 {
                 self.dual_groups += 1;
             }
         }
+        if self.options.compress_w8a8 {
+            crate::npu::release_compression_scratch(&self.backends);
+        }
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
     }
