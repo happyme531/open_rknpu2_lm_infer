@@ -684,15 +684,23 @@ impl BackendInner {
             return Ok(None);
         }
         let (bits, k, n, kt) = key;
-        let prefix = if bits == 4 {
-            format!("d{}-", self.domain_id)
+        let identity = if bits == 4 {
+            let profile = self
+                .material
+                .get(&key)
+                .and_then(|material| material.profile.as_ref())
+                .context("missing W4 tuning profile")?;
+            let fingerprint = unsafe { rk_npu_w4a8_tuning_profile_fingerprint(profile.raw) };
+            // Different weights with the same shape keep separate entries;
+            // moving the same weights to another domain reuses their cache.
+            format!("-fp{fingerprint:016x}")
         } else {
             String::new()
         };
         let path = self
             .options
             .tune_cache
-            .join(format!("{prefix}w{bits}-m{m}-k{k}-n{n}-kt{kt}.tune"));
+            .join(format!("w{bits}-m{m}-k{k}-n{n}-kt{kt}{identity}.tune"));
         Ok(Some(CString::new(path.as_os_str().as_encoded_bytes())?))
     }
     fn w8_partition(&mut self, k: usize, n: usize) -> Result<usize> {
@@ -904,10 +912,7 @@ impl BackendInner {
                 cfg.verbose = 2;
                 let mut hit = 0;
                 let start = std::time::Instant::now();
-                eprintln!(
-                    "Tuning W4: domain={} M={m} K={k} N={n} Ktile={kt}, cache miss",
-                    self.domain_id
-                );
+                eprintln!("Tuning W4: M={m} K={k} N={n} Ktile={kt}, cache miss");
                 self.tune_calls += 1;
                 check(
                     unsafe {
@@ -933,8 +938,8 @@ impl BackendInner {
                 found = true;
             } else if self.options.tune_search {
                 eprintln!(
-                    "Tuning W4: domain={} M={m} K={k} N={n} Ktile={kt}, cache hit ({:.1}us)",
-                    self.domain_id, fastest.base.total_us
+                    "Tuning W4: M={m} K={k} N={n} Ktile={kt}, cache hit ({:.1}us)",
+                    fastest.base.total_us
                 );
             }
         }
