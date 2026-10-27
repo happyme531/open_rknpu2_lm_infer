@@ -30,6 +30,9 @@ pub(crate) struct Stats {
 
 /// Weights are sorted descending and already normalized over selected top-k.
 pub(crate) fn apply(weights: &mut [f32], minimum: f32) {
+    if minimum == 0. {
+        return;
+    }
     for weight in weights.iter_mut().skip(1) {
         if *weight < minimum {
             *weight = 0.;
@@ -38,9 +41,13 @@ pub(crate) fn apply(weights: &mut [f32], minimum: f32) {
 }
 
 impl Stats {
-    pub fn record(&mut self, original: &[f32], retained: &[f32], rows: usize) {
+    pub fn record_unpruned(&mut self, assignments: usize, rows: usize) {
         self.rows += rows as u64;
-        self.assignments += original.len() as u64;
+        self.assignments += assignments as u64;
+    }
+
+    pub fn record(&mut self, original: &[f32], retained: &[f32], rows: usize) {
+        self.record_unpruned(original.len(), rows);
         for (&before, &after) in original.iter().zip(retained) {
             if before > 0. && after == 0. {
                 self.skipped_assignments += 1;
@@ -61,6 +68,11 @@ mod tests {
         assert_eq!(weights, [0.5, 0.25, 0., 0.]);
         let mut stats = Stats::default();
         stats.record(&original, &weights, 1);
+        assert_eq!(stats.skipped_assignments, 2);
+        assert_eq!(stats.dropped_weight, 0.25);
+        stats.record_unpruned(8, 2);
+        assert_eq!(stats.rows, 3);
+        assert_eq!(stats.assignments, 12);
         assert_eq!(stats.skipped_assignments, 2);
         assert_eq!(stats.dropped_weight, 0.25);
         apply(&mut weights, 1.);

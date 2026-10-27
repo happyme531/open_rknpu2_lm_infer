@@ -95,16 +95,32 @@ pub struct Reader {
 }
 impl Reader {
     pub fn new(store: Arc<Store>, timeline: Timeline) -> Result<Self> {
+        Self::start(store, timeline, |builder, task| builder.spawn(task))
+    }
+
+    fn start(
+        store: Arc<Store>,
+        timeline: Timeline,
+        mut spawn: impl FnMut(
+            std::thread::Builder,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self> {
         let record_stride = store.record_stride() as u64;
-        let shared = Shared::default();
-        let mut workers = Vec::new();
+        // Own each worker immediately so a later spawn failure stops and joins it.
+        let mut reader = Self {
+            shared: Shared::default(),
+            workers: Vec::with_capacity(IO_WORKERS + 1),
+            timeline,
+            record_stride,
+        };
         for thread in 1..=IO_WORKERS {
-            let work = shared.clone();
-            let trace = timeline.clone();
+            let work = reader.shared.clone();
+            let trace = reader.timeline.clone();
             let store = store.clone();
-            let worker = std::thread::Builder::new()
-                .name(format!("expert-io-{thread}"))
-                .spawn(move || {
+            let worker = spawn(
+                std::thread::Builder::new().name(format!("expert-io-{thread}")),
+                Box::new(move || {
                     let (lock, wake) = &*work;
                     loop {
                         let (keys, prefetch, generation) = {
@@ -235,22 +251,22 @@ impl Reader {
                         }
                         wake.notify_all();
                     }
-                })?;
-            workers.push(worker);
+                }),
+            )?;
+            reader.workers.push(worker);
         }
-        let work = shared.clone();
-        let trace = timeline.clone();
-        workers.push(std::thread::Builder::new().name("expert-import".into()).spawn(move || {
+        let work = reader.shared.clone();
+        let trace = reader.timeline.clone();
+        reader.workers.push(spawn(std::thread::Builder::new().name("expert-import".into()),Box::new(move || {
             let (lock,wake) = &*work;
             loop {
                 let job = {
                     let mut s = lock.lock().unwrap();
                     while !s.stopped && s.imports.is_empty() { s = wake.wait(s).unwrap(); }
                     if s.stopped { break; }
-                    // Confirmed routes precede speculative imports.
-                    let next = s.imports.iter().position(|job| !s.predictions.contains(&job.key)).unwrap_or(0);
-                    let job = s.imports.remove(next).unwrap();
-                    if s.generation != job.generation || !s.pending.contains(&job.key) {
+                    let job = s.imports.pop_front().unwrap();
+                    if s.generation != job.generation || !s.pending.contains(&job.key)
+                        || !s.staging_requests.contains(&job.key) {
                         publish(&mut s,job.key,job.generation,Ok(Loaded {record:job.record,staged:None}),
                             &trace,3,record_stride);
                         wake.notify_all();
@@ -280,13 +296,8 @@ impl Reader {
                 publish(&mut s,job.key,job.generation,result,&trace,3,record_stride);
                 wake.notify_all();
             }
-        })?);
-        Ok(Self {
-            shared,
-            workers,
-            timeline,
-            record_stride,
-        })
+        }))?);
+        Ok(reader)
     }
     pub fn worker_count(&self) -> usize {
         IO_WORKERS
@@ -334,6 +345,8 @@ impl Reader {
         let wanted: HashSet<_> = experts.iter().map(|&e| (layer, e)).collect();
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();
+        // Staging is opt-in for this demand, not a property of the expert key.
+        s.staging_requests.retain(|key| key.0 != layer);
         let previous = std::mem::take(&mut s.predictions);
         for key in previous {
             if key.0 != layer {
@@ -497,6 +510,7 @@ impl Reader {
         let result = s.ready.remove(&key).unwrap();
         s.pending.remove(&key);
         s.ram_ready.remove(&key);
+        s.staging_requests.remove(&key);
         s.stats.wait_ms += start.elapsed().as_secs_f64() * 1000.;
         self.timeline.span("wait record", 0, start, || {
             json!({"layer":layer,"expert":expert,"wanted":experts,
@@ -581,6 +595,77 @@ impl Drop for Reader {
 mod tests {
     use super::*;
     use crate::model::experts::store::{Geometry, Writer};
+
+    #[test]
+    fn worker_spawn_failure_joins_started_readers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geometry = Geometry {
+            native_version: 1,
+            layers: 1,
+            experts: 1,
+            hidden: 64,
+            intermediate: 64,
+            down_bits: 4,
+        };
+        let mut writer = Writer::create(dir.path(), geometry.clone(), vec![], 4096)?;
+        writer.write(0, 0, &[0; 4096])?;
+        writer.finish()?;
+        let store = Arc::new(Store::open(dir.path(), &geometry, &[], false)?);
+        for fail_at in [2, IO_WORKERS + 1] {
+            let mut attempts = 0;
+            let result = Reader::start(store.clone(), Timeline::default(), |builder, task| {
+                attempts += 1;
+                if attempts == fail_at {
+                    Err(std::io::Error::other("injected worker spawn failure"))
+                } else {
+                    builder.spawn(task)
+                }
+            });
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "injected worker spawn failure"
+            );
+            assert_eq!(attempts, fail_at);
+            // Every started reader owns a Store clone until its thread exits.
+            assert_eq!(Arc::strong_count(&store), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn consuming_a_record_clears_its_staging_request_before_reuse() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let geometry = Geometry {
+            native_version: 1,
+            layers: 1,
+            experts: 1,
+            hidden: 64,
+            intermediate: 64,
+            down_bits: 4,
+        };
+        let mut writer = Writer::create(dir.path(), geometry.clone(), vec![], 4096)?;
+        writer.write(0, 0, &[7; 4096])?;
+        writer.finish()?;
+        let reader = Reader::new(
+            Arc::new(Store::open(dir.path(), &geometry, &[], false)?),
+            Timeline::default(),
+        )?;
+        reader.demand(0, &[0]);
+        reader
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .staging_requests
+            .insert((0, 0));
+        assert_eq!(reader.take(0, 0)?.as_bytes(), &[7; 4096]);
+        assert!(reader.shared.0.lock().unwrap().staging_requests.is_empty());
+        // Appended prefill requests the same evicted expert without staging.
+        reader.demand(0, &[0]);
+        assert!(reader.shared.0.lock().unwrap().staging_requests.is_empty());
+        assert_eq!(reader.take(0, 0)?.as_bytes(), &[7; 4096]);
+        Ok(())
+    }
 
     #[test]
     fn parallel_reads_stay_bounded_across_reset_and_cancellation() -> Result<()> {
@@ -686,6 +771,7 @@ mod tests {
             assert!(s.pending.contains(&(0, 2)));
             s.demand.pop_front();
             s.ready.insert((0, 2), Err("test read failure".into()));
+            s.staging_requests.insert((0, 2));
         }
         assert_eq!(
             reader.try_take_any(0, &[2, 3]).err().unwrap().to_string(),
@@ -693,6 +779,7 @@ mod tests {
         );
         let s = reader.shared.0.lock().unwrap();
         assert!(!s.pending.contains(&(0, 2)));
+        assert!(!s.staging_requests.contains(&(0, 2)));
         assert!(s.pending.contains(&(0, 3)));
         assert_eq!(s.demand, VecDeque::from([(0, 3)]));
         Ok(())
@@ -772,6 +859,7 @@ mod tests {
             }),
         );
         state.in_flight.extend([((0, 1), 0), ((0, 4), 0)]);
+        state.staging_requests.extend([(0, 3), (1, 0)]);
         state.speculative.extend([(0, 2), (0, 5)]);
         let reader = Reader {
             shared: Arc::new((Mutex::new(state), Condvar::new())),
@@ -780,6 +868,10 @@ mod tests {
             record_stride: store.record_stride() as u64,
         };
         reader.demand(0, &[3, 4, 5]);
+        assert_eq!(
+            reader.shared.0.lock().unwrap().staging_requests,
+            HashSet::from([(1, 0)])
+        );
         let stats = reader.stats();
         assert_eq!(stats.predicted_demand, 3);
         assert_eq!(stats.predicted_ready, 1);

@@ -23,6 +23,12 @@ fn minicpm_batched_prefetch_timeline() -> Result<()> {
     run_batches(&[128, 4, 16, 4, 16, 1])
 }
 
+#[test]
+#[ignore = "requires MiniCPM checkpoint, prepared expert store, token windows and RK3588"]
+fn minicpm_prefetch_append_prompt_timeline() -> Result<()> {
+    run_batches(&[128, 4, 16, 32, 4, 32, 1])
+}
+
 fn run_batches(batches: &[usize]) -> Result<()> {
     let _lock = BoardLock::acquire()?;
     let windows: Vec<Vec<u32>> =
@@ -66,10 +72,18 @@ fn run_batches(batches: &[usize]) -> Result<()> {
             .context("expected streaming model")?
             .clone();
         paging.forward_marker(position, tokens.len(), true);
+        let staged_before = paging.stats()["io"]["staged_records"].as_u64().unwrap();
         let start = Instant::now();
         let logits = model.forward(tokens)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
         paging.forward_marker(position, tokens.len(), false);
+        if rows > crate::model::experts::DECODE_BATCH_MAX_ROWS {
+            assert_eq!(
+                paging.stats()["io"]["staged_records"].as_u64().unwrap(),
+                staged_before,
+                "prefill must not stage imports left over from decode"
+            );
+        }
         let top = logits
             .iter()
             .enumerate()

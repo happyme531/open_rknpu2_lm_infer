@@ -216,14 +216,20 @@ impl Routed {
             }
             Ok(())
         })?;
-        let original_weights = weights.clone();
-        for row in weights.chunks_exact_mut(self.top) {
-            pruning::apply(row, self.min_weight);
-        }
-        self.pruning.record(&original_weights, &weights, rows);
-        if rows <= DECODE_BATCH_MAX_ROWS {
-            self.pruning_decode
-                .record(&original_weights, &weights, rows);
+        let original_weights = (self.min_weight > 0.).then(|| weights.clone());
+        if let Some(original) = &original_weights {
+            for row in weights.chunks_exact_mut(self.top) {
+                pruning::apply(row, self.min_weight);
+            }
+            self.pruning.record(original, &weights, rows);
+            if rows <= DECODE_BATCH_MAX_ROWS {
+                self.pruning_decode.record(original, &weights, rows);
+            }
+        } else {
+            self.pruning.record_unpruned(weights.len(), rows);
+            if rows <= DECODE_BATCH_MAX_ROWS {
+                self.pruning_decode.record_unpruned(weights.len(), rows);
+            }
         }
         let request = timings.stage(Phase::Cpu, "target demand bookkeeping", || {
             match &self.experts {
@@ -257,7 +263,7 @@ impl Routed {
                 e.position,
                 e.index,
                 "router_weights_original",
-                &original_weights,
+                original_weights.as_deref().unwrap_or(&weights),
             )?;
             e.trace.save(
                 e.position,
