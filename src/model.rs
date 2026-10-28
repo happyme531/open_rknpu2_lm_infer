@@ -132,6 +132,25 @@ pub trait LanguageModel {
         anyhow::ensure!(start < input.tokens.len(), "empty prepared suffix");
         self.forward_cancellable(&input.tokens[start..], cancelled)
     }
+    /// Observe completed prefill groups without changing their scheduling.
+    fn forward_prepared_with_progress(
+        &mut self,
+        prepared: PreparedPrefill<'_>,
+        cancelled: &std::sync::atomic::AtomicBool,
+        progress: &mut dyn FnMut(crate::progress::ModelProgress),
+    ) -> Result<&[f32]> {
+        let total = prepared.input.tokens.len() - prepared.start;
+        progress(crate::progress::ModelProgress::Prefill {
+            completed: 0,
+            total,
+        });
+        let result = self.forward_prepared(prepared, cancelled)?;
+        progress(crate::progress::ModelProgress::Prefill {
+            completed: total,
+            total,
+        });
+        Ok(result)
+    }
     fn forward_cancellable(
         &mut self,
         tokens: &[u32],

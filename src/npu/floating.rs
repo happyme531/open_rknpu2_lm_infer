@@ -1,6 +1,7 @@
 //! Static floating Linear through the public FP16/BF16 MM ABI. Ordinary calls
 //! load shape profiles; explicit preparation can search complete host calls.
 use super::*;
+use crate::progress::TuningSource;
 #[path = "floating_gelu.rs"]
 mod gelu;
 #[cfg(test)]
@@ -8,6 +9,7 @@ mod gelu;
 mod tests;
 
 struct FloatWork {
+    untuned: bool,
     gelu: Option<Handle<rk_npu_mm_gelu_workspace>>,
     workspace: Handle<rk_npu_mm_tuned_workspace>,
     strategy: rk_npu_mm_strategy,
@@ -20,7 +22,7 @@ pub struct FloatBackend {
     device: Backend,
     dtype: rk_npu_mm_dtype,
     host_type: rk_npu_mm_host_type,
-    decoder: bool,
+    source: TuningSource,
 }
 pub struct FloatLinear {
     weight: Handle<rk_npu_mm_tuned_weights>,
@@ -71,8 +73,16 @@ impl FloatBackend {
     /// distribute independent output channels across the permitted NPU cores.
     pub fn for_decoder(device: Backend) -> Self {
         let mut backend = Self::new(device);
-        backend.decoder = true;
+        backend.source = TuningSource::Dflash;
         backend
+    }
+    pub(crate) fn for_mtp(device: Backend) -> Self {
+        let mut backend = Self::for_decoder(device);
+        backend.source = TuningSource::Mtp;
+        backend
+    }
+    fn is_decoder(&self) -> bool {
+        matches!(self.source, TuningSource::Mtp | TuningSource::Dflash)
     }
     /// Native BF16 arithmetic and resident BF16 weights, with FP32 host IO.
     pub fn bf16(device: Backend) -> Self {
@@ -90,7 +100,7 @@ impl FloatBackend {
             device,
             dtype,
             host_type: RK_NPU_MM_HOST_F32,
-            decoder: false,
+            source: TuningSource::Vision,
         }
     }
     /// Search is controlled by the explicit tune_search option. Ordinary
@@ -111,6 +121,9 @@ impl FloatBackend {
                 && (weight.is_null()
                     || unsafe { rk_npu_mm_tuned_weights_match(weight, &w.strategy) } == 0)
         }) {
+            if works[&(k, n)].untuned && !crate::progress::notice_recorded() {
+                self.report_untuned(rows, k, n);
+            }
             return Ok(());
         }
         let mut b = self.device.0.lock().unwrap();
@@ -166,7 +179,7 @@ impl FloatBackend {
             }
         }
         if found
-            && self.decoder
+            && self.is_decoder()
             && (strategy.options.n_tile > 4096 || (strategy.options.n_tile == 0 && n > 4096))
         {
             // Keep the validated mixed FP16/INT8 recipe even when a
@@ -190,7 +203,7 @@ impl FloatBackend {
             // The library baseline reserves 128 physical rows even for one
             // logical token. Wide auxiliary projections need only their real
             // rows; keeping the tile small also bounds the input CBUF footprint.
-            if self.decoder {
+            if self.is_decoder() {
                 strategy.m_tile = rows.min(32) as i32;
                 let cores = b.options.npu_mask.count_ones() as usize;
                 strategy.options.n_tile =
@@ -205,12 +218,20 @@ impl FloatBackend {
         works.insert(
             (k, n),
             FloatWork {
+                untuned: !found,
                 gelu: None,
                 workspace: Handle::new(raw, rk_npu_mm_tuned_workspace_free, "floating workspace")?,
                 strategy,
             },
         );
+        if !found {
+            crate::progress::untuned(&b.options, "FP16/BF16", rows, k, n, self.source);
+        }
         Ok(())
+    }
+    fn report_untuned(&self, rows: usize, k: usize, n: usize) {
+        let b = self.device.0.lock().unwrap();
+        crate::progress::untuned(&b.options, "FP16/BF16", rows, k, n, self.source);
     }
     /// The currently prepared strategy, including measured complete-call cost.
     pub fn profile(&self, k: usize, n: usize) -> Result<Value> {

@@ -59,14 +59,17 @@ pub struct Qwen35 {
 
 impl Qwen35 {
     fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
-        rows.extend([1, self.options.chunk]);
-        rows.extend(1..=self.speculation_window() + 1);
+        let mut primary_rows = vec![1, self.options.chunk];
+        primary_rows.extend(1..=self.speculation_window() + 1);
+        rows.extend(&primary_rows);
         rows.sort_unstable();
         rows.dedup();
         for backend in self.backends.iter().chain(self.head.backend()) {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
-                backend.prepare(*rows)?;
+                crate::progress::prefill_shape(!primary_rows.contains(rows), || {
+                    backend.prepare(*rows)
+                })?;
             }
         }
         self.work.recurrent.prepare(&rows)?;
@@ -156,7 +159,9 @@ impl Qwen35 {
             ) {
                 let inputs = [(first, None), (second.unwrap_or_default(), None)];
                 let count = if second.is_some() { 2 } else { 1 };
-                self.execute(&inputs[..count], cancelled, false)?;
+                crate::progress::prefill_shape(first.len() != self.options.chunk, || {
+                    self.execute(&inputs[..count], cancelled, false)
+                })?;
                 rows = inputs[count - 1].0.len();
             }
             ensure!(
@@ -340,7 +345,16 @@ impl LanguageModel for Qwen35 {
         prepared: PreparedPrefill<'_>,
         cancelled: &AtomicBool,
     ) -> Result<&[f32]> {
-        self.consume_prepared(prepared, cancelled)?;
+        self.consume_prepared(prepared, cancelled, None)?;
+        Ok(&self.logits)
+    }
+    fn forward_prepared_with_progress(
+        &mut self,
+        prepared: PreparedPrefill<'_>,
+        cancelled: &AtomicBool,
+        progress: &mut dyn FnMut(crate::progress::ModelProgress),
+    ) -> Result<&[f32]> {
+        self.consume_prepared(prepared, cancelled, Some(progress))?;
         Ok(&self.logits)
     }
     fn forward_cancellable(&mut self, tokens: &[u32], cancelled: &AtomicBool) -> Result<&[f32]> {

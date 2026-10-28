@@ -152,6 +152,12 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
 
+`run`、`chat` 和 `serve` 默认显示 prefill 进度、缓存命中 token 数、处理速度及 ETA，并在 decode 时显示近期和平均速度。开启 MTP/DFlash 时，还会显示接受率、平均每轮产出、轮数及 draft/verify 平均耗时。速度按完整模型调用统计，decode 不包含 prefill 产生的首 token；近期速度取最近约一秒的完整轮次。
+
+`run` 的状态写入 stderr，生成正文写入 stdout；`chat` 在独立状态区显示；`serve` 在服务端终端记录状态，HTTP/SSE 格式保持不变。重定向日志使用每五秒一次的纯文本更新，同时记录阶段切换和结束状态。视觉调优同时显示整体 shape 进度和当前 shape 的候选搜索进度。
+
+发现实际使用的 shape 缺少可用调优缓存时，每个进程只提示一次。target、DFlash 和视觉投影提示对应调优命令；MTP 浮点投影会说明当前 CLI 未提供对应调优入口。prefill 尾块及 checkpoint 切分产生的部分块不触发提示；`--no-tune` 主动禁用调优时也不提示。
+
 ### 双 ubatch prefill 调度
 
 使用 `--prefill-ubatches 2`，可以按层流水线重叠执行同一 prompt 的两个物理 ubatch。每个 ubatch 的 token 数仍由 `--ubatch-size` 控制。

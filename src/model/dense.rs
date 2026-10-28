@@ -458,7 +458,12 @@ impl Dense {
         }
         Ok(())
     }
-    fn advance_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<usize> {
+    fn advance_impl(
+        &mut self,
+        tokens: &[u32],
+        cancelled: Option<&AtomicBool>,
+        mut progress: Option<&mut dyn FnMut(crate::progress::ModelProgress)>,
+    ) -> Result<usize> {
         ensure!(
             !tokens.is_empty() && tokens.len() <= self.options.context - self.position,
             "empty input or context capacity exceeded"
@@ -468,6 +473,13 @@ impl Dense {
             "token outside model vocabulary"
         );
         self.reserve(self.position + tokens.len())?;
+        let start = self.position;
+        if let Some(progress) = progress.as_mut() {
+            progress(crate::progress::ModelProgress::Prefill {
+                completed: 0,
+                total: tokens.len(),
+            });
+        }
         let mut last_rows = 0;
         for (first, second) in
             super::prefill::batches(tokens, self.options.chunk, self.options.prefill_ubatches)
@@ -478,8 +490,19 @@ impl Dense {
             );
             let batches = [first, second.unwrap_or_default()];
             let count = if second.is_some() { 2 } else { 1 };
-            self.group(&batches[..count], cancelled)?;
+            crate::progress::prefill_shape(first.len() != self.options.chunk, || {
+                self.group(&batches[..count], cancelled)
+            })?;
             last_rows = batches[count - 1].len();
+            let completed = self.position - start;
+            if completed < tokens.len() {
+                if let Some(progress) = progress.as_mut() {
+                    progress(crate::progress::ModelProgress::Prefill {
+                        completed,
+                        total: tokens.len(),
+                    });
+                }
+            }
         }
         ensure!(
             !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -488,7 +511,7 @@ impl Dense {
         Ok(last_rows)
     }
     fn forward_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<&[f32]> {
-        let last_rows = self.advance_impl(tokens, cancelled)?;
+        let last_rows = self.advance_impl(tokens, cancelled, None)?;
         self.output_head(last_rows)?;
         Ok(&self.logits)
     }
@@ -556,9 +579,13 @@ impl LanguageModel for Dense {
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
             backend.prepare(1)?;
-            backend.prepare(prompt_tokens.min(self.options.chunk))?;
+            crate::progress::prefill_shape(prompt_tokens < self.options.chunk, || {
+                backend.prepare(prompt_tokens.min(self.options.chunk))
+            })?;
             if !prompt_tokens.is_multiple_of(self.options.chunk) {
-                backend.prepare(prompt_tokens % self.options.chunk)?;
+                crate::progress::prefill_shape(true, || {
+                    backend.prepare(prompt_tokens % self.options.chunk)
+                })?;
             }
         }
         if let Some(secondary) = &self.secondary {
@@ -581,13 +608,32 @@ impl LanguageModel for Dense {
         Ok(())
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
-        self.advance_impl(tokens, None).map(|_| ())
+        self.advance_impl(tokens, None, None).map(|_| ())
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         self.forward_impl(tokens, None)
     }
     fn forward_cancellable(&mut self, tokens: &[u32], cancelled: &AtomicBool) -> Result<&[f32]> {
         self.forward_impl(tokens, Some(cancelled))
+    }
+    fn forward_prepared_with_progress(
+        &mut self,
+        prepared: crate::model::PreparedPrefill<'_>,
+        cancelled: &AtomicBool,
+        progress: &mut dyn FnMut(crate::progress::ModelProgress),
+    ) -> Result<&[f32]> {
+        ensure!(
+            prepared.input.images.is_empty(),
+            "this model does not support images"
+        );
+        let tokens = &prepared.input.tokens[prepared.start..];
+        let rows = self.advance_impl(tokens, Some(cancelled), Some(&mut *progress))?;
+        self.output_head(rows)?;
+        progress(crate::progress::ModelProgress::Prefill {
+            completed: tokens.len(),
+            total: tokens.len(),
+        });
+        Ok(&self.logits)
     }
     fn position(&self) -> usize {
         self.position

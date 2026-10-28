@@ -1,5 +1,6 @@
 use crate::{
     model::{self, LanguageModel, ModelInfo, ModelOptions},
+    progress::{DecodeProgress, GenerationProgress, Phase, Reporter},
     sampling::Sampler,
     text::{OutputDecoder, StopFilter, TextCodec},
 };
@@ -13,7 +14,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 mod context;
 #[cfg(test)]
 mod tests;
@@ -40,6 +41,7 @@ struct EngineInner {
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     user_boundaries: bool,
+    progress: watch::Sender<GenerationProgress>,
 }
 
 impl Drop for EngineInner {
@@ -78,9 +80,17 @@ impl Engine {
         let worker_active = active.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
+        let (progress, _) = watch::channel(GenerationProgress::default());
+        let worker_progress = progress.clone();
+        let speculation = if options.speculation.window() > 0 {
+            options.speculation.kind.as_str()
+        } else {
+            "none"
+        };
         let worker = thread::Builder::new()
             .name("rknpu-inference".into())
             .spawn(move || {
+                let mut progress = Reporter::new(worker_progress, speculation);
                 let loaded = (|| -> Result<_> {
                     let chunk = options.chunk;
                     let mut options = options;
@@ -99,6 +109,7 @@ impl Engine {
                 if let Ok(mut latest) = worker_stats.write() {
                     *latest = model.stats();
                 }
+                progress.phase(Phase::Ready);
                 if ready_tx
                     .send(Ok((model.info().clone(), model.uses_user_boundaries())))
                     .is_err()
@@ -120,8 +131,14 @@ impl Engine {
                         &job,
                         &mut cache,
                         cache_prompt,
+                        &mut progress,
                     );
                     if let Err(error) = outcome {
+                        progress.phase(if job.cancel.load(Ordering::Relaxed) {
+                            Phase::Cancelled
+                        } else {
+                            Phase::Error
+                        });
                         let _ = model.reset();
                         cache.clear();
                         if !job.cancel.load(Ordering::Relaxed) {
@@ -149,6 +166,7 @@ impl Engine {
                 shutdown,
                 worker: Some(worker),
                 user_boundaries,
+                progress,
             }),
         })
     }
@@ -162,6 +180,11 @@ impl Engine {
             .read()
             .map(|v| v.clone())
             .unwrap_or(Value::Null)
+    }
+    /// Latest active-request status; subscribers need not drain every update.
+    /// Clone snapshots before doing IO so the watch read lock stays short.
+    pub fn subscribe_progress(&self) -> watch::Receiver<GenerationProgress> {
+        self.inner.progress.subscribe()
     }
     pub fn tokenize(&self, prompt: &Prompt) -> Result<Vec<u32>> {
         Ok(self.inner.codec.prepare(prompt, false)?.tokens)
@@ -251,8 +274,10 @@ fn run_generation(
     job: &Job,
     cache: &mut PrefixCache,
     cache_prompt: bool,
+    progress: &mut Reporter,
 ) -> Result<()> {
     let start = Instant::now();
+    progress.begin(job.input.tokens.len());
     let queue_ms = job.queued.elapsed().as_secs_f64() * 1000.0;
     let common_prefix_tokens = if job.request.cache_prompt.unwrap_or(cache_prompt) {
         cache.reusable(&job.input, model.position())
@@ -277,6 +302,7 @@ fn run_generation(
         cache.clear();
     }
     let cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.;
+    progress.state.cached_tokens = cached_tokens;
     let prepare_start = Instant::now();
     model.reserve(job.input.tokens.len() + job.request.max_tokens)?;
     let prepared = model.prepare_prepared(&job.input, cached_tokens)?;
@@ -285,7 +311,11 @@ fn run_generation(
     cache.logits.clear();
     cache
         .logits
-        .extend_from_slice(model.forward_prepared(prepared, &job.cancel)?);
+        .extend_from_slice(model.forward_prepared_with_progress(
+            prepared,
+            &job.cancel,
+            &mut |update| progress.model(update),
+        )?);
     cache.extend_input(&job.input, cached_tokens);
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let mut sampler = Sampler::new(
@@ -318,6 +348,7 @@ fn run_generation(
     let mut replay_rows = 0;
     let mut repair_rows = 0;
     let mut events = Vec::new();
+    progress.decoding();
     while generated < job.request.max_tokens {
         ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
         let call = Instant::now();
@@ -407,6 +438,18 @@ fn run_generation(
         if generated > emitted {
             decode_model_ms += call.elapsed().as_secs_f64() * 1000.;
         }
+        progress.decode(DecodeProgress {
+            generated,
+            consumed: consumed_tokens,
+            model_ms: decode_model_ms,
+            rounds: spec_rounds,
+            proposed,
+            accepted,
+            draft_ms,
+            verify_ms,
+            confidence_stops,
+            ..Default::default()
+        });
         for output in events.drain(..) {
             text.push_str(&output);
             if ttft_ms.is_none() {
@@ -464,5 +507,6 @@ fn run_generation(
         weight_profile_creations = %result.stats["weight_profile_creations"],
         strategy_fallback_calls = %result.stats["strategy_fallback_calls"],
         strategy_fallbacks = %result.stats["strategy_fallbacks"], "generation finished");
+    progress.phase(Phase::Finished);
     send_event(job, GenerationEvent::Finished(result))
 }

@@ -258,13 +258,37 @@ fn run_with_sampling(
         queued: Instant::now(),
     };
     let mut cache = PrefixCache::default();
-    run_generation(model, codec, &job, &mut cache, true)?;
+    let mut progress = Reporter::default();
+    run_generation(model, codec, &job, &mut cache, true, &mut progress)?;
+    assert_eq!(progress.state.phase, Phase::Finished);
+    assert_eq!(
+        progress.state.decode.generated,
+        progress.state.decode.consumed + usize::from(max_tokens > 0)
+    );
     assert_eq!(cache.rows_len(), model.position());
     let mut stream = String::new();
     while let Ok(event) = receiver.try_recv() {
         match event {
             GenerationEvent::Token(s) => stream.push_str(&s),
-            GenerationEvent::Finished(result) => return Ok((result, stream)),
+            GenerationEvent::Finished(result) => {
+                assert_eq!(
+                    progress.state.decode.proposed as u64,
+                    result.timings["spec_proposed"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    progress.state.decode.accepted as u64,
+                    result.timings["spec_accepted"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    progress.state.decode.rounds as u64,
+                    result.timings["spec_rounds"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    progress.state.decode.average_tokens_per_second,
+                    result.timings["decode_tokens_per_second"].as_f64()
+                );
+                return Ok((result, stream));
+            }
             GenerationEvent::Error(e) => panic!("{e}"),
         }
     }
@@ -315,7 +339,14 @@ fn cache_prompt_default_and_request_override_control_real_prefix_reuse() -> Resu
                     cancel: Arc::new(AtomicBool::new(false)),
                     queued: Instant::now(),
                 };
-                run_generation(&mut model, &codec, &job, &mut cache, default)?;
+                run_generation(
+                    &mut model,
+                    &codec,
+                    &job,
+                    &mut cache,
+                    default,
+                    &mut Reporter::default(),
+                )?;
                 assert_eq!(
                     model.tokens, tokens,
                     "cache policy must preserve model state"
@@ -468,7 +499,17 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
     };
     let mut model = Model::new(4, 4, 40);
     model.fail_commit = true;
-    assert!(run_generation(&mut model, &codec, &job, &mut PrefixCache::default(), true).is_err());
+    assert!(
+        run_generation(
+            &mut model,
+            &codec,
+            &job,
+            &mut PrefixCache::default(),
+            true,
+            &mut Reporter::default()
+        )
+        .is_err()
+    );
     let mut published = 0;
     while let Ok(event) = receiver.try_recv() {
         assert!(matches!(event, GenerationEvent::Token(_)));

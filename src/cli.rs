@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     path::PathBuf,
 };
 
@@ -664,6 +664,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 }
             };
             let engine = Engine::start(options)?;
+            let mut progress = engine.subscribe_progress();
+            let mut display = crate::progress::TerminalProgress::new(true);
+            let initial = progress.borrow_and_update().clone();
+            display.update(&initial, true)?;
             let mut handle = engine.generate(GenerationRequest {
                 prompt,
                 cache_prompt: None,
@@ -675,11 +679,26 @@ pub async fn execute(cli: Cli) -> Result<()> {
             tokio::pin!(interrupted);
             loop {
                 tokio::select! {
-                    _=&mut interrupted => { handle.cancel.store(true,std::sync::atomic::Ordering::Relaxed); eprintln!("\nCancelled"); break; }
+                    _=&mut interrupted => {
+                        handle.cancel.store(true,std::sync::atomic::Ordering::Relaxed);
+                        let mut state = progress.borrow().clone();
+                        state.phase = crate::progress::Phase::Cancelled;
+                        display.finish(&state)?;
+                        break;
+                    }
+                    changed=progress.changed() => {
+                        if changed.is_ok() {
+                            let state = progress.borrow_and_update().clone();
+                            // Drain queued text before committing the final status rows.
+                            if !matches!(state.phase, crate::progress::Phase::Finished | crate::progress::Phase::Cancelled | crate::progress::Phase::Error) {
+                                display.update(&state, false)?;
+                            }
+                        }
+                    }
                     event=handle.events.recv() => match event {
-                        Some(GenerationEvent::Token(text)) => { print!("{text}"); io::stdout().flush()?; }
-                        Some(GenerationEvent::Finished(result)) => { println!(); if stats { eprintln!("{}",serde_json::to_string_pretty(&serde_json::json!({"prompt_tokens":result.prompt_tokens,"completion_tokens":result.completion_tokens,"cached_tokens":result.cached_tokens,"finish_reason":result.finish_reason,"timings":result.timings,"stats":result.stats}))?); } break; }
-                        Some(GenerationEvent::Error(message)) => bail!("{message}"),
+                        Some(GenerationEvent::Token(text)) => { display.token(&text)?; }
+                        Some(GenerationEvent::Finished(result)) => { let state = progress.borrow().clone(); display.finish(&state)?; println!(); if stats { eprintln!("{}",serde_json::to_string_pretty(&serde_json::json!({"prompt_tokens":result.prompt_tokens,"completion_tokens":result.completion_tokens,"cached_tokens":result.cached_tokens,"finish_reason":result.finish_reason,"timings":result.timings,"stats":result.stats}))?); } break; }
+                        Some(GenerationEvent::Error(message)) => { let state = progress.borrow().clone(); display.finish(&state)?; bail!("{message}"); }
                         None => bail!("generation ended without a result"),
                     }
                 }
@@ -710,7 +729,22 @@ pub async fn execute(cli: Cli) -> Result<()> {
             ..
         } => {
             let engine = Engine::start_with_cache_prompt(options, cache_prompt)?;
-            crate::api::serve_with_parser(engine, &host, port, api_key, tool_call_parser).await?;
+            let mut progress = engine.subscribe_progress();
+            let display = tokio::spawn(async move {
+                let mut display = crate::progress::TerminalProgress::new(false);
+                let initial = progress.borrow_and_update().clone();
+                display.update(&initial, true)?;
+                while progress.changed().await.is_ok() {
+                    let state = progress.borrow_and_update().clone();
+                    display.update(&state, false)?;
+                }
+                Ok::<_, io::Error>(())
+            });
+            let result =
+                crate::api::serve_with_parser(engine, &host, port, api_key, tool_call_parser).await;
+            display.abort();
+            let _ = display.await;
+            result?;
         }
         Command::Bench(args) => crate::bench::run(
             options,

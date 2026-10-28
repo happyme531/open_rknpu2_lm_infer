@@ -31,7 +31,7 @@ impl Predictor {
         )?;
         cache.reserve(options.context)?;
         // Preserve all supplied BF16 values; FP16 GEMM uses FP32 host buffers.
-        let backend = FloatBackend::for_decoder(device.clone());
+        let backend = FloatBackend::for_mtp(device.clone());
         let (h, f, q, kv) = (
             c.hidden_size,
             c.intermediate_size,

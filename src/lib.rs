@@ -8,6 +8,7 @@ pub mod model;
 pub mod npu;
 pub mod ops;
 pub mod ppl;
+pub mod progress;
 pub mod sampling;
 pub mod speculative;
 pub mod text;

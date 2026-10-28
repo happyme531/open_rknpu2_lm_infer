@@ -67,6 +67,14 @@ fn wrap_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 impl Conversation {
+    fn notice(&mut self, message: String) {
+        let index = if self.active.is_some() {
+            self.transcript.len().saturating_sub(1)
+        } else {
+            self.transcript.len()
+        };
+        self.transcript.insert(index, ("Warning".into(), message));
+    }
     fn reset(&mut self, system: &Option<String>) {
         self.active.take();
         self.messages.clear();
@@ -230,9 +238,17 @@ pub async fn chat(
         follow: true,
     };
     app.reset(&system);
+    let mut progress = engine.subscribe_progress();
+    if let Some(message) = crate::progress::take_notice() {
+        app.notice(message);
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(40));
     loop {
         app.receive();
+        if let Some(message) = crate::progress::take_notice() {
+            app.notice(message);
+        }
+        let state = progress.borrow_and_update().clone();
         terminal.draw(|frame| {
             let area = frame.area();
             let input_width = area.width.saturating_sub(2).max(1) as usize;
@@ -246,9 +262,31 @@ pub async fn chat(
             let input_height = (input_lines.len().min(u16::MAX as usize) as u16)
                 .saturating_add(2)
                 .clamp(3, (area.height / 3).max(3));
+            let status_lines: Vec<_> = if app.active.is_some()
+                || (app.status != "Ready"
+                    && matches!(
+                        state.phase,
+                        crate::progress::Phase::Finished
+                            | crate::progress::Phase::Cancelled
+                            | crate::progress::Phase::Error
+                    )) {
+                state
+                    .lines()
+                    .iter()
+                    .flat_map(|line| wrap_lines(line, area.width.max(1) as usize))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let panes = Layout::vertical([
                 Constraint::Length(2),
                 Constraint::Min(1),
+                Constraint::Length(
+                    status_lines
+                        .len()
+                        .min(area.height.saturating_sub(input_height + 4) as usize)
+                        as u16,
+                ),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
@@ -281,7 +319,9 @@ pub async fn chat(
                 lines.push(Line::styled(
                     role.to_string(),
                     Style::default()
-                        .fg(if role == "You" {
+                        .fg(if role == "Warning" {
+                            Color::Yellow
+                        } else if role == "You" {
                             Color::Green
                         } else {
                             Color::Cyan
@@ -314,7 +354,7 @@ pub async fn chat(
             let row = input_lines.len().saturating_sub(1);
             let input_scroll = input_lines
                 .len()
-                .saturating_sub(panes[2].height.saturating_sub(2) as usize);
+                .saturating_sub(panes[3].height.saturating_sub(2) as usize);
             frame.render_widget(
                 Paragraph::new(Text::from(input_lines))
                     .block(
@@ -324,6 +364,10 @@ pub async fn chat(
                             .border_style(Style::default().fg(Color::Cyan)),
                     )
                     .scroll((input_scroll.min(u16::MAX as usize) as u16, 0)),
+                panes[3],
+            );
+            frame.render_widget(
+                Paragraph::new(Text::from(status_lines)).style(Style::default().fg(Color::Cyan)),
                 panes[2],
             );
             let footer = format!(
@@ -332,16 +376,16 @@ pub async fn chat(
             );
             frame.render_widget(
                 Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-                panes[3],
+                panes[4],
             );
-            if panes[2].width > 2 && panes[2].height > 2 {
+            if panes[3].width > 2 && panes[3].height > 2 {
                 frame.set_cursor_position((
-                    panes[2].x + 1 + (column % panes[2].width.saturating_sub(2) as usize) as u16,
-                    panes[2].y
+                    panes[3].x + 1 + (column % panes[3].width.saturating_sub(2) as usize) as u16,
+                    panes[3].y
                         + 1
                         + (row
                             .saturating_sub(input_scroll)
-                            .min((panes[2].height - 3) as usize) as u16),
+                            .min((panes[3].height - 3) as usize) as u16),
                 ));
             }
         })?;

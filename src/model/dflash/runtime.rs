@@ -161,7 +161,9 @@ impl DFlash {
             rows.dedup();
             for m in rows {
                 for (k, n) in [(h, kv), (fc_k, h)] {
-                    b.prepare(k, n, m)?;
+                    crate::progress::prefill_shape(m != self.chunk && m > max_draft + 1, || {
+                        b.prepare(k, n, m)
+                    })?;
                 }
             }
         }

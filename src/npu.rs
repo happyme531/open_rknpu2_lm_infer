@@ -1064,6 +1064,16 @@ impl BackendInner {
             }
             self.work.insert(wk, work);
         }
+        if self.fallbacks.contains(&wk) {
+            crate::progress::untuned(
+                &self.options,
+                if key.0 == 4 { "W4" } else { "W8" },
+                m,
+                key.1,
+                key.2,
+                crate::progress::TuningSource::Target,
+            );
+        }
         Ok(self.work.get_mut(&wk).unwrap())
     }
 
@@ -1209,6 +1219,46 @@ impl Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires exclusive RK3588 NPU access and a fresh test process"]
+    fn untuned_tail_is_silent_until_regular_shape() -> Result<()> {
+        let _lock = crate::validation::BoardLock::acquire()?;
+        let cache = tempfile::tempdir()?;
+        let mut options = options(cache.path())?;
+        options.tune = true;
+        let matrix = || QuantMatrix {
+            bits: 8,
+            k: 128,
+            n: 128,
+            codes: vec![1; 128 * 128],
+            scales: vec![0.01; 128],
+        };
+        {
+            let mut search = options.clone();
+            search.tune_search = true;
+            let tuner = Backend::new(&search, 0)?;
+            let _linear = tuner.load(matrix(), None)?;
+        }
+        // Reuse tuned decode, leaving the new main batch and its tail untuned.
+        options.chunk = 128;
+        let backend = Backend::new(&options, 0)?;
+        let _linear = backend.load(matrix(), None)?;
+        // K-partition candidate cache misses are not selected workspaces.
+        assert!(!crate::progress::notice_recorded());
+        crate::progress::prefill_shape(true, || backend.prepare(17))?;
+        assert!(crate::progress::take_notice().is_none());
+        backend.prepare(128)?;
+        let notice = crate::progress::take_notice().expect("main prefill cache miss");
+        assert!(notice.contains("W8 M=128 K=128 N=128"));
+        assert!(notice.contains(&format!("--tune-cache {:?}", cache.path())));
+        eprintln!("{notice}");
+        let second = Backend::new(&options, 1)?;
+        let _linear = second.load(matrix(), None)?;
+        second.prepare(128)?;
+        assert!(crate::progress::take_notice().is_none());
+        Ok(())
+    }
 
     fn options(cache: &std::path::Path) -> Result<ModelOptions> {
         let mut options = ModelOptions {

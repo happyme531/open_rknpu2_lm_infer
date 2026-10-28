@@ -155,6 +155,12 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
 
+`run`, `chat`, and `serve` show prefill progress, cached token counts, throughput, and ETA by default, followed by recent and average decode speed. With MTP/DFlash enabled, the display also includes acceptance, tokens per round, round count, and average draft/verify time. Throughput measures complete model calls; decode excludes the first token produced by prefill. Recent speed uses complete rounds from roughly the last second.
+
+`run` writes status to stderr and generated text to stdout; `chat` uses a separate status area. `serve` logs progress on the server, preserving the HTTP/SSE response format. Redirected logs use plain text at five-second intervals, plus phase transitions and completion. Vision tuning shows overall shape progress alongside the native candidate search progress.
+
+A shape used without an applicable tuning profile triggers one notice per process. Target, DFlash, and vision projections include a tuning command; MTP floating projections identify the missing CLI tuning support. Partial prefill batches, including checkpoint splits, do not trigger the notice. Explicit `--no-tune` also suppresses it.
+
 ### Dual Ubatch Prefill Scheduling
 
 Use `--prefill-ubatches 2` to overlap two physical ubatches from the same prompt in a layer-wise pipeline. The number of tokens in each ubatch is still controlled by `--ubatch-size`.

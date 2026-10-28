@@ -103,21 +103,33 @@ fn vision_profiles(mut options: ModelOptions, images: Vec<PathBuf>) -> Result<Va
         VisionDtype::Fp32 => FloatBackend::new(device.clone()),
     };
     let mut profiles = Vec::new();
+    let started = Instant::now();
     for (index, shape) in shapes.iter().enumerate() {
         eprintln!(
-            "Vision {}/{}: {} M={} K={} N={}",
-            index + 1,
+            "Vision {} {}/{} · current {}: {} M={} K={} N={} · elapsed {:.1}s · ETA {}",
+            crate::progress::bar(index, shapes.len()),
+            index,
             shapes.len(),
+            index + 1,
             shape.name,
             shape.rows,
             shape.k,
-            shape.n
+            shape.n,
+            started.elapsed().as_secs_f64(),
+            crate::progress::eta(index, shapes.len(), started.elapsed().as_secs_f64()),
         );
         backend.prepare(shape.k, shape.n, shape.rows)?;
         let mut profile = backend.profile(shape.k, shape.n)?;
         profile["projection"] = json!(shape.name);
         profiles.push(profile);
     }
+    eprintln!(
+        "Vision {} {}/{} (100%) · elapsed {:.1}s · ETA 0.0s",
+        crate::progress::bar(shapes.len(), shapes.len()),
+        shapes.len(),
+        shapes.len(),
+        started.elapsed().as_secs_f64()
+    );
     Ok(
         json!({"mode":"vision", "vision_dtype":options.vision_dtype.as_str(),
         "rows":rows, "images":inputs, "profiles":profiles, "stats":device.stats()}),

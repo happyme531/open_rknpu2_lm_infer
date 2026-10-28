@@ -14,6 +14,7 @@ impl Qwen35 {
         &mut self,
         prepared: PreparedPrefill<'_>,
         cancel: &AtomicBool,
+        mut progress: Option<&mut dyn FnMut(crate::progress::ModelProgress)>,
     ) -> Result<()> {
         let PreparedPrefill {
             input,
@@ -44,7 +45,14 @@ impl Qwen35 {
         self.reserve(input.tokens.len())?;
         let result = (|| {
             let mut features = Vec::new();
-            for span in input.images.iter().filter(|s| s.end() > start) {
+            let images = input.images.iter().filter(|s| s.end() > start).count();
+            for (index, span) in input.images.iter().filter(|s| s.end() > start).enumerate() {
+                if let Some(progress) = progress.as_mut() {
+                    progress(crate::progress::ModelProgress::Vision {
+                        completed: index,
+                        total: images,
+                    });
+                }
                 ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
                 if self.vision.is_none() {
                     let domain = 14u32
@@ -69,6 +77,12 @@ impl Qwen35 {
                 features.push((span.start, feature));
             }
             let mut rows = 0;
+            if let Some(progress) = progress.as_mut() {
+                progress(crate::progress::ModelProgress::Prefill {
+                    completed: 0,
+                    total: input.tokens.len() - start,
+                });
+            }
             self.prefix_cache.begin_request();
             for group in crate::model::prefill::groups(
                 &steps,
@@ -88,12 +102,29 @@ impl Qwen35 {
                         }),
                     );
                 }
-                self.execute(&inputs[..group.len()], Some(cancel), false)?;
+                crate::progress::prefill_shape(group[0].range.len() != self.options.chunk, || {
+                    self.execute(&inputs[..group.len()], Some(cancel), false)
+                })?;
                 rows = group.last().unwrap().range.len();
+                let completed = group.last().unwrap().range.end - start;
+                let total = input.tokens.len() - start;
+                if completed < total {
+                    if let Some(progress) = progress.as_mut() {
+                        progress(crate::progress::ModelProgress::Prefill { completed, total });
+                    }
+                }
             }
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
             self.next_rope_position = input.next_position;
-            self.output_head(rows)
+            self.output_head(rows)?;
+            if let Some(progress) = progress.as_mut() {
+                let total = input.tokens.len() - start;
+                progress(crate::progress::ModelProgress::Prefill {
+                    completed: total,
+                    total,
+                });
+            }
+            Ok(())
         })();
         if result.is_err() {
             self.reset()?;

@@ -242,7 +242,9 @@ impl Predictor {
         }
         rope.extend_from_slice(&positions[..rows - 1]);
         if rows > skip {
-            self.prefill_kv(c, &shifted, &embeddings[skip * h..], &rope)?;
+            crate::progress::prefill_shape(skip > 0, || {
+                self.prefill_kv(c, &shifted, &embeddings[skip * h..], &rope)
+            })?;
         }
         self.seed.clear();
         self.seed.extend_from_slice(&target[(rows - 1) * h..]);

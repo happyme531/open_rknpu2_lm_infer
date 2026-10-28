@@ -1,0 +1,4 @@
+The river flows through a quiet valley beneath mountains covered with snow.
+The streamed answer keeps its spaces and line breaks while the status moves below it.
+
+Accepted tokens and draft timing stay in the separate status area.
