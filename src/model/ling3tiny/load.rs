@@ -64,6 +64,10 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
     let raw = serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     let config = Config::parse(&raw)?;
     ensure!(
+        options.experts.min_weight == 0.,
+        "Ling3tiny does not support expert-min-weight; use 0"
+    );
+    ensure!(
         options.context <= config.max_context && options.context > 0,
         "Ling context exceeds model/runtime limit"
     );
@@ -235,4 +239,37 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         forward_ms: 0.,
         head_ms: 0.,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn unsupported_pruning_is_rejected_before_weights_or_device_setup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("config.json"),
+            include_str!("../../../tests/fixtures/ling3tiny/config.json"),
+        )?;
+        let cli = crate::cli::Cli::try_parse_from([
+            crate::PROJECT_NAME,
+            "--model",
+            directory.path().to_str().unwrap(),
+            "run",
+            "--expert-min-weight",
+            "0.05",
+        ])?;
+        let error = match Ling3Tiny::load(cli.model.options()?) {
+            Ok(_) => anyhow::bail!("unsupported Ling pruning was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not support expert-min-weight")
+        );
+        Ok(())
+    }
 }
