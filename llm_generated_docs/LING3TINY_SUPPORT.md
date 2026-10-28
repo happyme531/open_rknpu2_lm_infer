@@ -488,3 +488,9 @@ Workspace 准备仅保留实际 prefill 计划的行数，并为量化/TF32 back
 新增单元回归覆盖 history 地址/容量保持、kernel=1、2048 通道、恢复后的连续计算，以及同长度异维度快照拒绝。板端回归增加计划首批 20 行与短重放 4 行的检查，直接核对每个 FP16 workspace 的逻辑行数与句柄，要求执行后保持同一 workspace。总 backend fallback 计数包含量化投影首次建策略，不用它代替 FP16 workspace 的观测。
 
 验证：最终主机默认 155 项、板端 Ling-only Release 118 项自动测试及严格 Release Clippy 通过；resident/streaming 两种真实权重回归均通过 20/4 行 workspace 行数与句柄保持断言，完整 logits 逐位一致。两次 runner 均 exit_code=0、restore_errors=[]。观测方法限定为 cfg(test)，当前板端编译源码与主机 333 份源码/fixture 哈希一致。最终汇总为 `results/ling-ssm-review-20261025/validation-summary.json`。
+
+## 2026-10-28：统一工作区与模型级 scratch
+
+Ling 与其他 decoder 共用实际行数规划及 prefill/decode 阶段切换，进入 decode 时释放多行量化和 TF32 工作区。mixer、FFN、router 与输出头的临时 host 缓冲按模型复用；KDA、卷积和 MLA KV 继续逐层持有，MLA 的 FP16 打包缓冲也复用容量。`cpu_scratch_bytes` 单独记录 host 临时缓冲。
+
+Ling 当前不支持 `--expert-min-weight` 非零值，加载时直接报错；默认值 0 保持原计算。resident/streaming 的真实模型回归均通过完整 logits/state 和 20/4 行 FP16 workspace 句柄检查。修改与验证口径见[通用优化补齐记录](MODEL_RUNTIME_OPTIMIZATIONS_20261028.md)。
