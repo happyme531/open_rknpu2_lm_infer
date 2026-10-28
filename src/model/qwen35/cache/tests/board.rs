@@ -147,8 +147,11 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         restored,
         model.prefix_cache.bytes()
     );
-    planned_tail_workspaces_survive_prefill(&mut model, &cancel)?;
-    for cpu in [false, true] {
+    let npu_gdn = model.stats()["gdn_npu_workspace_rows"].is_array();
+    if npu_gdn {
+        planned_tail_workspaces_survive_prefill(&mut model, &cancel)?;
+    }
+    for cpu in [false, true].into_iter().filter(|cpu| npu_gdn || *cpu) {
         if cpu {
             model.work.recurrent = crate::layers::gated_delta::Scratch::default();
         }
@@ -182,21 +185,26 @@ fn planned_tail_workspaces_survive_prefill(model: &mut Qwen35, cancel: &AtomicBo
         let after = model.stats();
         assert!(after["gdn_npu_calls"].as_u64().unwrap() > 0);
         assert_eq!(after["gdn_npu_workspace_creations"], creations);
-        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!(expected));
-        eprintln!("planned GDN workspaces PASS rows={expected:?} prefill_creations=0");
+        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
+        eprintln!(
+            "planned GDN workspaces PASS rows={expected:?} prefill_creations=0 released_on_decode=true"
+        );
     }
-    // A standalone call outside a prepared plan retains the original bounded
-    // full-window plus single-tail policy.
-    model.forward(&[1; 20])?;
-    assert_eq!(
-        model.stats()["gdn_npu_workspace_rows"],
-        serde_json::json!([20, 128])
-    );
-    model.forward(&[1; 74])?;
-    assert_eq!(
-        model.stats()["gdn_npu_workspace_rows"],
-        serde_json::json!([74, 128])
-    );
+    // Short standalone prompts prepare only their actual rows, then release
+    // their NPU GDN scratch when projecting the last row for generation.
+    for rows in [20, 74] {
+        model.reset()?;
+        model.prepare(rows)?;
+        let before = model.stats();
+        assert_eq!(before["gdn_npu_workspace_rows"], serde_json::json!([rows]));
+        model.forward(&vec![1; rows])?;
+        let after = model.stats();
+        assert_eq!(
+            after["gdn_npu_workspace_creations"],
+            before["gdn_npu_workspace_creations"]
+        );
+        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
+    }
     Ok(())
 }
 

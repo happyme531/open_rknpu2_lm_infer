@@ -378,7 +378,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         mtp: None,
         features: Default::default(),
         dflash: None,
-        decode_prepared: false,
+        workspaces: Default::default(),
         prefix_cache,
     })
 }

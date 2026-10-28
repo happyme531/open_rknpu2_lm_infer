@@ -4,6 +4,8 @@ use std::time::Instant;
 
 impl Dense {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
+        self.workspaces
+            .enter_decode(self.backends.iter().chain(self.head.backend()), &[1])?;
         let start = Instant::now();
         self.cpu.norm(
             &self.hidden[(rows - 1) * self.h..rows * self.h],

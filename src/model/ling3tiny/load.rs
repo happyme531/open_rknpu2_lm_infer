@@ -238,6 +238,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         load_ms: start.elapsed().as_secs_f64() * 1000.,
         forward_ms: 0.,
         head_ms: 0.,
+        workspaces: Default::default(),
     })
 }
 

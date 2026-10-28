@@ -92,6 +92,7 @@ pub struct Dense {
     residual_multiplier: f32,
     logits_scaling: f32,
     timings: Timings,
+    workspaces: super::workspace::Workspaces,
 }
 
 impl Dense {
@@ -381,6 +382,7 @@ impl Dense {
             d,
             position: 0,
             reserved_tokens,
+            workspaces: Default::default(),
             epsilon,
             embedding_multiplier,
             residual_multiplier,
@@ -397,6 +399,9 @@ impl Dense {
     }
 
     fn chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.len() > 1 {
+            self.workspaces.reset();
+        }
         let rows = tokens.len();
         let h = self.h;
         let d = self.d;
@@ -583,6 +588,7 @@ impl LanguageModel for Dense {
             layer.attention.reset()?;
         }
         self.position = 0;
+        self.workspaces.reset();
         self.timings.linear = 0.0;
         self.timings.attention = 0.0;
         self.timings.cpu = 0.0;
@@ -626,21 +632,16 @@ impl LanguageModel for Dense {
             .chain(self.head.backend())
             .map(Backend::tune_operations)
             .sum();
-        let mut rows = vec![1, self.options.chunk];
-        if !prompt_tokens.is_multiple_of(self.options.chunk) {
-            rows.push(prompt_tokens % self.options.chunk);
-        }
-        rows.sort_unstable();
-        rows.dedup();
+        let mut rows = super::workspace::physical_rows([prompt_tokens], self.options.chunk);
+        self.workspaces.prepare(&mut rows, &[1]);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
-            backend.prepare(1)?;
-            backend.prepare(prompt_tokens.min(self.options.chunk))?;
-            if !prompt_tokens.is_multiple_of(self.options.chunk) {
-                backend.prepare(prompt_tokens % self.options.chunk)?;
+            for &rows in &rows {
+                backend.prepare(rows)?;
             }
         }
         if let Some(head) = self.head.backend() {
+            head.retain_workspaces(&[1])?;
             head.prepare(1)?;
         }
         self.timings.prepare += elapsed(start);

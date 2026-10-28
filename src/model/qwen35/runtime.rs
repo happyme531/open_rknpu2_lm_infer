@@ -51,17 +51,16 @@ pub struct Qwen35 {
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
-    pub(super) decode_prepared: bool,
+    pub(super) workspaces: crate::model::workspace::Workspaces,
     pub(super) prefix_cache: super::cache::PrefixCache,
 }
 
 impl Qwen35 {
-    fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
-        rows.extend([1, self.options.chunk]);
-        rows.extend(1..=self.speculation_window() + 1);
-        rows.sort_unstable();
-        rows.dedup();
-        self.decode_prepared = false;
+    fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
+        let prefill_rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
+        let mut rows = prefill_rows.clone();
+        let head_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        self.workspaces.prepare(&mut rows, &head_rows);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
@@ -70,14 +69,13 @@ impl Qwen35 {
         }
         // Generation projects only the prompt's final row; full-row scoring
         // prepares its own head workspace when token_nll is requested.
-        let head_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
         if let Some(backend) = self.head.backend() {
             backend.retain_workspaces(&head_rows)?;
             for rows in head_rows {
                 backend.prepare(rows)?;
             }
         }
-        self.work.recurrent.prepare(&rows)?;
+        self.work.recurrent.prepare(&prefill_rows)?;
         if let Some(draft) = &self.dflash {
             draft.prepare(&rows, self.options.speculation.window())?;
         }
@@ -127,7 +125,7 @@ impl Qwen35 {
     ) -> Result<()> {
         let start = Instant::now();
         if !verify && tokens.len() > 1 {
-            self.decode_prepared = false;
+            self.workspaces.reset();
         }
         let h = self.config.hidden_size;
         self.phases.context(self.position, tokens.len(), -1, verify);
@@ -231,6 +229,9 @@ impl Qwen35 {
         cancelled: Option<&AtomicBool>,
         logits: bool,
     ) -> Result<()> {
+        if tokens.len() > 1 {
+            self.workspaces.reset();
+        }
         self.check_input(tokens)?;
         ensure!(
             self.round.is_none(),
@@ -306,12 +307,16 @@ impl Qwen35 {
     }
 
     pub(super) fn release_prefill_workspaces(&mut self) -> Result<()> {
-        if !self.decode_prepared {
-            let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
-            for backend in self.backends.iter().chain(self.head.backend()) {
-                backend.retain_workspaces(&rows)?;
-            }
-            self.decode_prepared = true;
+        if self.workspaces.is_decoding() {
+            return Ok(());
+        }
+        let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        if self
+            .workspaces
+            .enter_decode(self.backends.iter().chain(self.head.backend()), &rows)?
+        {
+            // GDN verification and one-row AR execute on CPU.
+            self.work.recurrent.retain_workspaces(&[1]);
         }
         Ok(())
     }
@@ -338,7 +343,7 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.position = 0;
-        self.decode_prepared = false;
+        self.workspaces.reset();
         self.round = None;
         self.features.reset();
         if let Some(mtp) = &mut self.mtp {
@@ -396,11 +401,7 @@ impl LanguageModel for Qwen35 {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "Qwen3.5 prompt exceeds context"
         );
-        let mut rows = vec![1, self.options.chunk, prompt_tokens.min(self.options.chunk)];
-        if !prompt_tokens.is_multiple_of(self.options.chunk) {
-            rows.push(prompt_tokens % self.options.chunk);
-        }
-        self.prepare_rows(rows)
+        self.prepare_rows(vec![prompt_tokens])
     }
     fn prepare_prepared<'a>(
         &mut self,

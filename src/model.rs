@@ -49,6 +49,7 @@ pub use registry::{build_info, ensure_enabled};
     reason = "Shared tracing and test helpers are independent of model selection."
 )]
 pub(crate) mod trace;
+pub(crate) mod workspace;
 
 pub struct LinearShape {
     pub name: &'static str,

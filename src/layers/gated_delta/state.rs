@@ -95,6 +95,11 @@ impl Scratch {
         }
         Ok(())
     }
+    pub fn retain_workspaces(&mut self, rows: &[usize]) {
+        if let Some(prefill) = &mut self.prefill {
+            prefill.retain_workspaces(rows);
+        }
+    }
     pub fn reset_statistics(&mut self) {
         self.cpu_calls = 0;
         self.cpu_tokens = 0;

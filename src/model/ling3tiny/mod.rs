@@ -54,6 +54,7 @@ pub struct Ling3Tiny {
     load_ms: f64,
     forward_ms: f64,
     head_ms: f64,
+    workspaces: crate::model::workspace::Workspaces,
 }
 impl Ling3Tiny {
     pub fn load(options: ModelOptions) -> Result<Self> {
@@ -84,6 +85,9 @@ impl Ling3Tiny {
         Ok(())
     }
     fn chunk(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>) -> Result<()> {
+        if tokens.len() > 1 {
+            self.workspaces.reset();
+        }
         let start = Instant::now();
         let rows = tokens.len();
         let c = &self.config;
@@ -148,16 +152,15 @@ impl Ling3Tiny {
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
     }
-    fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
-        let floating_rows = rows[0];
-        rows.push(1);
-        rows.sort_unstable();
-        rows.dedup();
+    fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
+        let floating_rows = rows[0].min(self.options.chunk);
+        let mut rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
+        self.workspaces.prepare(&mut rows, &[1]);
         for backend in &self.backends {
+            backend.retain_workspaces(&rows)?;
             for &n in &rows {
                 backend.prepare(n)?;
             }
-            backend.retain_workspaces(&rows)?;
         }
         for backend in &self.router_backends {
             backend.retain_workspaces(&rows);
@@ -170,9 +173,20 @@ impl Ling3Tiny {
         for layer in &self.layers {
             layer.mixer.prepare(floating_rows)?;
         }
+        if let Some(head) = self.head.backend() {
+            head.retain_workspaces(&[1])?;
+        }
         self.head.prepare(1)
     }
     fn output(&mut self) -> Result<&[f32]> {
+        if self
+            .workspaces
+            .enter_decode(self.backends.iter().chain(self.head.backend()), &[1])?
+        {
+            for backend in &self.router_backends {
+                backend.retain_workspaces(&[1]);
+            }
+        }
         let _head = trace::Span::new(c"ling.output_head", -1, 1, self.position);
         let start = Instant::now();
         let mut input = vec![0.; self.config.hidden];
@@ -213,6 +227,7 @@ impl LanguageModel for Ling3Tiny {
             p.reset();
         }
         self.position = 0;
+        self.workspaces.reset();
         self.forward_ms = 0.;
         self.head_ms = 0.;
         self.last_hidden.clear();
@@ -235,12 +250,7 @@ impl LanguageModel for Ling3Tiny {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "invalid Ling prompt length"
         );
-        let mut rows = vec![self.options.chunk.min(prompt_tokens)];
-        let tail = prompt_tokens % self.options.chunk;
-        if tail > 0 {
-            rows.push(tail);
-        }
-        self.prepare_rows(rows)
+        self.prepare_rows(vec![prompt_tokens])
     }
     fn prepare_prepared<'a>(
         &mut self,
