@@ -217,6 +217,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
     };
     let trace = crate::model::trace::Trace::from_environment()?;
     let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
+    let work = super::buffers::Buffers::new(&config);
     Ok(Ling3Tiny {
         options,
         info,
@@ -230,6 +231,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         embedding,
         final_norm,
         head,
+        work,
         position: 0,
         logits: Vec::new(),
         last_hidden: Vec::new(),

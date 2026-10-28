@@ -5,8 +5,10 @@ use crate::{
     npu::{FloatLinear, Mla},
     ops::{causal_conv::ConvState, kda, norm, rope::InterleavedRope},
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 mod checkpoint;
+mod scratch;
+pub(super) use scratch::Scratch;
 
 #[derive(PartialEq)]
 pub(super) struct Snapshot {
@@ -142,37 +144,47 @@ impl Mixer {
     pub fn forward(
         &mut self,
         input: &[f32],
-        rows: usize,
+        output: &mut [f32],
         position: usize,
         c: &Config,
         cpu: &crate::model::cpu::Cpu,
-    ) -> Result<Vec<f32>> {
-        let mut attended = vec![0.; rows * 2048];
-        let (output, output_phase) = match self {
+        scratch: &mut Scratch,
+    ) -> Result<()> {
+        ensure!(
+            !input.is_empty()
+                && input.len() == output.len()
+                && input.len().is_multiple_of(c.hidden),
+            "Ling mixer input/output shape mismatch"
+        );
+        let rows = input.len() / c.hidden;
+        let Scratch {
+            attended,
+            kda: ks,
+            mla: ms,
+        } = scratch;
+        attended.resize(rows * 2048, 0.);
+        let (projection, output_phase) = match self {
             Self::Kda(k) => {
                 let stride = 5 * 2048;
-                let mut projected = vec![0.; rows * stride];
-                let mut scratch = vec![0.; rows * k.inputs.scratch_width()];
+                ks.resize(rows, k.inputs.scratch_width());
                 trace::measure(c"ling.kda_input_projection", || {
-                    k.inputs.run(input, &mut projected, rows, &mut scratch)
+                    k.inputs
+                        .run(input, &mut ks.projected, rows, &mut ks.projection)
                 })?;
-                let mut qkv = Vec::new();
-                for (index, conv) in k.conv.iter_mut().enumerate() {
-                    let mut values = vec![0.; rows * 2048];
+                for (index, (conv, values)) in k.conv.iter_mut().zip(&mut ks.qkv).enumerate() {
                     let first = index * 2048;
                     trace::measure(c"ling.kda_convolution", || {
                         conv.state.run_parallel_strided(
                             &cpu.pool,
-                            &projected[first..(rows - 1) * stride + first + 2048],
+                            &ks.projected[first..(rows - 1) * stride + first + 2048],
                             stride,
                             &conv.weights,
-                            &mut values,
+                            values,
                         )
                     })?;
-                    qkv.push(values);
                 }
                 trace::measure(c"ling.kda_qk_norm_gates", || -> Result<()> {
-                    for values in &mut qkv[..2] {
+                    for values in &mut ks.qkv[..2] {
                         if rows == 1 {
                             norm::l2_normalize(values, 128)?;
                         } else {
@@ -181,39 +193,37 @@ impl Mixer {
                     }
                     Ok(())
                 })?;
-                let mut decay = vec![0.; rows * 2048];
-                let mut beta = vec![0.; rows * 16];
                 trace::measure(c"ling.kda_beta_projection", || {
-                    k.beta.run(input, &mut beta, rows)
+                    k.beta.run(input, &mut ks.beta, rows)
                 })?;
                 trace::measure(c"ling.kda_qk_norm_gates", || {
                     kda::activate_gates(
                         &cpu.pool,
-                        &projected[3 * 2048..(rows - 1) * stride + 4 * 2048],
+                        &ks.projected[3 * 2048..(rows - 1) * stride + 4 * 2048],
                         stride,
                         &k.a,
                         &k.dt,
                         c.lower_bound,
-                        &mut beta,
-                        &mut decay,
+                        &mut ks.beta,
+                        &mut ks.decay,
                     )
                 })?;
                 trace::measure(c"ling.kda_recurrence", || {
                     k.state.run(
-                        &qkv[0],
-                        &qkv[1],
-                        &qkv[2],
-                        &decay,
-                        &beta,
-                        &mut attended,
+                        &ks.qkv[0],
+                        &ks.qkv[1],
+                        &ks.qkv[2],
+                        &ks.decay,
+                        &ks.beta,
+                        attended,
                         cpu.pool.current_num_threads(),
                     )
                 })?;
                 trace::measure(c"ling.kda_output_norm_gate", || {
                     norm::sigmoid_gated_norm_in_place(
                         &cpu.pool,
-                        &mut attended,
-                        &projected[4 * 2048..],
+                        attended,
+                        &ks.projected[4 * 2048..],
                         stride,
                         2048,
                         &k.norm,
@@ -223,40 +233,36 @@ impl Mixer {
                 (&k.output, c"ling.kda_output_projection")
             }
             Self::Mla(m) => {
-                let mut qa = vec![0.; rows * 256];
-                let mut qn = vec![0.; rows * 256];
+                ms.resize(rows);
                 trace::measure(c"ling.mla_q_a_projection", || {
-                    m.q_a.run(input, &mut qa, rows)
+                    m.q_a.run(input, &mut ms.qa, rows)
                 })?;
                 trace::measure(c"ling.mla_norm_rope", || {
-                    norm::rms_norm(&qa, &m.q_norm, c.epsilon, false, &mut qn)
+                    norm::rms_norm(&ms.qa, &m.q_norm, c.epsilon, false, &mut ms.normalized_q)
                 })?;
-                let mut q = vec![0.; rows * 3072];
-                trace::measure(c"ling.mla_q_b_projection", || m.q_b.run(&qn, &mut q, rows))?;
-                let mut kv = vec![0.; rows * 576];
-                let mut latent = vec![0.; rows * 512];
-                let mut rope = vec![0.; rows * 64];
-                let mut gates = vec![0.; rows * 16];
+                trace::measure(c"ling.mla_q_b_projection", || {
+                    m.q_b.run(&ms.normalized_q, &mut ms.query, rows)
+                })?;
                 trace::measure(c"ling.mla_kv_a_projection", || {
-                    m.kv_a.run(input, &mut kv, rows)
+                    m.kv_a.run(input, &mut ms.kv, rows)
                 })?;
                 trace::measure(c"ling.mla_gate_projection", || {
-                    m.gate.run(input, &mut gates, rows)
+                    m.gate.run(input, &mut ms.gates, rows)
                 })?;
                 trace::measure(c"ling.mla_norm_rope", || -> Result<()> {
                     for r in 0..rows {
                         norm::rms_norm(
-                            &kv[r * 576..r * 576 + 512],
+                            &ms.kv[r * 576..r * 576 + 512],
                             &m.kv_norm,
                             c.epsilon,
                             false,
-                            &mut latent[r * 512..(r + 1) * 512],
+                            &mut ms.latent[r * 512..(r + 1) * 512],
                         )?;
-                        rope[r * 64..(r + 1) * 64]
-                            .copy_from_slice(&kv[r * 576 + 512..(r + 1) * 576]);
+                        ms.rotary[r * 64..(r + 1) * 64]
+                            .copy_from_slice(&ms.kv[r * 576 + 512..(r + 1) * 576]);
                         m.rope.apply(
-                            &mut q[r * 3072..(r + 1) * 3072],
-                            &mut rope[r * 64..(r + 1) * 64],
+                            &mut ms.query[r * 3072..(r + 1) * 3072],
+                            &mut ms.rotary[r * 64..(r + 1) * 64],
                             192,
                             position + r,
                         )?;
@@ -264,15 +270,14 @@ impl Mixer {
                     Ok(())
                 })?;
                 trace::measure(c"ling.mla_core", || {
-                    m.cache
-                        .run(&q, &latent, &rope, &gates, &mut attended, rows, position)
+                    m.cache.run(
+                        &ms.query, &ms.latent, &ms.rotary, &ms.gates, attended, rows, position,
+                    )
                 })?;
                 (&m.output, c"ling.mla_output_projection")
             }
         };
-        let mut result = vec![0.; rows * c.hidden];
-        trace::measure(output_phase, || output.run(&attended, &mut result, rows))?;
-        Ok(result)
+        trace::measure(output_phase, || projection.run(attended, output, rows))
     }
 }
 #[cfg(test)]

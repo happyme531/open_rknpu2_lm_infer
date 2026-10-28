@@ -36,16 +36,26 @@ impl Dense {
             intermediate: f,
         })
     }
-    pub fn run(&self, input: &[f32], output: &mut [f32], rows: usize, cpu: &Cpu) -> Result<()> {
+    fn run(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        rows: usize,
+        cpu: &Cpu,
+        scratch: &mut DenseScratch,
+    ) -> Result<()> {
         let f = self.intermediate;
-        let mut middle = vec![0.; rows * f];
-        if !self.gate_up.run_swiglu(input, &mut middle, rows)? {
-            let mut gu = vec![0.; rows * 2 * f];
-            let mut scratch = vec![0.; rows * self.gate_up.scratch_width()];
-            self.gate_up.run(input, &mut gu, rows, &mut scratch)?;
-            cpu.swiglu(&gu, &mut middle, f);
+        scratch.middle.resize(rows * f, 0.);
+        if !self.gate_up.run_swiglu(input, &mut scratch.middle, rows)? {
+            scratch.gate_up.resize(rows * 2 * f, 0.);
+            scratch
+                .projection
+                .resize(rows * self.gate_up.scratch_width(), 0.);
+            self.gate_up
+                .run(input, &mut scratch.gate_up, rows, &mut scratch.projection)?;
+            cpu.swiglu(&scratch.gate_up, &mut scratch.middle, f);
         }
-        self.down.run(&middle, output, rows)
+        self.down.run(&scratch.middle, output, rows)
     }
 }
 enum Bank {
@@ -58,10 +68,59 @@ pub(super) enum FeedForward {
 }
 pub(super) struct Routed {
     router: Tf32Linear,
-    routing: RoutingScratch,
     bias: Vec<f32>,
     bank: Bank,
     shared: Option<Dense>,
+}
+
+#[derive(Default)]
+struct DenseScratch {
+    middle: Vec<f32>,
+    gate_up: Vec<f32>,
+    projection: Vec<f32>,
+}
+
+pub(super) struct Scratch {
+    dense: DenseScratch,
+    routing: RoutingScratch,
+    logits: Vec<f32>,
+    ids: Vec<i32>,
+    weights: Vec<f32>,
+    shared: Vec<f32>,
+}
+
+impl Scratch {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            dense: Default::default(),
+            routing: RoutingScratch::new(config),
+            logits: Vec::new(),
+            ids: Vec::new(),
+            weights: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        [
+            &self.dense.middle,
+            &self.dense.gate_up,
+            &self.dense.projection,
+            &self.logits,
+            &self.weights,
+            &self.shared,
+            &self.routing.scores,
+            &self.routing.selected,
+            &self.routing.group_scores,
+        ]
+        .iter()
+        .map(|values| values.capacity() * 4)
+        .sum::<usize>()
+            + self.ids.capacity() * size_of::<i32>()
+            + (self.routing.groups.capacity() + self.routing.candidates.capacity())
+                * size_of::<usize>()
+            + self.routing.enabled.capacity() * size_of::<bool>()
+    }
 }
 
 struct RoutingScratch {
@@ -247,7 +306,6 @@ impl FeedForward {
         );
         Ok(Self::Routed(Box::new(Routed {
             router: l.router.load(&router.floats()?, c.hidden, c.experts)?,
-            routing: RoutingScratch::new(c),
             bias: l.vector(&format!("{p}.gate.expert_bias"), c.experts)?,
             bank,
             shared: if joint {
@@ -264,32 +322,47 @@ impl FeedForward {
     pub fn run(
         &mut self,
         input: &[f32],
-        rows: usize,
+        output: &mut [f32],
         position: usize,
         c: &Config,
         cpu: &Cpu,
-    ) -> Result<Vec<f32>> {
-        let mut out = vec![0.; rows * c.hidden];
+        scratch: &mut Scratch,
+    ) -> Result<()> {
+        ensure!(
+            !input.is_empty()
+                && input.len() == output.len()
+                && input.len().is_multiple_of(c.hidden),
+            "Ling FFN input/output shape mismatch"
+        );
+        let rows = input.len() / c.hidden;
+        let Scratch {
+            dense,
+            routing,
+            logits,
+            ids,
+            weights,
+            shared,
+        } = scratch;
         match self {
             Self::Dense(d) => {
-                trace::measure(c"ling.dense_ffn", || d.run(input, &mut out, rows, cpu))?
+                trace::measure(c"ling.dense_ffn", || d.run(input, output, rows, cpu, dense))?
             }
             Self::Routed(r) => {
-                let mut logits = vec![0.; rows * c.experts];
+                logits.resize(rows * c.experts, 0.);
                 trace::measure(c"ling.moe_router_projection", || {
-                    r.router.run(input, &mut logits, rows)
+                    r.router.run(input, logits, rows)
                 })?;
-                let (ids, weights) = trace::measure(c"ling.moe_router", || -> Result<_> {
-                    let mut ids = vec![0; rows * c.top];
-                    let mut weights = vec![0.; rows * c.top];
+                ids.resize(rows * c.top, 0);
+                weights.resize(rows * c.top, 0.);
+                trace::measure(c"ling.moe_router", || -> Result<()> {
                     for ((row, ids), weights) in logits
                         .chunks_exact(c.experts)
                         .zip(ids.chunks_mut(c.top))
                         .zip(weights.chunks_mut(c.top))
                     {
-                        r.routing.routes(row, &r.bias, c, ids, weights)?;
+                        routing.routes(row, &r.bias, c, ids, weights)?;
                     }
-                    Ok((ids, weights))
+                    Ok(())
                 })?;
                 let stage = if r.shared.is_none() {
                     c"ling.moe_routed_shared_experts"
@@ -297,23 +370,23 @@ impl FeedForward {
                     c"ling.moe_routed_experts"
                 };
                 trace::measure(stage, || match &mut r.bank {
-                    Bank::Resident(b) => b.run(input, &ids, &weights, &mut out, rows),
+                    Bank::Resident(b) => b.run(input, ids, weights, output, rows),
                     Bank::Paged(b) => {
-                        let request = b.request(&ids, &weights, position, rows);
-                        b.run(input, &ids, &weights, &mut out, request)
+                        let request = b.request(ids, weights, position, rows);
+                        b.run(input, ids, weights, output, request)
                     }
                 })?;
                 if let Some(ffn) = &r.shared {
                     trace::measure(c"ling.shared_expert_ffn", || -> Result<()> {
-                        let mut shared = vec![0.; rows * c.hidden];
-                        ffn.run(input, &mut shared, rows, cpu)?;
-                        cpu.add(&mut out, &shared);
+                        shared.resize(rows * c.hidden, 0.);
+                        ffn.run(input, shared, rows, cpu, dense)?;
+                        cpu.add(output, shared);
                         Ok(())
                     })?;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn joint_shared(&self) -> bool {

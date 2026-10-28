@@ -21,6 +21,7 @@ use std::{
     },
     time::Instant,
 };
+mod buffers;
 mod cache;
 mod config;
 mod load;
@@ -46,6 +47,7 @@ pub struct Ling3Tiny {
     embedding: Tensor,
     final_norm: Vec<f32>,
     head: OutputHead,
+    work: buffers::Buffers,
     position: usize,
     logits: Vec<f32>,
     last_hidden: Vec<f32>,
@@ -92,12 +94,12 @@ impl Ling3Tiny {
         let rows = tokens.len();
         let c = &self.config;
         let h = c.hidden;
-        let (mut hidden, mut normalized) = trace::measure(c"ling.embedding", || {
-            let mut hidden = vec![0.; rows * h];
-            for (&id, row) in tokens.iter().zip(hidden.chunks_mut(h)) {
+        self.work.resize(rows, h);
+        let w = &mut self.work;
+        trace::measure(c"ling.embedding", || {
+            for (&id, row) in tokens.iter().zip(w.hidden.chunks_mut(h)) {
                 self.embedding.row(id as usize, row);
             }
-            (hidden, vec![0.; rows * h])
         });
         #[cfg(test)]
         if let Some(p) = &self.paging {
@@ -111,35 +113,52 @@ impl Ling3Tiny {
             let _layer = trace::Span::new(c"ling.layer", index as i32, rows, self.position);
             trace::measure(c"ling.layer_norm_residual", || {
                 norm::rms_norm(
-                    &hidden,
+                    &w.hidden,
                     &layer.input_norm,
                     c.epsilon,
                     false,
-                    &mut normalized,
+                    &mut w.normalized,
                 )
             })?;
             self.trace
-                .save(self.position, index as i32, "input", &normalized)?;
-            let attention = layer
-                .mixer
-                .forward(&normalized, rows, self.position, c, &self.cpu)?;
+                .save(self.position, index as i32, "input", &w.normalized)?;
+            layer.mixer.forward(
+                &w.normalized,
+                &mut w.output,
+                self.position,
+                c,
+                &self.cpu,
+                &mut w.mixer,
+            )?;
             self.trace
-                .save(self.position, index as i32, "o", &attention)?;
+                .save(self.position, index as i32, "o", &w.output)?;
             trace::measure(c"ling.layer_norm_residual", || {
-                self.cpu.add(&mut hidden, &attention);
-                norm::rms_norm(&hidden, &layer.post_norm, c.epsilon, false, &mut normalized)
+                self.cpu.add(&mut w.hidden, &w.output);
+                norm::rms_norm(
+                    &w.hidden,
+                    &layer.post_norm,
+                    c.epsilon,
+                    false,
+                    &mut w.normalized,
+                )
             })?;
             self.trace
-                .save(self.position, index as i32, "post", &normalized)?;
-            let ffn = layer
-                .ffn
-                .run(&normalized, rows, self.position, c, &self.cpu)?;
-            self.trace.save(self.position, index as i32, "ffn", &ffn)?;
+                .save(self.position, index as i32, "post", &w.normalized)?;
+            layer.ffn.run(
+                &w.normalized,
+                &mut w.output,
+                self.position,
+                c,
+                &self.cpu,
+                &mut w.ffn,
+            )?;
+            self.trace
+                .save(self.position, index as i32, "ffn", &w.output)?;
             trace::measure(c"ling.layer_norm_residual", || {
-                self.cpu.add(&mut hidden, &ffn)
+                self.cpu.add(&mut w.hidden, &w.output)
             });
             self.trace
-                .save(self.position, index as i32, "hidden", &hidden)?;
+                .save(self.position, index as i32, "hidden", &w.hidden)?;
         }
         #[cfg(test)]
         if let Some(p) = &self.paging {
@@ -147,7 +166,7 @@ impl Ling3Tiny {
         }
         self.last_hidden.clear();
         self.last_hidden
-            .extend_from_slice(&hidden[(rows - 1) * h..]);
+            .extend_from_slice(&w.hidden[(rows - 1) * h..]);
         self.position += rows;
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
@@ -189,16 +208,16 @@ impl Ling3Tiny {
         }
         let _head = trace::Span::new(c"ling.output_head", -1, 1, self.position);
         let start = Instant::now();
-        let mut input = vec![0.; self.config.hidden];
         norm::rms_norm(
             &self.last_hidden,
             &self.final_norm,
             self.config.epsilon,
             false,
-            &mut input,
+            &mut self.work.head,
         )?;
         self.logits.resize(self.config.vocab, 0.);
-        self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
+        self.head
+            .run(&self.cpu, &self.work.head, &mut self.logits, 1)?;
         debug_assert!(
             self.logits.iter().all(|x| x.is_finite()),
             "nonfinite Ling logits"
@@ -315,9 +334,14 @@ impl LanguageModel for Ling3Tiny {
                     .sum::<u64>()
             })
             .sum::<u64>();
+        let mla_scratch_bytes: u64 = mixers
+            .iter()
+            .map(|m| m["host_scratch_bytes"].as_u64().unwrap_or(0))
+            .sum();
         let fields = serde_json::json!({"architecture":"bailing_hybrid","position":self.position,
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "mapped_weight_bytes":self.weights.store.mapped_bytes(),"mixers":mixers,
+            "cpu_scratch_bytes":self.work.allocated_bytes() as u64+mla_scratch_bytes+(self.last_hidden.capacity()+self.logits.capacity()) as u64*4,
             "attention_backend":"native-npu-mla-absorbed-stable-softmax","attention_cache_payload_bytes":kv_bytes,
             "mla_projection_backend":"native-npu-fp16","router_projection_backend":"native-npu-tf32",
             "kda_backend":"cpu-fp32","kv_dtype":"float16","expert_storage":if self.paging.is_some() {"stream"} else {"resident"},
