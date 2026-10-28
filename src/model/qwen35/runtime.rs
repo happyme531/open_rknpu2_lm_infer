@@ -412,10 +412,17 @@ impl LanguageModel for Qwen35 {
             start < input.tokens.len() && input.tokens.len() <= self.options.context,
             "invalid prepared prompt"
         );
+        let steps = self.prefix_cache.plan(input, start, self.options.chunk);
+        let logical_rows = self.prompt_chunk_rows();
+        let steps = if logical_rows > self.options.chunk {
+            crate::model::PrefillStep::coalesce(steps, logical_rows)
+        } else {
+            steps
+        };
         let prepared = PreparedPrefill {
             input,
             start,
-            steps: self.prefix_cache.plan(input, start, self.options.chunk),
+            steps,
             checkpoint: self.prefix_cache.last_position(),
         };
         let rows = prepared.steps.iter().map(|s| s.range.len()).collect();

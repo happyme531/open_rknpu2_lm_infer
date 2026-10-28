@@ -69,6 +69,12 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         options.tune = true;
         options.tune_cache = cache.into();
     }
+    if let Some(store) = std::env::var_os("RKNPU_PREFIX_EXPERT_STORE") {
+        options.experts.cache = Some(store.into());
+    }
+    if std::env::var_os("RKNPU_PREFIX_STREAM").is_some() {
+        options.experts.storage = crate::model::experts::Storage::Stream;
+    }
     crate::npu::configure_cpu(&mut options)?;
     let codec = TextCodec::load(&options.path)?;
     let mut model = Qwen35::load(options)?;
@@ -86,6 +92,15 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     );
     let cancel = AtomicBool::new(false);
     let prepared = model.prepare_prepared(&input, 0)?;
+    if model.paging.is_some() && model.mtp.is_none() {
+        assert!(
+            prepared
+                .steps
+                .iter()
+                .any(|step| step.range.len() > model.options.chunk),
+            "streaming prepared input did not retain a logical prompt block"
+        );
+    }
     let expected = model.forward_prepared(prepared, &cancel)?.to_vec();
     let expected_positions = vec![
         input.user_starts[0],

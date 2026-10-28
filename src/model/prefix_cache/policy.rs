@@ -108,6 +108,42 @@ mod tests {
             [20, 128, 128, 74, 118, 128, 4]
         );
     }
+
+    #[test]
+    fn logical_streaming_blocks_preserve_checkpoints_and_cover_the_whole_prompt() {
+        for capacity in [0, 32] {
+            let mut input = PreparedInput::text(vec![1; 2200]);
+            input.user_starts = vec![20, 350];
+            let settings = CheckpointOptions {
+                capacity,
+                ..Default::default()
+            };
+            let physical = plan(&input, 0, 128, settings, None);
+            let checkpoints: Vec<_> = physical
+                .iter()
+                .filter(|step| step.checkpoint)
+                .map(|step| step.range.start)
+                .collect();
+            let logical = PrefillStep::coalesce(physical, 1024);
+            assert!(logical.iter().any(|step| step.range.len() > 128));
+            assert!(logical.iter().all(|step| step.range.len() <= 1024));
+            assert_eq!(
+                logical
+                    .iter()
+                    .filter(|step| step.checkpoint)
+                    .map(|step| step.range.start)
+                    .collect::<Vec<_>>(),
+                checkpoints
+            );
+            assert_eq!(
+                logical
+                    .iter()
+                    .flat_map(|step| step.range.clone())
+                    .collect::<Vec<_>>(),
+                (0..input.tokens.len()).collect::<Vec<_>>()
+            );
+        }
+    }
     #[test]
     fn intermediate_user_boundaries_obey_minimum_spacing() {
         let mut input = PreparedInput::text(vec![1; 20_000]);
