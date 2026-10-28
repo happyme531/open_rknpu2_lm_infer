@@ -6,11 +6,29 @@ use rayon::{ThreadPool, prelude::*};
 mod kernel;
 
 /// Channel-major, oldest-to-newest K-1 samples. K=1 has empty history.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ConvState {
     channels: usize,
     kernel: usize,
     history: Vec<f32>,
+}
+
+impl Clone for ConvState {
+    fn clone(&self) -> Self {
+        Self {
+            channels: self.channels,
+            kernel: self.kernel,
+            history: self.history.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        // Shared layer scratch may change geometry; retain its history storage
+        // whenever Vec::clone_from can reuse the allocation.
+        self.history.clone_from(&source.history);
+        self.channels = source.channels;
+        self.kernel = source.kernel;
+    }
 }
 
 impl ConvState {
@@ -155,6 +173,29 @@ impl ConvState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cloning_into_shared_scratch_reuses_storage_and_updates_geometry() -> Result<()> {
+        let mut source = ConvState::new(3, 3)?;
+        source.append(&[1., 2., 3., 4., 5., 6.])?;
+        let mut scratch = ConvState::new(6, 2)?;
+        let pointer = scratch.history.as_ptr();
+        let capacity = scratch.history.capacity();
+        scratch.clone_from(&source);
+        assert_eq!(scratch, source);
+        assert_eq!(scratch.history.as_ptr(), pointer);
+        assert_eq!(scratch.history.capacity(), capacity);
+
+        let weights = vec![0.25; 9];
+        let input = [7., 8., 9.];
+        let mut actual = [0.; 3];
+        let mut expected = [0.; 3];
+        scratch.run(&input, &weights, &mut actual)?;
+        source.run(&input, &weights, &mut expected)?;
+        assert_eq!(actual, expected);
+        assert_eq!(scratch, source);
+        Ok(())
+    }
+
     #[test]
     fn restore_reuses_history_and_rejects_incompatible_geometry() -> Result<()> {
         for channels in [3, 2048] {

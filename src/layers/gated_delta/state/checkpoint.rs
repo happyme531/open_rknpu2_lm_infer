@@ -40,7 +40,7 @@ impl LayerState {
             "GDN snapshot shape mismatch"
         );
         self.state.clone_from(&snapshot.state);
-        self.conv.clone_from(&snapshot.conv);
+        self.conv.restore(&snapshot.conv)?;
         self.position = snapshot.position;
         Ok(())
     }
