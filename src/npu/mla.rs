@@ -6,6 +6,14 @@ pub struct Mla {
     workspace: Handle<rk_npu_mla_f16_workspace>,
     _weights: Handle<rk_npu_mla_f16_weights>,
     owner: Backend,
+    io: RefCell<HostIo>,
+}
+
+#[derive(Default)]
+struct HostIo {
+    query: Vec<u16>,
+    latent: Vec<u16>,
+    rotary: Vec<u16>,
 }
 
 impl Backend {
@@ -50,6 +58,7 @@ impl Backend {
             workspace,
             _weights: weights,
             owner: self.clone(),
+            io: RefCell::default(),
         })
     }
 }
@@ -60,10 +69,13 @@ impl Mla {
             unsafe { rk_npu_mla_f16_cache_get_info(self.cache.raw, &mut info) },
             "MLA cache info",
         )?;
+        let io = self.io.borrow();
+        let host_bytes = (io.query.capacity() + io.latent.capacity() + io.rotary.capacity()) * 2;
         Ok(
             json!({"mode":"absorbed", "length":info.length,"capacity":info.capacity,
             "max_capacity":info.max_capacity,"key_bytes":info.key_bytes,"value_bytes":info.value_bytes,
-            "tail_bytes":info.tail_bytes,"latent_dim":512,"rotary_dim":64,"kv_heads":1}),
+            "tail_bytes":info.tail_bytes,"latent_dim":512,"rotary_dim":64,"kv_heads":1,
+            "host_scratch_bytes":host_bytes}),
         )
     }
     pub fn reserve(&self, capacity: usize) -> Result<()> {
@@ -126,19 +138,20 @@ impl Mla {
             info.length as usize == position && position + rows <= b.options.context,
             "MLA cache position/context mismatch"
         );
-        let pack = |input: &[f32]| -> Result<Vec<u16>> {
-            let mut out = vec![0; input.len()];
-            super::attention::pack_half(input, &mut out)?;
-            Ok(out)
-        };
-        let (q, c, k) = (pack(query)?, pack(latent)?, pack(rotary)?);
+        let mut io = self.io.borrow_mut();
+        io.query.resize(query.len(), 0);
+        io.latent.resize(latent.len(), 0);
+        io.rotary.resize(rotary.len(), 0);
+        super::attention::pack_half(query, &mut io.query)?;
+        super::attention::pack_half(latent, &mut io.latent)?;
+        super::attention::pack_half(rotary, &mut io.rotary)?;
         check(
             unsafe {
                 rk_npu_mla_f16_cache_append(
                     b.context.raw,
                     self.cache.raw,
-                    c.as_ptr(),
-                    k.as_ptr(),
+                    io.latent.as_ptr(),
+                    io.rotary.as_ptr(),
                     rows as i32,
                 )
             },
@@ -152,7 +165,7 @@ impl Mla {
                         b.context.raw,
                         self.workspace.raw,
                         self.cache.raw,
-                        q.as_ptr().add(first * 16 * 192),
+                        io.query.as_ptr().add(first * 16 * 192),
                         gates.as_ptr().add(first * 16),
                         count as i32,
                         (position + first) as i32,
@@ -221,6 +234,15 @@ mod tests {
             33,
             0,
         )?;
+        let host_buffers = |mla: &Mla| {
+            let io = mla.io.borrow();
+            [
+                (io.query.as_ptr() as usize, io.query.capacity()),
+                (io.latent.as_ptr() as usize, io.latent.capacity()),
+                (io.rotary.as_ptr() as usize, io.rotary.capacity()),
+            ]
+        };
+        let prepared_host_buffers = host_buffers(&mla);
         mla.reserve(96)?;
         assert_eq!(mla.info()?["length"], 33);
         mla.run(
@@ -232,6 +254,7 @@ mod tests {
             1,
             33,
         )?;
+        assert_eq!(host_buffers(&mla), prepared_host_buffers);
         for row in [0, 1, 16, 31, 32, 33] {
             for h in 0..16 {
                 let k_scale = if h % 2 == 0 { 0.5 } else { 1. };
