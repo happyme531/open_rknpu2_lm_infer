@@ -58,6 +58,10 @@ impl Features {
 }
 
 impl Qwen35 {
+    pub(super) fn has_dflash(&self) -> bool {
+        self.dflash.is_some()
+    }
+
     pub(super) fn load_dflash(&mut self) -> Result<()> {
         ensure!(
             !self
@@ -171,7 +175,6 @@ impl Qwen35 {
         );
         let start = Instant::now();
         let mut logits = vec![0.; rows * self.info.vocab_size];
-        self.head.prepare(rows)?;
         self.head.run(&self.cpu, hidden, &mut logits, rows)?;
         self.head_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(logits)

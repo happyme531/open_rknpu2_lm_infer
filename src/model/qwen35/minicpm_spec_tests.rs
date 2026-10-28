@@ -15,7 +15,14 @@ fn generate(model: &mut Qwen35, prompt: &[u32], limit: usize) -> Result<(Vec<u32
     model.reset()?;
     model.reserve(prompt.len() + limit)?;
     model.prepare(prompt.len())?;
-    let mut sampler = Sampler::new(SamplingParams::default(), model.info().vocab_size, prompt)?;
+    let mut sampler = Sampler::new(
+        SamplingParams {
+            temperature: 0.,
+            ..Default::default()
+        },
+        model.info().vocab_size,
+        prompt,
+    )?;
     let begin = Instant::now();
     let first = sampler.sample(model.forward(prompt)?)?;
     let prefill_ms = begin.elapsed().as_secs_f64() * 1000.;
@@ -80,6 +87,8 @@ fn minicpm_dspark_generation_matches_ar() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: crate::model::experts::Options {
             cache: Some(std::env::var("MINICPM_TEST_STORE")?.into()),
             ..Default::default()

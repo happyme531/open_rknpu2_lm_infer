@@ -6,3 +6,4 @@
 /dist/
 __pycache__/
 llm_generated_docs/evidence
+/tests/api_mock/target/

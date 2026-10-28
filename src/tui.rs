@@ -149,6 +149,7 @@ impl Conversation {
                 tools: None,
                 enable_thinking: thinking,
             },
+            cache_prompt: None,
             sampling: sampling.clone(),
             max_tokens,
             stop: stop.to_vec(),
@@ -255,7 +256,7 @@ pub async fn chat(
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        " ◆ OPEN RKNPU2 ",
+                        format!(" ◆ {} ", crate::PROJECT_NAME),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),

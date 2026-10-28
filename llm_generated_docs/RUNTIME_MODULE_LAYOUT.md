@@ -2,9 +2,13 @@
 
 日期：2026-10-17，Asia/Shanghai。
 
+2026-10-28 模型开关边界：Cargo 只提供 `model-*` 家族选择和 `all-models` 组合。条件编译集中在 `model.rs` 的模型入口、模型注册表及模型专属测试工具；共享算子、层、投影、专家调度、预填充、视觉处理和草稿公共实现统一编译，接口和字段不随目标模型选择变化。模型目录保留配置、权重映射和能力接入；运行时判断所选模型是否支持对应能力。新增模型不得向共享模块添加模型家族条件。
+
 2026-10-18视觉扩展：通用输入、图像预处理、LayerNorm/GELU、FP16 Linear分别新增于 `input.rs`、`vision/`、`layers/layer_norm.rs` / `ops/gelu.rs`、`npu/floating.rs`；Qwen3.5目录只放ViT配置/权重/编排。API请求解析及前缀身份管理分别拆至 `api/request.rs`、`engine/context.rs`，视觉功能与验证版本边界见 [视觉记录](QWEN35_VISION_PROGRESS.md)。下文重构数字与验证是10月17日的历史记录。
 
 独立测试和诊断工具源码统一放在 `tests/tools/`，通过 Cargo.toml 显式注册，沿用 `--example NAME` 构建/运行入口；默认测试不执行这些需要外部数据或设备的程序。历史消融和插桩工具移至 `scripts/archive/`，目录与依赖见 [FP16/ViT 实验归档](FP16_VIT_EXPERIMENT_ARCHIVE.md)。
+
+2026-10-24 SSM 前缀缓存：`model/prefix_cache.rs` 和 `model/prefix_cache/` 统一管理 Qwen3.5 与 Ling3tiny 的请求边界调度、同位置快照复用、容量淘汰和统计。模型私有的 `qwen35/cache.rs`、`ling3tiny/cache.rs` 分别负责 GDN/MTP 与 KDA/卷积快照的保存和恢复；Attention/MLA KV 保留分配并截断。模型前向使用同一份 `PreparedPrefill` 计划完成 workspace 准备和实际执行。
 
 ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，使用 Rust NEON/窄范围内联汇编及模型自身的 Rayon 线程池。此前新增的 `native/cpu_kernels/vision.cpp`、`vision_rotary.cpp` 和对应 FFI 已移除；`native/cpu_kernels/` 只保留已有的 GDN 内核。
 

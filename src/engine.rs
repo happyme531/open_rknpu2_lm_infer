@@ -1,10 +1,9 @@
 use crate::{
     model::{self, LanguageModel, ModelInfo, ModelOptions},
-    sampling::{Sampler, SamplingParams},
-    text::{StopFilter, TextCodec},
+    sampling::Sampler,
+    text::{OutputDecoder, StopFilter, TextCodec},
 };
 use anyhow::{Context, Result, anyhow, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -20,63 +19,11 @@ mod context;
 mod tests;
 use context::{PrefixCache, validate_request_tokens};
 
-#[derive(Debug, Clone)]
-pub enum Prompt {
-    Text(String),
-    Tokens(Vec<u32>),
-    Chat {
-        messages: Vec<Value>,
-        tools: Option<Value>,
-        enable_thinking: bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationRequest {
-    pub prompt: Prompt,
-    pub sampling: SamplingParams,
-    pub max_tokens: usize,
-    pub stop: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationResult {
-    pub text: String,
-    pub finish_reason: String,
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub cached_tokens: usize,
-    pub timings: Value,
-    pub stats: Value,
-}
-
-#[derive(Debug, Clone)]
-pub enum GenerationEvent {
-    Token(String),
-    Finished(GenerationResult),
-    Error(String),
-}
-
-pub struct GenerationHandle {
-    pub events: mpsc::Receiver<GenerationEvent>,
-    pub cancel: Arc<AtomicBool>,
-}
-impl Drop for GenerationHandle {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
-#[derive(Debug)]
-pub struct EngineBusy;
-impl std::fmt::Display for EngineBusy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("inference request queue is full")
-    }
-}
-impl std::error::Error for EngineBusy {}
+mod types;
+pub use types::*;
 
 struct Job {
+    preserve_tool_markers: bool,
     input: crate::input::PreparedInput,
     request: GenerationRequest,
     events: mpsc::Sender<GenerationEvent>,
@@ -92,6 +39,7 @@ struct EngineInner {
     active: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    user_boundaries: bool,
 }
 
 impl Drop for EngineInner {
@@ -116,6 +64,11 @@ pub struct Engine {
 
 impl Engine {
     pub fn start(options: ModelOptions) -> Result<Self> {
+        Self::start_with_cache_prompt(options, true)
+    }
+
+    pub fn start_with_cache_prompt(options: ModelOptions, cache_prompt: bool) -> Result<Self> {
+        model::ensure_enabled(&options.path)?;
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);
@@ -147,7 +100,10 @@ impl Engine {
                 if let Ok(mut latest) = worker_stats.write() {
                     *latest = model.stats();
                 }
-                if ready_tx.send(Ok(model.info().clone())).is_err() {
+                if ready_tx
+                    .send(Ok((model.info().clone(), model.uses_user_boundaries())))
+                    .is_err()
+                {
                     return;
                 }
                 let mut cache = PrefixCache::default();
@@ -159,7 +115,13 @@ impl Engine {
                     if let Ok(mut running) = worker_active.lock() {
                         *running = Some(job.cancel.clone());
                     }
-                    let outcome = run_generation(model.as_mut(), &worker_codec, &job, &mut cache);
+                    let outcome = run_generation(
+                        model.as_mut(),
+                        &worker_codec,
+                        &job,
+                        &mut cache,
+                        cache_prompt,
+                    );
                     if let Err(error) = outcome {
                         let _ = model.reset();
                         cache.clear();
@@ -175,7 +137,7 @@ impl Engine {
                     }
                 }
             })?;
-        let info = ready_rx
+        let (info, user_boundaries) = ready_rx
             .recv()
             .context("inference worker stopped during loading")??;
         Ok(Self {
@@ -187,6 +149,7 @@ impl Engine {
                 active,
                 shutdown,
                 worker: Some(worker),
+                user_boundaries,
             }),
         })
     }
@@ -202,7 +165,7 @@ impl Engine {
             .unwrap_or(Value::Null)
     }
     pub fn tokenize(&self, prompt: &Prompt) -> Result<Vec<u32>> {
-        Ok(self.inner.codec.prepare(prompt)?.tokens)
+        Ok(self.inner.codec.prepare(prompt, false)?.tokens)
     }
     pub fn prompt_opens_thinking(&self, prompt: &Prompt) -> Result<bool> {
         Ok(matches!(prompt, Prompt::Chat { .. })
@@ -223,6 +186,14 @@ impl Engine {
     }
 
     pub fn generate(&self, request: GenerationRequest) -> Result<GenerationHandle> {
+        self.generate_with_tool_markers(request, false)
+    }
+
+    pub(crate) fn generate_with_tool_markers(
+        &self,
+        request: GenerationRequest,
+        preserve_tool_markers: bool,
+    ) -> Result<GenerationHandle> {
         ensure!(
             !self.inner.shutdown.load(Ordering::Relaxed),
             "inference worker is shutting down"
@@ -236,11 +207,15 @@ impl Engine {
             request.stop.iter().all(|stop| !stop.is_empty()),
             "stop sequences must not be empty"
         );
-        let input = self.inner.codec.prepare(&request.prompt)?;
+        let input = self
+            .inner
+            .codec
+            .prepare(&request.prompt, self.inner.user_boundaries)?;
         validate_request_tokens(&input.tokens, request.max_tokens, self.info())?;
         let (events_tx, events) = mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
         let job = Job {
+            preserve_tool_markers,
             input,
             request,
             events: events_tx,
@@ -276,38 +251,43 @@ fn run_generation(
     codec: &TextCodec,
     job: &Job,
     cache: &mut PrefixCache,
+    cache_prompt: bool,
 ) -> Result<()> {
     let start = Instant::now();
     let queue_ms = job.queued.elapsed().as_secs_f64() * 1000.0;
-    let mut cached_tokens = cache.reusable(&job.input, model.position());
+    let common_prefix_tokens = if job.request.cache_prompt.unwrap_or(cache_prompt) {
+        cache.reusable(&job.input, model.position())
+    } else {
+        0
+    };
+    let mut cached_tokens = common_prefix_tokens.min(job.input.tokens.len() - 1);
+    let restore_start = Instant::now();
     if cached_tokens > 0 && cached_tokens < model.position() {
-        if model.truncate(cached_tokens)? {
+        let restored = model.restore_prefix(cached_tokens)?;
+        ensure!(
+            restored <= cached_tokens,
+            "restored prefix exceeds requested maximum"
+        );
+        cached_tokens = restored;
+        if cached_tokens > 0 {
             cache.truncate(cached_tokens);
-        } else {
-            cached_tokens = 0;
         }
     }
     if cached_tokens == 0 {
         model.reset()?;
         cache.clear();
     }
-    let remaining = &job.input.tokens[cached_tokens..];
+    let cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.;
     let prepare_start = Instant::now();
     model.reserve(job.input.tokens.len() + job.request.max_tokens)?;
-    if !remaining.is_empty() {
-        model.prepare(remaining.len())?;
-    }
+    let prepared = model.prepare_prepared(&job.input, cached_tokens)?;
     let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
     let prefill_start = Instant::now();
-    if !remaining.is_empty() {
-        cache.logits.clear();
-        cache.logits.extend_from_slice(model.forward_prepared(
-            &job.input,
-            cached_tokens,
-            &job.cancel,
-        )?);
-        cache.extend_input(&job.input, cached_tokens);
-    }
+    cache.logits.clear();
+    cache
+        .logits
+        .extend_from_slice(model.forward_prepared(prepared, &job.cancel)?);
+    cache.extend_input(&job.input, cached_tokens);
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let mut sampler = Sampler::new(
         job.request.sampling.clone(),
@@ -315,7 +295,7 @@ fn run_generation(
         &job.input.tokens,
     )?;
     let mut filter = StopFilter::new(job.request.stop.clone())?;
-    let mut decoder = codec.tokenizer.decode_stream(true);
+    let mut decoder = OutputDecoder::new(&codec.tokenizer, job.preserve_tool_markers);
     let mut text = String::new();
     let mut generated = 0;
     let mut reason = "length";
@@ -338,6 +318,7 @@ fn run_generation(
     let mut verify_physical_rows = 0;
     let mut replay_rows = 0;
     let mut repair_rows = 0;
+    let mut events = Vec::new();
     while generated < job.request.max_tokens {
         ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
         let call = Instant::now();
@@ -352,26 +333,29 @@ fn run_generation(
         } else {
             None
         };
-        let batch = if let Some(round) = &round {
+        let sampled;
+        let batch: &[u32] = if let Some(round) = &round {
             draft_ms += round.draft_ms;
             verify_ms += round.verify_ms;
             proposed += round.inputs.len() - 1;
             draft_attempts += round.draft_attempts;
             confidence_stops += usize::from(round.confidence_stopped);
-            round.output.clone()
+            &round.output
         } else {
             if let Some(anchor) = pending {
-                cache.logits = model.forward_cancellable(&[anchor], &job.cancel)?.to_vec();
+                let logits = model.forward_cancellable(&[anchor], &job.cancel)?;
+                cache.logits.clear();
+                cache.logits.extend_from_slice(logits);
                 cache.append_token(anchor);
                 decode_calls += 1;
                 consumed_tokens += 1;
             }
-            vec![sampler.sample(&cache.logits)?]
+            sampled = [sampler.sample(&cache.logits)?];
+            &sampled
         };
-        let mut events = Vec::new();
         let mut emitted = 0;
         let mut stopped = false;
-        for &token in &batch {
+        for &token in batch {
             ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
             generated += 1;
             emitted += 1;
@@ -402,7 +386,10 @@ fn run_generation(
             model.finish_verification(emitted)?;
             repair_ms += repair_start.elapsed().as_secs_f64() * 1000.;
             let vocab = model.info().vocab_size;
-            cache.logits = round.logits[(emitted - 1) * vocab..emitted * vocab].to_vec();
+            cache.logits.clear();
+            cache
+                .logits
+                .extend_from_slice(&round.logits[(emitted - 1) * vocab..emitted * vocab]);
             for &input in &round.inputs[..emitted] {
                 cache.append_token(input);
             }
@@ -421,7 +408,7 @@ fn run_generation(
         if generated > emitted {
             decode_model_ms += call.elapsed().as_secs_f64() * 1000.;
         }
-        for output in events {
+        for output in events.drain(..) {
             text.push_str(&output);
             if ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.);
@@ -445,6 +432,8 @@ fn run_generation(
         completion_tokens: generated,
         cached_tokens,
         timings: json!({"queue_ms":queue_ms,"prepare_ms":prepare_ms,"prefill_ms":prefill_ms,
+            "common_prefix_tokens":common_prefix_tokens,"cache_restore_ms":cache_restore_ms,
+            "prefix_recompute_tokens":common_prefix_tokens-cached_tokens,
             "ttft_ms":ttft_ms,"decode_ms":decode_ms,"decode_model_ms":decode_model_ms,"decode_calls":decode_calls,
             "decode_tokens_per_second": if decode_model_ms > 0.0 { Some(consumed_tokens as f64 * 1000.0 / decode_model_ms) } else { None },
             "mtp_proposed":proposed,"mtp_accepted":accepted,
@@ -465,6 +454,10 @@ fn run_generation(
     };
     tracing::info!(prompt_tokens = result.prompt_tokens, cached_tokens = result.cached_tokens,
         completion_tokens = result.completion_tokens, timings = %result.timings,
+        prefix_checkpoint_count = %result.stats["prefix_checkpoint_count"],
+        prefix_checkpoint_bytes = %result.stats["prefix_checkpoint_bytes"],
+        prefix_checkpoint_hits = %result.stats["prefix_checkpoint_hits"],
+        prefix_checkpoint_save_ms = %result.stats["prefix_checkpoint_save_ms"],
         tune_cache_hits = %result.stats["tune_cache_hits"],
         tune_cache_misses = %result.stats["tune_cache_misses"],
         tune_calls = %result.stats["tune_calls"],

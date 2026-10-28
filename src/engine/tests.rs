@@ -1,4 +1,12 @@
 use super::*;
+use crate::sampling::SamplingParams;
+
+fn greedy() -> SamplingParams {
+    SamplingParams {
+        temperature: 0.,
+        ..Default::default()
+    }
+}
 
 /// A history-length oracle with controllable proposal rejection. It implements
 /// real pending transactions, so emitting/committing too far fails the test.
@@ -168,7 +176,7 @@ fn parallel_corrections_use_previous_proposal_and_learned_confidence() -> Result
     model.draft_adjust = vec![(3, 4, 0.95), (4, 1, 0.2), (1, 2, 0.99)];
     model.p_min = 0.5;
     model.forward(&[1, 2])?;
-    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[1, 2, 3])?;
+    let mut sampler = Sampler::new(greedy(), 5, &[1, 2, 3])?;
     let round =
         crate::speculative::run_round(&mut model, &mut sampler, 3, 8, &AtomicBool::new(false))?;
     assert_eq!(round.inputs, [3, 4]);
@@ -230,7 +238,7 @@ fn confidence_truncation_preserves_greedy_commit_and_budget_boundaries() -> Resu
                         .collect();
                     let anchor =
                         model.forward(&[4])?.iter().position(|x| *x == 10.).unwrap() as u32;
-                    let mut sampler = Sampler::new(SamplingParams::default(), 5, &[4, anchor])?;
+                    let mut sampler = Sampler::new(greedy(), 5, &[4, anchor])?;
                     let round = run_round_with_options(
                         &mut model,
                         &mut sampler,
@@ -304,7 +312,7 @@ fn run(
     max_tokens: usize,
     stop: Vec<String>,
 ) -> Result<(GenerationResult, String)> {
-    run_with_sampling(model, codec, max_tokens, stop, SamplingParams::default())
+    run_with_sampling(model, codec, max_tokens, stop, greedy())
 }
 fn run_with_sampling(
     model: &mut Model,
@@ -315,9 +323,11 @@ fn run_with_sampling(
 ) -> Result<(GenerationResult, String)> {
     let (events, mut receiver) = mpsc::channel(64);
     let job = Job {
+        preserve_tool_markers: false,
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
+            cache_prompt: None,
             sampling,
             max_tokens,
             stop,
@@ -327,7 +337,7 @@ fn run_with_sampling(
         queued: Instant::now(),
     };
     let mut cache = PrefixCache::default();
-    run_generation(model, codec, &job, &mut cache)?;
+    run_generation(model, codec, &job, &mut cache, true)?;
     assert_eq!(cache.rows_len(), model.position());
     let mut stream = String::new();
     while let Ok(event) = receiver.try_recv() {
@@ -358,6 +368,59 @@ fn configured_confidence_truncation_reaches_generation_and_statistics() -> Resul
     assert!(
         actual.timings["mtp_accepted"].as_u64() < actual.timings["mtp_draft_attempts"].as_u64()
     );
+    Ok(())
+}
+
+#[test]
+fn cache_prompt_default_and_request_override_control_real_prefix_reuse() -> Result<()> {
+    let (_dir, codec) = codec()?;
+    for default in [false, true] {
+        for (requested, enabled) in [(None, default), (Some(false), false), (Some(true), true)] {
+            let mut model = Model::new(0, 0, 40);
+            let mut cache = PrefixCache::default();
+            let mut generate = |tokens: Vec<u32>, cache_prompt| -> Result<GenerationResult> {
+                let (events, mut receiver) = mpsc::channel(64);
+                let job = Job {
+                    preserve_tool_markers: false,
+                    input: crate::input::PreparedInput::text(tokens.clone()),
+                    request: GenerationRequest {
+                        prompt: Prompt::Tokens(tokens.clone()),
+                        cache_prompt,
+                        sampling: greedy(),
+                        max_tokens: 1,
+                        stop: vec![],
+                    },
+                    events,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    queued: Instant::now(),
+                };
+                run_generation(&mut model, &codec, &job, &mut cache, default)?;
+                assert_eq!(
+                    model.tokens, tokens,
+                    "cache policy must preserve model state"
+                );
+                while let Ok(event) = receiver.try_recv() {
+                    if let GenerationEvent::Finished(result) = event {
+                        return Ok(result);
+                    }
+                }
+                anyhow::bail!("missing completion")
+            };
+            assert_eq!(generate(vec![1, 2, 3, 4], Some(true))?.cached_tokens, 0);
+            let result = generate(vec![1, 2, 3, 4, 2], requested)?;
+            assert_eq!(result.cached_tokens, if enabled { 4 } else { 0 });
+            assert_eq!(
+                result.timings["common_prefix_tokens"],
+                if enabled { 4 } else { 0 }
+            );
+            // Disabling reuse for one request still leaves its computed state
+            // available to a following request that explicitly enables reuse.
+            assert_eq!(
+                generate(vec![1, 2, 3, 4, 2, 3], Some(true))?.cached_tokens,
+                5
+            );
+        }
+    }
     Ok(())
 }
 
@@ -469,10 +532,12 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
     let (_dir, codec) = codec()?;
     let (events, mut receiver) = mpsc::channel(64);
     let job = Job {
+        preserve_tool_markers: false,
         input: crate::input::PreparedInput::text(vec![4]),
         request: GenerationRequest {
             prompt: Prompt::Tokens(vec![4]),
-            sampling: SamplingParams::default(),
+            cache_prompt: None,
+            sampling: greedy(),
             max_tokens: 8,
             stop: vec![],
         },
@@ -482,7 +547,7 @@ fn failed_commit_does_not_publish_the_speculative_batch() -> Result<()> {
     };
     let mut model = Model::new(4, 4, 40);
     model.fail_commit = true;
-    assert!(run_generation(&mut model, &codec, &job, &mut PrefixCache::default()).is_err());
+    assert!(run_generation(&mut model, &codec, &job, &mut PrefixCache::default(), true).is_err());
     let mut published = 0;
     while let Ok(event) = receiver.try_recv() {
         assert!(matches!(event, GenerationEvent::Token(_)));

@@ -80,7 +80,7 @@ def main():
         return row
 
     try:
-        wait(lambda view: 'Ready' in screen.display[-1] and 'OPEN RKNPU2' in view, timeout=300)
+        wait(lambda view: 'Ready' in screen.display[-1] and 'Send a message to begin.' in view, timeout=300)
         snapshot('ready')
         attach('cats.png')
         first = message('cats', 'How many cats are in this photograph? Answer briefly.', [('two', '2', 'pair')])

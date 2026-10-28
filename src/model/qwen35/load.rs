@@ -28,6 +28,7 @@ fn vector(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
 pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
     let start = Instant::now();
     let raw: Value = serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+    crate::model::registry::require(&raw)?;
     let config = Config::parse(&raw)?;
     let expert_slots = config
         .moe
@@ -101,7 +102,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         let store = expert_store.as_ref().ok_or_else(|| {
             anyhow::anyhow!("streaming requires a MoE checkpoint and --expert-store")
         })?;
-        Some(crate::model::experts::Paging::new(
+        Some(crate::model::experts::paged::Paging::new(
             &options,
             store.clone(),
             expert_slots,
@@ -348,6 +349,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             .as_ref()
             .map_or_else(Default::default, |p| p.timeline()),
     );
+    let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
     Ok(Qwen35 {
         options,
         info,
@@ -377,5 +379,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         features: Default::default(),
         dflash: None,
         decode_prepared: false,
+        prefix_cache,
     })
 }

@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::ensure;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -35,6 +36,10 @@ pub(crate) fn inspect(path: &Path, requested_context: usize) -> Result<Value> {
 
 /// Text configs may list end-of-text while the native chat tokenizer uses a
 /// distinct end-of-turn token. Both terminate generation; neither is emitted.
+#[allow(
+    dead_code,
+    reason = "Shared EOS metadata is available to every model family."
+)]
 pub(crate) fn eos_tokens(path: &Path, configured: &[u32], vocab: usize) -> Result<Vec<u32>> {
     let mut result = configured.to_vec();
     let generation = path.join("generation_config.json");

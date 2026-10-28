@@ -1,19 +1,43 @@
 [package]
 name = "open_rknpu2_lm_infer"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"
 license = "AGPL-3.0-only"
 autoexamples = false
 
+[features]
+default = ["all-models"]
+all-models = ["model-qwen3", "model-llama", "model-granite", "model-qwen35", "model-minicpmv47", "model-ling3tiny"]
+model-qwen3 = []
+model-llama = []
+model-granite = []
+model-qwen35 = []
+model-minicpmv47 = []
+model-ling3tiny = []
+
+[[example]]
+name = "kda_check_cost"
+required-features = ["model-ling3tiny"]
+path = "tests/tools/kda_check_cost.rs"
+test = false
+
+[[example]]
+name = "ling3tiny_check"
+required-features = ["model-ling3tiny"]
+path = "tests/tools/ling3tiny_check.rs"
+test = false
+
 [[example]]
 name = "minicpmv47_check"
+required-features = ["model-minicpmv47"]
 path = "tests/tools/minicpmv47_check.rs"
 test = false
 
 [[example]]
 name = "minicpmv47_bench"
+required-features = ["model-minicpmv47"]
 path = "tests/tools/minicpmv47_bench.rs"
 test = false
 
@@ -41,11 +65,13 @@ test = false
 
 [[example]]
 name = "qwen35_check"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_check.rs"
 test = false
 
 [[example]]
 name = "qwen35_inventory"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_inventory.rs"
 test = false
 
@@ -61,11 +87,13 @@ test = false
 
 [[example]]
 name = "vision_probe"
+required-features = ["model-qwen35"]
 path = "tests/tools/vision_probe.rs"
 test = false
 
 [[example]]
 name = "vision_profile"
+required-features = ["model-qwen35"]
 path = "tests/tools/vision_profile.rs"
 test = false
 
@@ -76,7 +104,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tokio-stream = "0.1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 clap = { version = "4", features = ["derive", "env"] }
 ratatui = "0.29"
 crossterm = "0.28"
@@ -91,6 +119,7 @@ rand_chacha = "0.3"
 libc = "0.2"
 rayon = "1"
 regex = "1"
+roxmltree = "0.20"
 base64 = "0.22"
 sha2 = "0.10"
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }

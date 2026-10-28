@@ -1,5 +1,55 @@
 use anyhow::{Result, ensure};
 
+/// Adjacent-pair RoPE shared by query heads and a rotary-only key.
+pub struct InterleavedRope {
+    inv_freq: Vec<f32>,
+}
+
+impl InterleavedRope {
+    pub fn new(rotary_dim: usize, theta: f32) -> Result<Self> {
+        ensure!(
+            rotary_dim > 0 && rotary_dim.is_multiple_of(2) && theta.is_finite() && theta > 0.,
+            "invalid interleaved RoPE geometry"
+        );
+        Ok(Self {
+            inv_freq: (0..rotary_dim / 2)
+                .map(|i| theta.powf(-((2 * i) as f32) / rotary_dim as f32))
+                .collect(),
+        })
+    }
+
+    /// Rotate the last rotary_dim channels of each Q head and the shared K.
+    pub fn apply(
+        &self,
+        query: &mut [f32],
+        key: &mut [f32],
+        head_dim: usize,
+        position: usize,
+    ) -> Result<()> {
+        let rotary_dim = self.inv_freq.len() * 2;
+        ensure!(
+            head_dim >= rotary_dim
+                && query.len().is_multiple_of(head_dim)
+                && key.len() == rotary_dim,
+            "interleaved RoPE input shape mismatch"
+        );
+        let rotate = |pair: &mut [f32], s, c| {
+            let (a, b) = (pair[0], pair[1]);
+            pair[0] = a * c - b * s;
+            pair[1] = b * c + a * s;
+        };
+        for (i, &freq) in self.inv_freq.iter().enumerate() {
+            let (s, c) = (position as f32 * freq).sin_cos();
+            rotate(&mut key[2 * i..2 * i + 2], s, c);
+            let at = head_dim - rotary_dim + 2 * i;
+            for head in query.chunks_mut(head_dim) {
+                rotate(&mut head[at..at + 2], s, c);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Positions are [temporal, height, width], independent of token/KV indices.
 #[derive(Debug, Clone)]
 pub struct MRope {
@@ -91,6 +141,34 @@ impl MRope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_interleaved_angles_match_each_head_and_position() -> Result<()> {
+        let rope = InterleavedRope::new(64, 6_000_000.)?;
+        for pos in [0, 37, 511, 32767] {
+            let mut query: Vec<_> = (0..16 * 192).map(|i| (i as f32 * 0.13).sin()).collect();
+            let mut key: Vec<_> = (0..64).map(|i| (i as f32 * 0.17).cos()).collect();
+            let mut q_ref = query.clone();
+            let mut k_ref = key.clone();
+            for values in q_ref
+                .chunks_mut(192)
+                .map(|h| &mut h[128..])
+                .chain(std::iter::once(k_ref.as_mut_slice()))
+            {
+                for (i, pair) in values.chunks_mut(2).enumerate() {
+                    let angle = pos as f32 * 6_000_000_f32.powf(-((2 * i) as f32) / 64.);
+                    let (s, c) = angle.sin_cos();
+                    let (a, b) = (pair[0], pair[1]);
+                    pair[0] = a * c - b * s;
+                    pair[1] = b * c + a * s;
+                }
+            }
+            rope.apply(&mut query, &mut key, 192, pos)?;
+            assert_eq!(query, q_ref);
+            assert_eq!(key, k_ref);
+        }
+        Ok(())
+    }
 
     #[test]
     fn text_positions_degenerate_and_preserve_unrotated_tail() {

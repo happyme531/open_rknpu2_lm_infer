@@ -51,13 +51,21 @@ impl DFlash {
         self.position = 0;
         Ok(())
     }
-    pub(crate) fn abort(&self) -> Result<()> {
+    pub fn abort(&self) -> Result<()> {
         for layer in &self.layers {
             layer.cache.truncate(self.position)?;
         }
         Ok(())
     }
-    pub(crate) fn backends(&self) -> &[Backend] {
+    pub fn restore_prefix(&mut self, position: usize) -> Result<()> {
+        ensure!(position <= self.position, "cannot extend DFlash prefix");
+        for layer in &self.layers {
+            layer.cache.truncate(position)?;
+        }
+        self.position = position;
+        Ok(())
+    }
+    pub fn backends(&self) -> &[Backend] {
         &self.backends
     }
     pub fn prepare_context(&mut self, features: &[f32], cancel: Option<&AtomicBool>) -> Result<()> {

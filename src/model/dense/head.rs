@@ -1,5 +1,5 @@
 use super::{Dense, elapsed};
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use std::time::Instant;
 
 impl Dense {
@@ -21,7 +21,7 @@ impl Dense {
         }
         self.timings.head += elapsed(start);
         self.trace(-1, "logits", &self.logits)?;
-        ensure!(
+        debug_assert!(
             self.logits.iter().all(|f| f.is_finite()),
             "nonfinite logits"
         );

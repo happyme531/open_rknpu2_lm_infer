@@ -17,7 +17,10 @@ fn narrow_w8_gdn_gates_match_integer_oracle() -> Result<()> {
         tune_cache: cache.path().into(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;

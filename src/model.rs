@@ -3,18 +3,69 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod checkpoint;
+#[allow(
+    dead_code,
+    reason = "Shared CPU adapters remain available in every model build."
+)]
 pub(crate) mod cpu;
+#[cfg(any(
+    feature = "model-qwen3",
+    feature = "model-llama",
+    feature = "model-granite"
+))]
 pub mod dense;
 pub mod dflash;
+#[allow(
+    dead_code,
+    reason = "Shared expert scheduling remains available in every model build."
+)]
 pub mod experts;
+#[cfg(feature = "model-ling3tiny")]
+pub mod ling3tiny;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
+#[allow(
+    dead_code,
+    reason = "Prepared input has a stable shape across model builds."
+)]
+mod prefill;
+#[allow(
+    dead_code,
+    reason = "Shared prefix caching is compiled independently of its model consumers."
+)]
+mod prefix_cache;
 pub(crate) mod projection;
+pub(crate) use prefill::PrefillStep;
+pub use prefill::PreparedPrefill;
 mod speculation;
 pub use speculation::{SpeculativeConfig, SpeculativeType};
+#[cfg(any(feature = "model-qwen35", feature = "model-minicpmv47"))]
 pub mod qwen35;
+mod registry;
+pub use registry::{build_info, ensure_enabled};
+#[allow(
+    dead_code,
+    reason = "Shared tracing and test helpers are independent of model selection."
+)]
 pub(crate) mod trace;
+
+pub struct LinearShape {
+    pub name: &'static str,
+    pub rows: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+pub fn vision_tuning_shapes(path: &std::path::Path, rows: &[usize]) -> Result<Vec<LinearShape>> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    let family = registry::require(&config)?;
+    let shapes = family
+        .vision_shapes
+        .ok_or_else(|| anyhow::anyhow!("this model family has no supported vision encoder"))?;
+    shapes(path, rows)
+}
 
 /// ViT activation storage and CPU arithmetic. NPU GEMMs remain FP16 in both modes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -47,7 +98,22 @@ pub struct ModelOptions {
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
     pub experts: experts::Options,
+    pub checkpoints: CheckpointOptions,
     pub speculation: SpeculativeConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointOptions {
+    pub capacity: usize,
+    pub min_step: usize,
+}
+impl Default for CheckpointOptions {
+    fn default() -> Self {
+        Self {
+            capacity: 32,
+            min_step: 8192,
+        }
+    }
 }
 impl ModelOptions {
     pub(crate) fn validate_speculation(&self) -> Result<()> {
@@ -68,12 +134,28 @@ pub struct ModelInfo {
 /// New architectures register through `load` and implement this contract.
 pub trait LanguageModel {
     fn info(&self) -> &ModelInfo;
+    fn uses_user_boundaries(&self) -> bool {
+        false
+    }
     fn reset(&mut self) -> Result<()>;
     /// Reserve KV for a complete request before tuning and timed forwards.
     fn reserve(&mut self, _tokens: usize) -> Result<()> {
         Ok(())
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()>;
+    fn prepare_prepared<'a>(
+        &mut self,
+        input: &'a crate::input::PreparedInput,
+        start: usize,
+    ) -> Result<PreparedPrefill<'a>> {
+        self.prepare(input.tokens.len() - start)?;
+        Ok(PreparedPrefill {
+            input,
+            start,
+            steps: Vec::new(),
+            checkpoint: None,
+        })
+    }
     /// Consume prompt/history tokens without evaluating final output norm or
     /// lm_head. Generation uses `forward` when next-token logits are required.
     fn prefill(&mut self, _tokens: &[u32]) -> Result<()> {
@@ -84,10 +166,10 @@ pub trait LanguageModel {
     /// state; image decoding and token expansion have already completed.
     fn forward_prepared(
         &mut self,
-        input: &crate::input::PreparedInput,
-        start: usize,
+        prepared: PreparedPrefill<'_>,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<&[f32]> {
+        let PreparedPrefill { input, start, .. } = prepared;
         anyhow::ensure!(
             input.images.is_empty(),
             "this model does not support images"
@@ -185,6 +267,15 @@ pub trait LanguageModel {
     fn truncate(&mut self, _position: usize) -> Result<bool> {
         Ok(false)
     }
+    /// Restore a usable prefix no longer than `maximum`. Zero asks the caller
+    /// to reset. Recurrent models may restore an earlier checkpoint.
+    fn restore_prefix(&mut self, maximum: usize) -> Result<usize> {
+        if maximum == self.position() || self.truncate(maximum)? {
+            Ok(maximum)
+        } else {
+            Ok(0)
+        }
+    }
     fn stats(&self) -> serde_json::Value;
 }
 
@@ -193,11 +284,12 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
     let spec = options.speculation.clone();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+    let family = registry::require(&config)?;
     anyhow::ensure!(
         options.experts.storage != experts::Storage::Stream
             || matches!(
                 config["model_type"].as_str(),
-                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7")
+                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7" | "bailing_hybrid")
             ),
         "expert streaming requires a MoE checkpoint"
     );
@@ -212,15 +304,7 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
         "speculative decoding requires a Qwen3.5 or MiniCPM-V 4.7 checkpoint"
     );
     crate::npu::configure_cpu(&mut options)?;
-    let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
-        Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
-        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7") => {
-            Box::new(qwen35::Qwen35::load(options)?)
-        }
-        other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, minicpmv4_7"
-        ),
-    };
+    let mut model = (family.load)(options)?;
     if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {
         model.enable_mtp(spec.window())?;
     }

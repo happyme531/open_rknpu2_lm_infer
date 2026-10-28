@@ -1,13 +1,11 @@
 //! Model-independent file storage and scheduling for packed expert weights.
 mod io;
-mod paged;
+pub(crate) mod paged;
 pub(crate) mod prepare;
 pub(crate) mod pruning;
 pub mod store;
-mod timeline;
+pub(crate) mod timeline;
 mod window;
-pub(crate) use paged::{Paged, Paging};
-pub(crate) use timeline::Timeline;
 
 use anyhow::{Result, ensure};
 use std::path::PathBuf;

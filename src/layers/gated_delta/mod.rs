@@ -5,4 +5,4 @@ mod mixer;
 mod state;
 
 pub use mixer::{MixerWeights, Projected};
-pub use state::{LayerState, MemoryUsage, Scratch};
+pub use state::{LayerState, MemoryUsage, Scratch, Snapshot};

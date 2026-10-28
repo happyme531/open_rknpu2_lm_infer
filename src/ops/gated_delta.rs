@@ -95,11 +95,8 @@ impl GdnDimensions {
             "GDN update shape mismatch"
         );
         ensure!(
-            updates.log_decay.iter().all(|v| !v.is_nan() && *v <= 0.0)
-                && updates
-                    .beta
-                    .iter()
-                    .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            updates.log_decay.iter().all(|v| *v <= 0.0)
+                && updates.beta.iter().all(|v| (0.0..=1.0).contains(v)),
             "invalid GDN update values"
         );
         Ok(())

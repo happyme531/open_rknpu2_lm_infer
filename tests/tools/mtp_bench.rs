@@ -61,7 +61,7 @@ struct Args {
     tune_cache: Option<PathBuf>,
     #[arg(long)]
     prompts: Option<PathBuf>,
-    #[arg(long, default_value_t = 0.)]
+    #[arg(long, default_value_t = open_rknpu2_lm_infer::sampling::DEFAULT_TEMPERATURE)]
     temperature: f32,
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -208,7 +208,10 @@ fn main() -> Result<()> {
         tune_cache: args.tune_cache.unwrap_or_default(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
+
         speculation: open_rknpu2_lm_infer::model::SpeculativeConfig {
             kind: open_rknpu2_lm_infer::model::SpeculativeType::DraftMtp,
             max_draft: schedule[0],

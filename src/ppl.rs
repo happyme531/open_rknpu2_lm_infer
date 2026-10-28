@@ -56,13 +56,17 @@ pub fn run(
         "PPL token outside model vocabulary"
     );
     let identity = json!({"model":options.path,"inputs":tokens_file,"windows":windows.len(),
-        "window_size":length,"scored_target_positions":[score_start,length - 1],
-        "chunk":options.chunk,"attention_tile":options.attention_tile,
-        "context":options.context,"cpu_threads":options.threads,
-        "expert_min_weight":options.experts.min_weight,
-        "cpu_core_mask":options.cpu_mask,"npu_core_mask":options.npu_mask,
-        "kv_reset_per_window":true,"chat_template":false,"added_bos_eos":false,
-        "arithmetic":"INT32 W4/W8 Linear, native FP16 GQA, FP32 exp and FP64 NLL reduction"});
+    "window_size":length,"scored_target_positions":[score_start,length - 1],
+    "chunk":options.chunk,"attention_tile":options.attention_tile,
+    "context":options.context,"cpu_threads":options.threads,
+    "expert_min_weight":options.experts.min_weight,
+    "cpu_core_mask":options.cpu_mask,"npu_core_mask":options.npu_mask,
+    "kv_reset_per_window":true,"chat_template":false,"added_bos_eos":false,
+    "arithmetic":if model.info().architecture == "bailing_hybrid" {
+        "INT32 W4/W8 Linear, NPU TF32 router, NPU FP16 MLA projections, native FP16 absorbed MLA, FP32 CPU KDA, FP32 exp and FP64 NLL reduction"
+    } else {
+        "INT32 W4/W8 Linear, native FP16 GQA, FP32 exp and FP64 NLL reduction"
+    }});
     let mut report = if report_path.exists() {
         let previous: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
         ensure!(

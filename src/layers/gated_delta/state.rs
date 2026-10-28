@@ -5,6 +5,9 @@ use rayon::ThreadPool;
 use serde::Serialize;
 use std::time::Instant;
 
+mod checkpoint;
+pub use checkpoint::Snapshot;
+
 use super::mixer::{MixerWeights, MixerWorkspace, Projected, ValidatedProjected};
 use crate::ops::{
     causal_conv::ConvState,
@@ -88,10 +91,7 @@ impl Scratch {
     }
     pub fn prepare(&mut self, rows: &[usize]) -> Result<()> {
         if let Some(prefill) = &mut self.prefill {
-            prefill.retain_workspaces(rows);
-            for &m in rows {
-                prefill.prepare(m)?;
-            }
+            prefill.prepare_all(rows)?;
         }
         Ok(())
     }

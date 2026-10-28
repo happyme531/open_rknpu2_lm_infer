@@ -2,7 +2,9 @@ use super::{
     checkpoint::{QuantLoader, concatenate},
     cpu::Cpu,
 };
-use crate::npu::{Backend, FloatBackend, FloatLinear};
+use crate::npu::Backend;
+use crate::npu::FloatBackend;
+use crate::npu::FloatLinear;
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -38,7 +40,8 @@ impl Linear {
     fn n(&self) -> usize {
         match self {
             Self::Quantized(l) => l.n(),
-            Self::Floating { n, .. } | Self::SplitK { n, .. } | Self::SplitN { n, .. } => *n,
+            Self::Floating { n, .. } => *n,
+            Self::SplitK { n, .. } | Self::SplitN { n, .. } => *n,
             Self::Host { weight, .. } => weight.shape[0],
         }
     }
@@ -184,22 +187,13 @@ impl Linear {
                 }
                 Ok(())
             }
-            Self::Floating { linear, n } => {
-                ensure!(
-                    rows > 0 && input.len().is_multiple_of(rows) && output.len() == rows * n,
-                    "invalid floating decoder projection shape"
-                );
-                linear.run(input, output, rows)
-            }
+            Self::Floating { linear, .. } => linear.run(input, output, rows),
         }
     }
     fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
         match self {
             Self::Quantized(l) => l.run_swiglu(input, output, rows),
-            Self::Floating { .. }
-            | Self::SplitK { .. }
-            | Self::SplitN { .. }
-            | Self::Host { .. } => Ok(false),
+            _ => Ok(false),
         }
     }
 }

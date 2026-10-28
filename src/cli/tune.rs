@@ -1,9 +1,11 @@
+use crate::model::ModelOptions;
 use crate::{
-    model::{ModelOptions, VisionDtype},
+    model::VisionDtype,
     npu::{self, Backend, FloatBackend},
     vision::ImageProcessor,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Instant};
 
@@ -59,6 +61,7 @@ fn text_profiles(options: ModelOptions, mut batches: Vec<usize>) -> Result<Value
 }
 
 fn vision_profiles(mut options: ModelOptions, images: Vec<PathBuf>) -> Result<Value> {
+    crate::model::ensure_enabled(&options.path)?;
     let processor =
         ImageProcessor::load(&options.path)?.context("model has no supported vision encoder")?;
     let mut inputs = Vec::new();
@@ -89,7 +92,7 @@ fn vision_profiles(mut options: ModelOptions, images: Vec<PathBuf>) -> Result<Va
     }
     rows.sort_unstable();
     rows.dedup();
-    let shapes = crate::model::qwen35::vision::tuning_shapes(&options.path, &rows)?;
+    let shapes = crate::model::vision_tuning_shapes(&options.path, &rows)?;
     npu::configure_cpu(&mut options)?;
     eprintln!(
         "Tuning ViT {}: {} shapes; cache={}",

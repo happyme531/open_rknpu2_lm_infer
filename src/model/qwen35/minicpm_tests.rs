@@ -105,6 +105,8 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
         speculation: Default::default(),
     };
@@ -209,6 +211,7 @@ fn minicpm_stream_resident_equivalence() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
         speculation: Default::default(),
         experts: crate::model::experts::Options {
             cache: Some(std::env::var("MINICPM_TEST_STORE")?.into()),

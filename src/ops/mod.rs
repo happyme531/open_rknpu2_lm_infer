@@ -7,4 +7,5 @@ pub mod norm;
 pub mod rope;
 
 pub mod gelu;
+pub mod kda;
 pub mod vision_half;

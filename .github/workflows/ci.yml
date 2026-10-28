@@ -56,8 +56,24 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --release --locked -- -D warnings
+      - name: Single-family build checks
+        run: |
+          for features in model-qwen3 model-llama model-granite model-qwen35 model-minicpmv47 model-ling3tiny model-ling3tiny,model-qwen3; do
+            cargo clippy --all-targets --release --locked --no-default-features --features "$features" -- -D warnings
+          done
       - name: Tests
         run: cargo test --release --locked
+      - name: Single-family tests
+        run: |
+          for features in model-qwen3 model-llama model-granite model-qwen35 model-minicpmv47 model-ling3tiny; do
+            cargo test --release --locked --no-default-features --features "$features" --lib --tests
+          done
+      - name: Custom project name
+        env:
+          RKNPU_PROJECT_NAME: customer_infer
+        run: |
+          python3 scripts/build_release.py --models ling3tiny --output /tmp/customer-infer
+          cargo test --release --locked --no-default-features --features model-ling3tiny --test model_selection
       - name: Release build
         run: cargo build --release --locked
       - name: CLI smoke test

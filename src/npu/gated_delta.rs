@@ -3,11 +3,13 @@ use super::*;
 use crate::ops::gated_delta::GdnDimensions;
 
 pub struct GatedDelta {
-    // Drop device work before releasing the context. Keep the configured full
-    // window and at most one tail, shared across all recurrent layers.
+    // Drop device work before releasing the context. Planned forwards retain
+    // their whole row set. An unplanned tail replaces other tails while keeping
+    // the configured full window. All recurrent layers share these workspaces.
     work: BTreeMap<usize, Handle<rk_npu_gdn_workspace>>,
     device: Backend,
     main_rows: usize,
+    workspace_creations: usize,
     calls: usize,
     tokens: usize,
     elapsed_us: f64,
@@ -30,6 +32,7 @@ impl GatedDelta {
             work: BTreeMap::new(),
             device,
             main_rows,
+            workspace_creations: 0,
             calls: 0,
             tokens: 0,
             elapsed_us: 0.,
@@ -54,6 +57,25 @@ impl GatedDelta {
         if rows != self.main_rows {
             self.work.retain(|&m, _| m == self.main_rows);
         }
+        self.create_workspace(rows)
+    }
+    pub fn prepare_all(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(
+            rows.iter().all(|&m| m <= 2048),
+            "NPU GDN window exceeds 2048 tokens"
+        );
+        self.retain_workspaces(rows);
+        for &m in rows {
+            if m > Self::CPU_MAX_ROWS && !self.work.contains_key(&m) {
+                self.create_workspace(m)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn retain_workspaces(&mut self, rows: &[usize]) {
+        self.work.retain(|m, _| rows.contains(m));
+    }
+    fn create_workspace(&mut self, rows: usize) -> Result<()> {
         let device = self.device.0.borrow();
         let mut cfg = rk_npu_gdn_config::default();
         unsafe { rk_npu_gdn_config_init(&mut cfg, rows as i32) };
@@ -76,10 +98,8 @@ impl GatedDelta {
             rows,
             Handle::new(raw, rk_npu_gdn_workspace_free, "NPU GDN workspace")?,
         );
+        self.workspace_creations += 1;
         Ok(())
-    }
-    pub fn retain_workspaces(&mut self, rows: &[usize]) {
-        self.work.retain(|m, _| rows.contains(m));
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_projected(
@@ -148,6 +168,7 @@ impl GatedDelta {
         Ok(())
     }
     pub fn reset_statistics(&mut self) {
+        self.workspace_creations = 0;
         self.calls = 0;
         self.tokens = 0;
         self.elapsed_us = 0.;
@@ -156,6 +177,7 @@ impl GatedDelta {
     }
     pub fn stats(&self) -> Value {
         json!({"gdn_npu_precision":"tf32","gdn_npu_calls":self.calls,"gdn_npu_tokens":self.tokens,
+            "gdn_npu_workspace_creations":self.workspace_creations,
             "gdn_npu_ms":self.elapsed_us/1000.,"gdn_npu_hardware_ms":self.hardware_us/1000.,
             "gdn_npu_prepare_ms":self.cpu_work_us[0]/1000.,
             "gdn_npu_coefficients_ms":self.cpu_work_us[1]/1000.,

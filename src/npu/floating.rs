@@ -293,6 +293,15 @@ impl FloatBackend {
     }
 }
 impl FloatLinear {
+    #[cfg(test)]
+    #[allow(dead_code, reason = "Shared workspace inspection for model tests.")]
+    pub(crate) fn prepared_workspace(&self) -> Option<(usize, usize)> {
+        self.owner
+            .work
+            .borrow()
+            .get(&(self.k, self.n))
+            .map(|w| (w.strategy.M as usize, w.workspace.raw as usize))
+    }
     pub fn prepare(&self, rows: usize) -> Result<()> {
         self.owner
             .prepare_for_weights(self.k, self.n, rows, self.weight.raw)
@@ -408,7 +417,8 @@ impl FloatLinear {
                     std::mem::size_of_val(output) as u64,
                 )
             },
-            &format!("floating Linear M={rows} K={} N={}", self.k, self.n),
+            "floating Linear run",
         )
+        .with_context(|| format!("floating Linear M={rows} K={} N={}", self.k, self.n))
     }
 }

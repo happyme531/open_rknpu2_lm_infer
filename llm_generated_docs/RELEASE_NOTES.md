@@ -1,3 +1,15 @@
+# v0.7.0
+
+- 新增按模型模板处理的工具调用解析，支持 MiniCPM5 XML 工具调用及流式 OpenAI 兼容 API 输出。
+- W4 gate/up 融合扩展到小批次与 decode，按调用策略复用或单独缓存 SwiGLU 工作区；普通 GEMM 的调优策略保持独立。
+- 稠密 FFN 的融合与独立激活统一使用算子库的 FP32 SwiGLU，实现不承诺与旧 FP64 路径逐位一致。
+- 优化有限 top-k 采样，先选择候选再排序；贪心采样改为单次扫描。复用生成缓冲区，移除重复的输出头准备和 release 热路径数值诊断。
+- CLI 与 HTTP API 的默认温度统一为 **1**，默认输出上限统一为 **2048 tokens**。需要贪心生成时显式指定 `--temp 0` 或 API 的 `temperature: 0`。
+- 更新 NPU 算子库至 `4f36ab6`，包含 W4A8 和 Attention 执行优化；普通推理继续读取已有调优缓存，需要时使用 `tune` 命令显式调优。
+- 已完成 RK3588 上的 105 项自动测试、W4/W8 padding 与融合 SwiGLU 板端检查，以及 Qwen3-4B、Qwen3.5-4B MTP1 和 448×448 视觉编码的 README 口径复测。GitHub Release 另执行 ARM64 构建、Clippy、自动测试、启动和打包检查。
+
+ARM64 附件适用于 Debian 11 / glibc 2.31 或更新系统，依赖 libstdc++6、libgomp1 和 RK3588 NPU DRM 驱动。模型独立下载。
+
 # v0.6.1
 
 - 修复 Qwen3.5 图片超过1024个patch时出现 `invalid full FP16 attention shape` 的问题；视觉 Attention 按预处理后的实际图像长度分配工作区。

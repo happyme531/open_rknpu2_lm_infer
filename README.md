@@ -87,6 +87,7 @@
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
+| bailing_hybrid (Ling3tiny) | [Ling-3.0-tiny-QQQ-W4A8-Mixed-CT](llm_generated_docs/LING3TINY_SUPPORT.md) |
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 

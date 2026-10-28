@@ -55,7 +55,10 @@ fn real_weight_ubatch_probe() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;
@@ -264,7 +267,10 @@ fn large_ubatch_model_sweep() -> Result<()> {
             tune_cache: cache.clone(),
             attention_tile: 512,
             vision_dtype: Default::default(),
+            checkpoints: Default::default(),
+
             experts: Default::default(),
+
             speculation: Default::default(),
         })?;
         model.reserve(tokens.len() + continuation.len())?;
@@ -364,7 +370,10 @@ fn large_ubatch_attention_splitting() -> Result<()> {
         tune_cache: PathBuf::new(),
         attention_tile: 512,
         vision_dtype: Default::default(),
+        checkpoints: Default::default(),
+
         experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;

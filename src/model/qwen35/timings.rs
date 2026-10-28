@@ -1,5 +1,5 @@
 //! Synchronous stage totals; fused Linear finish remains part of its call.
-use crate::model::experts::Timeline;
+use crate::model::experts::timeline::Timeline;
 use serde::Serialize;
 use std::time::Instant;
 
