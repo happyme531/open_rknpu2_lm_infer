@@ -63,6 +63,10 @@ jobs:
           done
       - name: Tests
         run: cargo test --release --locked
+      - name: Board runner tests
+        run: |
+          python3 scripts/qwen35/test_board_runner.py
+          python3 -m unittest discover -s tests/board -p 'test_*.py'
       - name: Single-family tests
         run: |
           for features in model-qwen3 model-llama model-granite model-qwen35 model-minicpmv47 model-ling3tiny; do

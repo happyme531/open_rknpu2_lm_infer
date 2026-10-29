@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import time
 
@@ -46,16 +47,37 @@ def write(path, value):
                    text=True, stdout=subprocess.DEVNULL, check=True)
 
 
+def run_command(command, env, lock_fd, timeout):
+    """Keep descendants bounded too, while leaving clock restoration to main."""
+    child = subprocess.Popen(command, env=env, pass_fds=(lock_fd,), start_new_session=True)
+    try:
+        try:
+            return child.wait(timeout=timeout), False
+        except subprocess.TimeoutExpired:
+            return 124, True
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--wait-lock", action="store_true", help="wait for another board job to release the NPU")
     parser.add_argument("--cpu-khz", type=int, default=2400000, help="fixed big-core frequency in kHz")
     parser.add_argument("--skip-dmc", action="store_true", help="leave DDR uncontrolled on boards without DMC devfreq")
+    parser.add_argument("--timeout", type=float, help="command timeout in seconds; terminate its process group and restore clocks")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.cpu_khz <= 0:
         parser.error("--cpu-khz must be positive")
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be positive")
     targets = clock_targets(args.cpu_khz, args.skip_dmc)
     command = args.command
     if command and command[0] == "--":
@@ -92,7 +114,7 @@ def main():
             env.setdefault("GOMP_SPINCOUNT", "0")
             report["environment"] = {k: v for k, v in env.items() if k.startswith(("RK_NPU_", "OMP_", "GOMP_", "OPENBLAS_"))}
             start = time.monotonic()
-            status = subprocess.run(command, env=env, pass_fds=(lock.fileno(),)).returncode
+            status, report["timed_out"] = run_command(command, env, lock.fileno(), args.timeout)
             report["command_elapsed_seconds"] = time.monotonic() - start
             report["after_command"] = snapshot(targets)
         except (OSError, subprocess.CalledProcessError, RuntimeError) as error:

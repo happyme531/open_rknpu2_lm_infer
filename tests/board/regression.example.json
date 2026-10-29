@@ -1,0 +1,25 @@
+{
+  "sources": {
+    "main": "/path/to/main-checkout",
+    "feature": "/path/to/feature-checkout"
+  },
+  "tokens": "/path/to/fixed-600-token-ids.json",
+  "continuation": "/path/to/continuation-token-ids.json",
+  "timeout_seconds": 600,
+  "models": {
+    "qwen3": {
+      "path": "/path/to/Qwen3-4B-W4A8-Mixed-LMHeadW8",
+      "baseline": "main"
+    },
+    "qwen35": {
+      "path": "/path/to/Qwen3.5-4B-W4A8",
+      "baseline": "main",
+      "draft": "/path/to/Qwen3.5-4B-DFlash"
+    },
+    "ling3tiny": {
+      "path": "/path/to/Ling-3.0-tiny-W4A8",
+      "store": "/path/to/ling-expert-store",
+      "baseline": "feature"
+    }
+  }
+}

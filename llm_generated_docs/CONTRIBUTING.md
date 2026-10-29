@@ -18,6 +18,8 @@ cargo test --release --locked
 
 涉及 NPU、KV 或模型前向的修改还需运行相关板端算子测试，并使用固定 token IDs 比较模型 logits。板端测试与测速共享 `/tmp/rknpu_lowlevel_submit.lock`；固定频率和恢复由 `scripts/run_board.py` 管理。
 
+`tests/board/regression.py` 提供配置驱动的单板/多板自动回归，覆盖算子、基线 logits、prefix、专家 prefetch、压缩和推测解码，并支持超时与断点续跑。配置和运行方式见 [BOARD_REGRESSION.md](BOARD_REGRESSION.md)。
+
 全局板锁只用于测试、评估和测速，工具类型为 `validation::BoardLock`；正式 `run`、`chat`、`serve` 和 `tune` 不获取它。真实图片的服务/TUI 回归入口为 `tests/board/vision_api.py`、`vision_tui.py`；由外层 runner 持锁，子应用不继承锁描述符和 bypass 环境变量，以同时验证正式路径不依赖全局锁。TUI 测试可按 `tests/board/requirements.txt` 在隔离目录安装测试依赖。
 
 性能报告包含模型格式、上下文、chunk、CPU/NPU mask、固定频率、调优缓存状态及原始样本。分别报告 prefill、decode 和历史 KV 深度；prefill 测完整主干调用，不执行最终 norm/输出头，decode 包含输出头。连续 `-pg PP,TG` 在同一 KV 上下文先 prefill 再 decode。结果与复现方式见 [VALIDATION.md](VALIDATION.md)。

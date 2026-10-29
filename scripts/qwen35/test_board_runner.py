@@ -6,6 +6,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import json
+import os
+import sys
+import time
 
 spec = importlib.util.spec_from_file_location("run_board", Path(__file__).resolve().parents[1] / "run_board.py")
 runner = importlib.util.module_from_spec(spec)
@@ -37,6 +40,7 @@ class BoardRunnerTests(unittest.TestCase):
                  patch.object(runner, "snapshot", side_effect=[before, fixed, fixed, before]), \
                  patch.object(runner, "write", side_effect=lambda path, value: writes.append((path, str(value)))), \
                  patch.object(runner.subprocess, "run", side_effect=run), \
+                 patch.object(runner, "run_command", return_value=(7, False)), \
                  patch.object(runner.fcntl, "flock"):
                 self.assertEqual(runner.main(), 7)
             data = json.loads(report.read_text())
@@ -50,6 +54,26 @@ class BoardRunnerTests(unittest.TestCase):
             minimum, maximum, _, _ = targets[root]
             self.assertIn((root / minimum, before[str(root)][minimum]), restore)
             self.assertIn((root / maximum, before[str(root)][maximum]), restore)
+
+    def test_timeout_reaps_child_and_its_descendant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child_pid = Path(temp) / "child.pid"
+            command = [sys.executable, "-c",
+                "import subprocess,sys,time; "
+                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)", str(child_pid)]
+            with open(Path(temp)/"lock", "w") as lock:
+                status, timed_out = runner.run_command(command, os.environ.copy(), lock.fileno(), 1)
+            self.assertEqual((status, timed_out), (124, True))
+            pid = int(child_pid.read_text())
+            deadline = time.monotonic()+5
+            while time.monotonic() < deadline:
+                proc = Path(f"/proc/{pid}/stat")
+                if not proc.exists() or proc.read_text().split()[2] == "Z":
+                    break
+                time.sleep(.05)
+            else:
+                self.fail("timed-out descendant is still running")
 
 
 if __name__ == "__main__":
