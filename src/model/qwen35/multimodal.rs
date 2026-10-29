@@ -1,6 +1,8 @@
-use super::{runtime::Qwen35, vision::Encoder};
+use super::runtime::Qwen35;
+use super::vision::Encoder;
 use crate::model::{LanguageModel, PreparedPrefill};
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy)]
@@ -103,15 +105,19 @@ impl Qwen35 {
                     );
                 }
                 crate::progress::prefill_shape(group[0].range.len() != self.options.chunk, || {
-                    self.execute(&inputs[..group.len()], Some(cancel), false)
+                    if self.paging.is_some() {
+                        self.prompt_chunk(inputs[0].0, Some(cancel), inputs[0].1)
+                    } else {
+                        self.execute(&inputs[..group.len()], Some(cancel), false)
+                    }
                 })?;
-                rows = group.last().unwrap().range.len();
+                rows = (group.last().unwrap().range.len() - 1) % self.options.chunk + 1;
                 let completed = group.last().unwrap().range.end - start;
                 let total = input.tokens.len() - start;
-                if completed < total {
-                    if let Some(progress) = progress.as_mut() {
-                        progress(crate::progress::ModelProgress::Prefill { completed, total });
-                    }
+                if completed < total
+                    && let Some(progress) = progress.as_mut()
+                {
+                    progress(crate::progress::ModelProgress::Prefill { completed, total });
                 }
             }
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");

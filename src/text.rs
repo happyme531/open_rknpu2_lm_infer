@@ -26,9 +26,19 @@ struct ChatDelimiters {
 }
 impl ChatDelimiters {
     fn for_template(tokenizer: &Tokenizer, template: &str) -> Result<Option<Self>> {
-        if !template.contains("<|im_start|>") || tokenizer.token_to_id("<|im_start|>").is_none() {
+        let (user, tool) = if template.contains("<|im_start|>")
+            && tokenizer.token_to_id("<|im_start|>").is_some()
+        {
+            ("<|im_start|>user", "<|im_start|>user\n<tool_response>")
+        } else if template.contains("<role>HUMAN</role>")
+            && tokenizer.token_to_id("<|role_end|>").is_some()
+        {
+            // Bailing V3 renders tool-role messages as OBSERVATION. It also
+            // accepts legacy user messages whose content starts with this tag.
+            ("<role>HUMAN</role>", "<role>HUMAN</role><tool_response>")
+        } else {
             return Ok(None);
-        }
+        };
         let encode = |text: &str| -> Result<Vec<u32>> {
             Ok(tokenizer
                 .encode(text, false)
@@ -37,8 +47,8 @@ impl ChatDelimiters {
                 .to_vec())
         };
         Ok(Some(Self {
-            user: encode("<|im_start|>user")?,
-            tool: encode("<|im_start|>user\n<tool_response>")?,
+            user: encode(user)?,
+            tool: encode(tool)?,
         }))
     }
 }
@@ -232,8 +242,7 @@ impl TextCodec {
             && matches!(prompt, Prompt::Chat { .. })
             && let Some(delimiters) = &self.delimiters
         {
-            // Same ChatML user/tool delimiter precedence as llama.cpp's
-            // qwen3-coder parser and common_chat_msg_delimiters::split.
+            // Tool responses take precedence over their enclosing user marker.
             for i in 0..tokens.len() {
                 if tokens[i..].starts_with(&delimiters.user)
                     && !tokens[i..].starts_with(&delimiters.tool)
@@ -535,6 +544,64 @@ mod tests {
         assert!(
             codec
                 .prepare(&Prompt::Text(codec.template.clone()), true)
+                .unwrap()
+                .user_starts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bailing_user_boundaries_exclude_observations_and_legacy_tool_responses() {
+        let vocab = [
+            ("[UNK]", 0),
+            ("system", 1),
+            ("hello", 2),
+            ("world", 3),
+            ("<tool_response>", 4),
+            ("<role>HUMAN</role>", 5),
+            ("<role>OBSERVATION</role>", 6),
+            ("<|role_end|>", 7),
+        ]
+        .into_iter()
+        .map(|(s, n)| (s.to_owned(), n))
+        .collect();
+        let mut tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("[UNK]".into())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tokenizer.add_special_tokens(&[
+            tokenizers::AddedToken::from("<role>HUMAN</role>", true),
+            tokenizers::AddedToken::from("<role>OBSERVATION</role>", true),
+            tokenizers::AddedToken::from("<tool_response>", true),
+            tokenizers::AddedToken::from("<|role_end|>", true),
+        ]);
+        let template = "system<role>HUMAN</role>hello<role>OBSERVATION</role><tool_response>world<role>HUMAN</role><tool_response>world<role>HUMAN</role>hello".to_owned();
+        let delimiters = ChatDelimiters::for_template(&tokenizer, &template).unwrap();
+        let codec = TextCodec {
+            tokenizer,
+            template,
+            eos_token: Value::Null,
+            bos_token: Value::Null,
+            images: None,
+            delimiters,
+        };
+        let prompt = Prompt::Chat {
+            messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+            tools: None,
+            enable_thinking: false,
+        };
+        let input = codec.prepare(&prompt, true).unwrap();
+        assert_eq!(input.tokens, [1, 5, 2, 6, 4, 3, 5, 4, 3, 5, 2]);
+        assert_eq!(input.user_starts, [1, 9]);
+        assert!(
+            codec
+                .prepare(&prompt, false)
                 .unwrap()
                 .user_starts
                 .is_empty()

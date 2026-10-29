@@ -8,6 +8,7 @@ pub enum SpeculativeType {
     None,
     DraftMtp,
     DraftDflash,
+    DraftDspark,
 }
 impl SpeculativeType {
     pub fn as_str(self) -> &'static str {
@@ -15,6 +16,7 @@ impl SpeculativeType {
             Self::None => "none",
             Self::DraftMtp => "draft-mtp",
             Self::DraftDflash => "draft-dflash",
+            Self::DraftDspark => "draft-dspark",
         }
     }
 }
@@ -48,7 +50,15 @@ impl SpeculativeConfig {
         }
     }
     pub(crate) fn validate(&self, chunk: usize) -> Result<()> {
-        ensure!(self.max_draft <= 7, "spec-draft-n-max must be in 0..7");
+        let max = if self.kind == SpeculativeType::DraftDspark {
+            15
+        } else {
+            7
+        };
+        ensure!(
+            self.max_draft <= max,
+            "spec-draft-n-max must be in 0..{max}"
+        );
         ensure!(
             self.window() == 0 || self.max_draft < chunk,
             "spec-draft-n-max must be smaller than ubatch-size"
@@ -62,12 +72,19 @@ impl SpeculativeConfig {
             "spec-draft-p-min requires enabled speculative decoding"
         );
         ensure!(
-            self.kind == SpeculativeType::DraftDflash || self.model.is_none(),
-            "spec-draft-model requires --spec-type draft-dflash"
+            matches!(
+                self.kind,
+                SpeculativeType::DraftDflash | SpeculativeType::DraftDspark
+            ) || self.model.is_none(),
+            "spec-draft-model requires --spec-type draft-dflash or draft-dspark"
         );
         ensure!(
-            self.kind != SpeculativeType::DraftDflash || self.window() == 0 || self.model.is_some(),
-            "draft-dflash requires --spec-draft-model"
+            !matches!(
+                self.kind,
+                SpeculativeType::DraftDflash | SpeculativeType::DraftDspark
+            ) || self.window() == 0
+                || self.model.is_some(),
+            "draft-dflash/draft-dspark requires --spec-draft-model"
         );
         Ok(())
     }

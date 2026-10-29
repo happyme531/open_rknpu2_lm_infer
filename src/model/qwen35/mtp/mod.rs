@@ -200,6 +200,7 @@ impl Predictor {
                 verify: false,
             },
             &mut Timings::default(),
+            None,
         )?;
         self.normalized.resize(rows * h, 0.);
         norm::rms_norm(

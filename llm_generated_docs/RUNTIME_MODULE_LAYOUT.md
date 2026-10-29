@@ -2,9 +2,19 @@
 
 日期：2026-10-17，Asia/Shanghai。
 
+2026-10-28 模型开关边界：Cargo 只提供 `model-*` 家族选择和 `all-models` 组合。条件编译集中在 `model.rs` 的模型入口、模型注册表及模型专属测试工具；共享算子、层、投影、专家调度、预填充、视觉处理和草稿公共实现统一编译，接口和字段不随目标模型选择变化。模型目录保留配置、权重映射和能力接入；运行时判断所选模型是否支持对应能力。新增模型不得向共享模块添加模型家族条件。
+
 2026-10-18视觉扩展：通用输入、图像预处理、LayerNorm/GELU、FP16 Linear分别新增于 `input.rs`、`vision/`、`layers/layer_norm.rs` / `ops/gelu.rs`、`npu/floating.rs`；Qwen3.5目录只放ViT配置/权重/编排。API请求解析及前缀身份管理分别拆至 `api/request.rs`、`engine/context.rs`，视觉功能与验证版本边界见 [视觉记录](QWEN35_VISION_PROGRESS.md)。下文重构数字与验证是10月17日的历史记录。
 
 独立测试和诊断工具源码统一放在 `tests/tools/`，通过 Cargo.toml 显式注册，沿用 `--example NAME` 构建/运行入口；默认测试不执行这些需要外部数据或设备的程序。历史消融和插桩工具移至 `scripts/archive/`，目录与依赖见 [FP16/ViT 实验归档](FP16_VIT_EXPERIMENT_ARCHIVE.md)。
+
+2026-10-24 SSM 前缀缓存：`model/prefix_cache.rs` 和 `model/prefix_cache/` 统一管理 Qwen3.5 与 Ling3tiny 的请求边界调度、同位置快照复用、容量淘汰和统计。模型私有的 `qwen35/cache.rs`、`ling3tiny/cache.rs` 分别负责 GDN/MTP 与 KDA/卷积快照的保存和恢复；Attention/MLA KV 保留分配并截断。模型前向使用同一份 `PreparedPrefill` 计划完成 workspace 准备和实际执行。
+
+2026-10-28 执行边界：Dense 与 Qwen3.5 dense 支持双 ubatch 层流水；Qwen MoE、MiniCPM 和 Ling 使用单执行 lane，加载时拒绝 `--prefill-ubatches 2`。未启用 MTP 时，流式 Qwen MoE/MiniCPM 保留逐层专家执行的逻辑 prompt 块，mixer 继续使用物理 ubatch，checkpoint 标记始终开启新块。`Paging` 的 reader、staging bank、预测和共享工作区由模型持有；每层的 `Paged` 只持有自己的热专家 bank、窗口和统计，串行执行时显式借用模型的 `&Paging`。共享分页状态不进入双 ubatch worker。
+
+`model/workspace.rs` 统一实际物理行数规划与 prefill/decode 阶段切换。生成首个 logits 时释放多行投影工作区与 GDN prefill scratch，包含第二执行 lane；追加多行 prompt 重新进入 prefill 阶段。Backend 使用 `Arc<Mutex<_>>` 管理设备和域，双 lane 共享权重与 KV，各自持有执行 scratch。Qwen 加载器先预分配各域 KV，再上传投影权重；流式模式同时为冷专家和 staging 保留地址域。
+
+开启 W8A8 无损压缩时，Dense、Qwen3.5、MiniCPM 与 Ling 在加载完成及主干调用结束后释放临时未压缩布局；流式逻辑 prompt 块使用相同策略。输出头单独管理其布局，保持原有的权重精度和计算路径。
 
 ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，使用 Rust NEON/窄范围内联汇编及模型自身的 Rayon 线程池。此前新增的 `native/cpu_kernels/vision.cpp`、`vision_rotary.cpp` 和对应 FFI 已移除；`native/cpu_kernels/` 只保留已有的 GDN 内核。
 
@@ -22,7 +32,9 @@ ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，�
 | `src/model/output_head.rs` | Dense 和 Qwen3.5 共用的量化/浮点输出投影及 backend 生命周期；不选择 tied 权重，不做最终 norm/模型缩放 |
 | `src/model/trace.rs` | 两个模型共用的可选 FP32 tensor trace 写出 |
 | `src/model/projection.rs`、`cpu.rs`、`metadata.rs`、`metrics.rs` | 模型共用的量化投影、CPU 线程池/Tensor 适配、元数据与 backend 统计 |
-| `src/model/pipeline.rs`、`prefill.rs` | 模型共用的层末双批流水、单份层状态存储、批次组合和 checkpoint 边界 |
+| `src/model/pipeline.rs`、`prefill.rs` | 层末双批流水、单份层状态存储、物理批次配对、流式逻辑块合并和 checkpoint 边界 |
+| `src/model/experts/` | 原生专家记录、需求优先 I/O、LES 预取、staging、逐层热窗口与共享冷 bank；不承担模型层的并发执行 |
+| `src/model/workspace.rs` | 实际物理行数规划、prefill/decode 阶段切换；模型负责枚举所属 backend 和 GDN/TF32 等专用 scratch |
 | `src/npu/lane.rs` | 共享设备与权重，为有界执行作用域选择独立算子 workspace；不复制模型层 |
 | `src/model/qwen35/` | Qwen 配置/权重映射、RoPE 默认值、Q/gate 布局、混合 decoder 编排、LanguageModel 实现和模型统计 |
 

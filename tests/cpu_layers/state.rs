@@ -56,7 +56,11 @@ fn checkpoints_restore_state_history_and_next_output_after_a_branch() {
         .forward(&pool, &weights, input.view(5, 7), &mut scratch)
         .unwrap()
         .to_vec();
+    let state_pointer = state.canonical().as_ptr();
+    let history_pointer = state.convolution().as_ptr();
     state.restore(&saved).unwrap();
+    assert_eq!(state.canonical().as_ptr(), state_pointer);
+    assert_eq!(state.convolution().as_ptr(), history_pointer);
     assert_eq!(state.position(), 5);
     assert_eq!(state.canonical(), canonical);
     assert_eq!(state.convolution(), history);

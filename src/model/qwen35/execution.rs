@@ -69,6 +69,9 @@ impl Qwen35 {
         let start = Instant::now();
         let (tokens, prepared) = inputs[0];
         let rows = tokens.len();
+        if !verify && rows > 1 {
+            self.workspaces.reset();
+        }
         let position = self.position;
         let rope = self.phases.measure(Phase::Cpu, || {
             embed(
@@ -142,6 +145,7 @@ impl Qwen35 {
                             ..execution
                         },
                         timings,
+                        None,
                     )?;
                     features.record(i, &first.hidden[..rows * self.config.hidden_size]);
                     Ok(())
@@ -155,6 +159,7 @@ impl Qwen35 {
                                 ..next
                             },
                             &mut other_timings,
+                            None,
                         )?;
                         other_features
                             .record(i, &work.hidden[..tokens.len() * self.config.hidden_size]);
@@ -176,6 +181,7 @@ impl Qwen35 {
                         ..execution
                     },
                     &mut self.phases,
+                    self.paging.as_ref(),
                 )?;
                 self.features
                     .record(i, &self.work.hidden[..rows * self.config.hidden_size]);

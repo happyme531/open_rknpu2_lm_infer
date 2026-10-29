@@ -4,8 +4,8 @@
 namespace rknpu2_cpu_kernels {
 #if defined(__aarch64__)
 // Value rows share each key/query load, with ggml's four accumulators per row.
-template<int rows, bool output>
-inline void update_block(float * state, const float * key, float decay,
+template<int rows, bool output, class Decay>
+inline void update_block(float * state, const float * key, Decay decay,
                           float beta, const float * value, const float * query,
                           float * out, float scaling) {
     float32x4_t sums[rows][4];
@@ -14,9 +14,10 @@ inline void update_block(float * state, const float * key, float decay,
         for (int j = 0; j < 4; ++j) {
             const int at = i + 4*j;
             const float32x4_t k = vld1q_f32(key + at);
+            const auto factor = decay_lanes(decay, at);
             for (int r = 0; r < rows; ++r) {
                 float * s = state + r*128 + at;
-                const float32x4_t v = vmulq_n_f32(vld1q_f32(s), decay);
+                const float32x4_t v = apply_decay(vld1q_f32(s), factor);
                 vst1q_f32(s, v);
                 sums[r][j] = vfmaq_f32(sums[r][j], v, k);
             }

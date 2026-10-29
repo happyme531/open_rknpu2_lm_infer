@@ -1,4 +1,5 @@
-//! Qwen3.5 hybrid text model: config, checkpoint mapping and decoder orchestration.
+//! Shared Qwen3.5 decoder architecture, also used by MiniCPM-V 4.7 text.
+//! Model-family availability is controlled by the registry, independently of reuse.
 mod attention;
 mod cache;
 pub mod config;
@@ -7,8 +8,10 @@ mod execution;
 mod features;
 mod head;
 mod load;
+mod moe;
 mod mtp;
 mod multimodal;
+mod prefill;
 mod rope;
 mod runtime;
 mod stats;
@@ -18,3 +21,10 @@ pub mod vision;
 pub mod weights;
 
 pub use runtime::Qwen35;
+
+#[cfg(all(test, feature = "model-minicpmv47"))]
+mod minicpm_spec_tests;
+#[cfg(all(test, feature = "model-minicpmv47"))]
+mod minicpm_tests;
+#[cfg(all(test, feature = "model-minicpmv47"))]
+mod paging_tests;

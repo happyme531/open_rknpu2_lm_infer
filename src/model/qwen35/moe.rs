@@ -1,0 +1,365 @@
+//! Routed FFN orchestration, independent of checkpoint storage and weight paging.
+use super::{
+    config::Config,
+    decoder::{Buffers, Execution},
+    timings::{Phase, Timings},
+};
+use crate::{
+    model::{
+        checkpoint::{QuantLoader, Tensor},
+        cpu::Cpu,
+        experts::{
+            DECODE_BATCH_MAX_ROWS,
+            paged::{Paged, Paging},
+            pruning,
+            store::Store,
+        },
+        projection::{Linear, Projection},
+    },
+    npu::{Backend, Moe},
+};
+use anyhow::{Context, Result, ensure};
+use std::sync::Arc;
+
+enum Bank {
+    Resident(Moe),
+    Paged(Box<Paged>),
+}
+
+pub(super) struct Storage<'a> {
+    pub options: &'a crate::model::ModelOptions,
+    pub store: Option<&'a Arc<Store>>,
+    pub paging: Option<&'a Paging>,
+}
+
+pub(super) struct Routed {
+    router: Tensor,
+    shared_gate: Tensor,
+    experts: Bank,
+    prediction: Option<(Tensor, usize)>,
+    shared_gu: Projection,
+    shared_down: Linear,
+    h: usize,
+    f: usize,
+    count: usize,
+    top: usize,
+    min_weight: f32,
+    pruning: pruning::Stats,
+    pruning_decode: pruning::Stats,
+}
+
+pub(super) fn routes(logits: &[f32], top: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+    ensure!(top > 0 && top <= logits.len(), "invalid router top-k");
+    debug_assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "nonfinite router logits"
+    );
+    let mut ids: Vec<usize> = (0..logits.len()).collect();
+    ids.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+    ids.truncate(top);
+    let max = logits[ids[0]];
+    let mut weights: Vec<_> = ids.iter().map(|&id| (logits[id] - max).exp()).collect();
+    let sum: f32 = weights.iter().sum();
+    for w in &mut weights {
+        *w /= sum;
+    }
+    Ok((ids.into_iter().map(|id| id as i32).collect(), weights))
+}
+
+impl Routed {
+    #[cfg(all(test, feature = "model-minicpmv47"))]
+    pub(super) fn export(&self, expert: usize) -> Result<Vec<u8>> {
+        match &self.experts {
+            Bank::Resident(m) => m.export(expert),
+            _ => anyhow::bail!("paged bank is not fully resident"),
+        }
+    }
+    pub(super) fn statistics(&self) -> serde_json::Value {
+        let mut stats = match &self.experts {
+            Bank::Resident(_) => serde_json::json!({}),
+            Bank::Paged(p) => p.stats(),
+        };
+        stats["pruning"] = serde_json::json!({"minimum_weight":self.min_weight,
+            "all":self.pruning,"decode":self.pruning_decode});
+        stats
+    }
+    pub(super) fn load(
+        backend: &Backend,
+        loader: &Arc<QuantLoader>,
+        cpu: &Cpu,
+        c: &Config,
+        p: &str,
+        index: usize,
+        storage: Storage<'_>,
+    ) -> Result<Self> {
+        let Storage {
+            options,
+            store,
+            paging,
+        } = storage;
+        pruning::validate(options.experts.min_weight)?;
+        let m = c.moe.as_ref().expect("MoE configuration");
+        let h = c.hidden_size;
+        let experts = if let Some(paging) = paging {
+            Bank::Paged(Box::new(Paged::new(
+                backend,
+                store.unwrap(),
+                index,
+                paging,
+            )?))
+        } else if let Some(store) = store {
+            let mut bank = backend.moe_packed(h, c.intermediate_size, m.experts, m.top_k)?;
+            for expert in 0..m.experts {
+                bank.import(expert, store.read(index, expert)?.as_bytes())?;
+            }
+            Bank::Resident(bank)
+        } else {
+            let mut gate = Vec::with_capacity(m.experts);
+            let mut down = Vec::with_capacity(m.experts);
+            let name = format!("{p}.mlp.experts");
+            for expert in 0..m.experts {
+                let (g, d) = cpu
+                    .pool
+                    .install(|| loader.expert(&name, expert, h, c.intermediate_size))?;
+                gate.push(g);
+                down.push(d);
+            }
+            let experts = backend.load_moe(&gate, &down, m.top_k)?;
+            drop((gate, down));
+            loader.store.release_pages()?;
+            Bank::Resident(experts)
+        };
+        let prediction =
+            if paging.is_some() && options.experts.prefetch && index + 1 < c.layers.len() {
+                let router = loader.store.get(&format!(
+                    "{}.layers.{}.mlp.gate.weight",
+                    c.text_prefix,
+                    index + 1
+                ))?;
+                router.require_shape(&[m.experts, h], "LES next-layer router")?;
+                Some((router, index + 1))
+            } else {
+                None
+            };
+        let router = loader.store.get(&format!("{p}.mlp.gate.weight"))?;
+        router.require_shape(&[m.experts, h], "MoE router")?;
+        let shared_gate = loader
+            .store
+            .get(&format!("{p}.mlp.shared_expert_gate.weight"))?;
+        shared_gate.require_shape(&[1, h], "shared expert gate")?;
+        ensure!(
+            router.floating() && shared_gate.floating(),
+            "router and shared gate must be floating"
+        );
+        let f = m.shared_intermediate;
+        Ok(Self {
+            router,
+            shared_gate,
+            experts,
+            prediction,
+            shared_gu: Projection::load(
+                backend,
+                loader,
+                cpu,
+                vec![
+                    (format!("{p}.mlp.shared_expert.gate_proj"), f),
+                    (format!("{p}.mlp.shared_expert.up_proj"), f),
+                ],
+                h,
+            )?,
+            shared_down: Linear::load(
+                backend,
+                loader,
+                cpu,
+                &format!("{p}.mlp.shared_expert.down_proj"),
+                h,
+                f,
+            )?,
+            h,
+            f,
+            count: m.experts,
+            top: m.top_k,
+            min_weight: options.experts.min_weight,
+            pruning: pruning::Stats::default(),
+            pruning_decode: pruning::Stats::default(),
+        })
+    }
+
+    pub(super) fn forward(
+        &mut self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+        paging: Option<&Paging>,
+    ) -> Result<()> {
+        self.routed(
+            &w.normalized[..e.rows * self.h],
+            &mut w.projected[..e.rows * self.h],
+            e,
+            timings,
+            paging,
+        )?;
+        self.shared(w, e, timings)
+    }
+
+    pub(super) fn routed(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        e: &Execution<'_>,
+        timings: &mut Timings,
+        paging: Option<&Paging>,
+    ) -> Result<()> {
+        let rows = e.rows;
+        timings.context(e.position, rows, e.index, e.verify);
+        let mut ids = Vec::with_capacity(rows * self.top);
+        let mut weights = Vec::with_capacity(rows * self.top);
+        let mut logits = vec![0.; rows * self.count];
+        timings.stage(Phase::Cpu, "target router", || -> Result<()> {
+            e.cpu.dense_head_batch(&self.router, input, &mut logits);
+            for row in logits.chunks_exact(self.count) {
+                let (i, r) = routes(row, self.top)?;
+                ids.extend(i);
+                weights.extend(r);
+            }
+            Ok(())
+        })?;
+        let original_weights = (self.min_weight > 0.).then(|| weights.clone());
+        if let Some(original) = &original_weights {
+            for row in weights.chunks_exact_mut(self.top) {
+                pruning::apply(row, self.min_weight);
+            }
+            self.pruning.record(original, &weights, rows);
+            if rows <= DECODE_BATCH_MAX_ROWS {
+                self.pruning_decode.record(original, &weights, rows);
+            }
+        } else {
+            self.pruning.record_unpruned(weights.len(), rows);
+            if rows <= DECODE_BATCH_MAX_ROWS {
+                self.pruning_decode.record_unpruned(weights.len(), rows);
+            }
+        }
+        let request = timings.stage(Phase::Cpu, "target demand bookkeeping", || -> Result<_> {
+            Ok(match &self.experts {
+                Bank::Paged(bank) => Some(bank.request(
+                    paging.context("paged experts require the model paging context")?,
+                    &ids,
+                    &weights,
+                    e.position,
+                    rows,
+                )),
+                Bank::Resident(_) => None,
+            })
+        })?;
+        if rows <= DECODE_BATCH_MAX_ROWS
+            && let (Some((router, next)), Some(paging)) = (&self.prediction, paging)
+        {
+            let predicted = timings.stage(Phase::Cpu, "target LES router", || -> Result<_> {
+                let mut predicted = Vec::with_capacity(rows * self.top);
+                e.cpu.dense_head_batch(router, input, &mut logits);
+                for row in logits.chunks_exact(self.count) {
+                    let (ids, mut weights) = routes(row, self.top)?;
+                    pruning::apply(&mut weights, self.min_weight);
+                    predicted.extend(
+                        ids.into_iter()
+                            .zip(weights)
+                            .filter_map(|(id, weight)| (weight > 0.).then_some(id)),
+                    );
+                }
+                Ok(predicted)
+            })?;
+            timings.stage(Phase::Cpu, "target LES enqueue", || {
+                paging.predict(*next, &predicted)
+            });
+        }
+        if e.trace.enabled() {
+            e.trace.save(
+                e.position,
+                e.index,
+                "router_weights_original",
+                original_weights.as_deref().unwrap_or(&weights),
+            )?;
+            e.trace.save(
+                e.position,
+                e.index,
+                "router_ids",
+                &ids.iter().map(|&i| i as f32).collect::<Vec<_>>(),
+            )?;
+            e.trace
+                .save(e.position, e.index, "router_weights", &weights)?;
+        }
+        timings.stage(Phase::Linear, "target routed", || match &mut self.experts {
+            Bank::Resident(bank) => bank.run(input, &ids, &weights, output, rows),
+            Bank::Paged(bank) => bank.run(
+                paging.context("paged experts require the model paging context")?,
+                input,
+                (&ids, &weights),
+                output,
+                request.expect("paged expert demand"),
+            ),
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn shared(
+        &self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+    ) -> Result<()> {
+        let rows = e.rows;
+        timings.context(e.position, rows, e.index, e.verify);
+        timings.stage(Phase::Linear, "target shared gateup", || {
+            self.shared_gu.run(
+                &w.normalized[..rows * self.h],
+                &mut w.gate_up[..rows * 2 * self.f],
+                rows,
+                &mut w.scatter,
+            )
+        })?;
+        timings.trace("target shared activation", || {
+            e.cpu.swiglu(
+                &w.gate_up[..rows * 2 * self.f],
+                &mut w.middle[..rows * self.f],
+                self.f,
+            );
+        });
+        timings.stage(Phase::Linear, "target shared down", || {
+            self.shared_down.run(
+                &w.middle[..rows * self.f],
+                &mut w.attended[..rows * self.h],
+                rows,
+            )
+        })?;
+        timings.stage(Phase::Cpu, "target shared gate merge", || {
+            let mut gate = [0.];
+            for row in 0..rows {
+                e.cpu.dense_head(
+                    &self.shared_gate,
+                    &w.normalized[row * self.h..(row + 1) * self.h],
+                    &mut gate,
+                );
+                let scale = 1. / (1. + (-gate[0]).exp());
+                for col in 0..self.h {
+                    w.projected[row * self.h + col] += scale * w.attended[row * self.h + col];
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn routing_is_normalized_over_selected_experts() {
+        let (ids, weights) = routes(&[-100., 1., 3., 2.], 2).unwrap();
+        assert_eq!(ids, [2, 3]);
+        assert!((weights[0] - 1. / (1. + (-1f32).exp())).abs() < 1e-6);
+        assert!((weights.iter().sum::<f32>() - 1.).abs() < 1e-6);
+        assert!(routes(&[], 1).is_err());
+        assert!(routes(&[0.], 0).is_err());
+        assert!(routes(&[0.], 2).is_err());
+    }
+}

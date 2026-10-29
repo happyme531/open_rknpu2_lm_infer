@@ -4,6 +4,13 @@ use std::time::Instant;
 
 impl Dense {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
+        self.workspaces.enter_decode(
+            self.backends
+                .iter()
+                .chain(self.head.backend())
+                .chain(self.secondary.iter().flat_map(|lane| lane.backends())),
+            &[1],
+        )?;
         let start = Instant::now();
         let batch = &mut self.batches[0];
         self.cpu.norm(

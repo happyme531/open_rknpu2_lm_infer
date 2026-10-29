@@ -1,0 +1,376 @@
+//! Grouped routed FFN. Immutable expert banks share scratch within a domain.
+use super::*;
+
+pub(super) type Key = (usize, usize, usize, usize, bool);
+pub(super) struct Work {
+    workspace: Handle<rk_npu_moe_w8_workspace>,
+    pub bytes: u64,
+}
+
+pub struct Moe {
+    weights: Handle<rk_npu_moe_w8_weights>,
+    owner: Backend,
+    key: Key,
+}
+
+/// Main-thread owner of staging storage; no compute workspace is allocated.
+pub(crate) struct ImportBank {
+    weights: Handle<rk_npu_moe_w8_weights>,
+    owner: Backend,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportTarget(*mut rk_npu_moe_w8_weights);
+// The reader loans distinct staging slots to its workers. It joins all workers
+// before dropping the ImportBanks and their owning contexts.
+unsafe impl Send for ImportTarget {}
+pub(crate) struct ImportTiming {
+    pub copy_ms: f64,
+    pub validate_ms: f64,
+    pub sync_ms: f64,
+    pub total_ms: f64,
+}
+impl ImportTarget {
+    /// The bank/context must remain alive; this slot must be exclusively loaned.
+    pub unsafe fn import(self, slot: usize, data: &[u8]) -> Result<ImportTiming> {
+        let mut timing = rk_npu_moe_import_timings::default();
+        check(
+            unsafe {
+                rk_npu_moe_quant_import_expert_timed(
+                    self.0,
+                    slot as i32,
+                    data.as_ptr().cast(),
+                    data.len() as u64,
+                    &mut timing,
+                )
+            },
+            "stage packed expert",
+        )?;
+        Ok(ImportTiming {
+            copy_ms: timing.copy_us / 1000.,
+            validate_ms: timing.validate_us / 1000.,
+            sync_ms: (timing.gate_sync_us + timing.down_sync_us) / 1000.,
+            total_ms: timing.total_us / 1000.,
+        })
+    }
+}
+impl ImportBank {
+    /// The reader must join its workers before this owner is destroyed.
+    pub unsafe fn target(&self) -> ImportTarget {
+        ImportTarget(self.weights.raw)
+    }
+    pub fn weight_bytes(&self) -> u64 {
+        unsafe { rk_npu_moe_w8_weights_device_bytes(self.weights.raw) }
+    }
+    pub fn shares_context(&self, moe: &Moe) -> bool {
+        Arc::ptr_eq(&self.owner.0, &moe.owner.0)
+    }
+}
+
+impl Backend {
+    pub fn load_moe(&self, gate: &[QuantMatrix], down: &[QuantMatrix], top: usize) -> Result<Moe> {
+        self.load_moe_impl(gate, down, top, None)
+    }
+
+    pub fn load_moe_with_shared(
+        &self,
+        gate: &[QuantMatrix],
+        down: &[QuantMatrix],
+        top: usize,
+        shared: (&QuantMatrix, &QuantMatrix),
+    ) -> Result<Moe> {
+        self.load_moe_impl(gate, down, top, Some(shared))
+    }
+
+    fn load_moe_impl(
+        &self,
+        gate: &[QuantMatrix],
+        down: &[QuantMatrix],
+        top: usize,
+        shared: Option<(&QuantMatrix, &QuantMatrix)>,
+    ) -> Result<Moe> {
+        ensure!(
+            !gate.is_empty() && gate.len() == down.len(),
+            "invalid expert bank"
+        );
+        gate.iter()
+            .chain(down)
+            .try_for_each(QuantMatrix::validate)?;
+        ensure!(
+            gate.iter().chain(down).all(|m| m.bits == 4),
+            "grouped MoE requires W4 gate/up and down weights"
+        );
+        let (h, f, e) = (gate[0].k, gate[0].n / 2, gate.len());
+        ensure!(
+            gate.iter().all(|g| g.k == h && g.n == 2 * f)
+                && down.iter().all(|d| d.k == f && d.n == h),
+            "incompatible expert matrices"
+        );
+        let mut experts: Vec<_> = gate
+            .iter()
+            .zip(down)
+            .map(|(g, d)| rk_npu_moe_w8_expert {
+                gate_up: g.codes.as_ptr(),
+                gate_up_scales: g.scales.as_ptr(),
+                down: d.codes.as_ptr(),
+                down_scales: d.scales.as_ptr(),
+            })
+            .collect();
+        if let Some((g, d)) = shared {
+            experts.push(shared_expert(g, d, h, f)?);
+        }
+        self.moe_bank((h, f, e, top, shared.is_some()), |domain, config| unsafe {
+            if shared.is_some() {
+                rk_npu_moe_w4_weights_create(domain, config, experts.as_ptr())
+            } else {
+                rk_npu_moe_quant_weights_create(domain, config, experts.as_ptr())
+            }
+        })
+    }
+
+    pub fn moe_slots(&self, h: usize, f: usize, slots: usize) -> Result<Moe> {
+        self.moe_packed(h, f, slots, 1)
+    }
+    pub fn moe_packed(&self, h: usize, f: usize, slots: usize, top: usize) -> Result<Moe> {
+        self.moe_bank((h, f, slots, top, false), |domain, config| unsafe {
+            rk_npu_moe_quant_slots_create(domain, config)
+        })
+    }
+
+    pub fn moe_packed_with_shared(
+        &self,
+        h: usize,
+        f: usize,
+        slots: usize,
+        top: usize,
+        shared: (&QuantMatrix, &QuantMatrix),
+    ) -> Result<Moe> {
+        let expert = shared_expert(shared.0, shared.1, h, f)?;
+        self.moe_bank((h, f, slots, top, true), |domain, config| unsafe {
+            rk_npu_moe_w4_slots_create(domain, config, &expert)
+        })
+    }
+
+    fn moe_bank(
+        &self,
+        key: Key,
+        create: impl FnOnce(
+            *mut rk_npu_iommu_domain,
+            &rk_npu_moe_w8_weight_config,
+        ) -> *mut rk_npu_moe_w8_weights,
+    ) -> Result<Moe> {
+        let (h, f, e, top, shared) = key;
+        let mut b = self.0.lock().unwrap();
+        ensure!(
+            [1, 3, 7].contains(&b.options.npu_mask),
+            "grouped MoE requires NPU mask 1/3/7"
+        );
+        let mut config = rk_npu_moe_w8_config::default();
+        unsafe {
+            rk_npu_moe_w8_config_init(
+                &mut config,
+                h as i32,
+                f as i32,
+                e as i32,
+                i32::from(shared),
+                top as i32,
+                b.options.chunk as i32,
+            )
+        };
+        config.npu_cores = b.options.npu_mask.count_ones() as i32;
+        config.cpu_threads = b.options.threads as i32;
+        let weights = Handle::new(
+            create(b.domain.raw, &config.weights),
+            rk_npu_moe_w8_weights_free,
+            "packed MoE expert bank",
+        )?;
+        if !b.moe_work.contains_key(&key) {
+            let workspace = Handle::new(
+                unsafe {
+                    if shared {
+                        rk_npu_moe_w4_workspace_create(b.domain.raw, &config)
+                    } else {
+                        rk_npu_moe_quant_workspace_create(b.domain.raw, &config)
+                    }
+                },
+                rk_npu_moe_w8_workspace_free,
+                "grouped MoE workspace",
+            )?;
+            let bytes = unsafe { rk_npu_moe_w8_workspace_device_bytes(workspace.raw) };
+            b.moe_work.insert(key, Work { workspace, bytes });
+        }
+        b.weight_bytes += unsafe { rk_npu_moe_w8_weights_device_bytes(weights.raw) };
+        Ok(Moe {
+            weights,
+            owner: self.clone(),
+            key,
+        })
+    }
+}
+
+fn shared_expert(
+    g: &QuantMatrix,
+    d: &QuantMatrix,
+    h: usize,
+    f: usize,
+) -> Result<rk_npu_moe_w8_expert> {
+    g.validate()?;
+    d.validate()?;
+    ensure!(
+        g.bits == 8 && d.bits == 8 && g.k == h && g.n == 2 * f && d.k == f && d.n == h,
+        "joint MoE requires a shared W8 expert with the routed intermediate width"
+    );
+    Ok(rk_npu_moe_w8_expert {
+        gate_up: g.codes.as_ptr(),
+        gate_up_scales: g.scales.as_ptr(),
+        down: d.codes.as_ptr(),
+        down_scales: d.scales.as_ptr(),
+    })
+}
+
+impl Moe {
+    pub(crate) fn import_bank(&self, slots: usize) -> Result<ImportBank> {
+        let mut b = self.owner.0.lock().unwrap();
+        let config = rk_npu_moe_w8_weight_config {
+            hidden: self.key.0 as i32,
+            intermediate: self.key.1 as i32,
+            routed_experts: slots as i32,
+            shared_expert: 0,
+        };
+        let weights = Handle::new(
+            unsafe { rk_npu_moe_quant_slots_create(b.domain.raw, &config) },
+            rk_npu_moe_w8_weights_free,
+            "expert staging bank",
+        )?;
+        b.weight_bytes += unsafe { rk_npu_moe_w8_weights_device_bytes(weights.raw) };
+        Ok(ImportBank {
+            weights,
+            owner: self.owner.clone(),
+        })
+    }
+    pub(crate) fn promote(
+        &mut self,
+        slot: usize,
+        bank: &mut ImportBank,
+        staged: usize,
+    ) -> Result<()> {
+        check(
+            unsafe {
+                rk_npu_moe_quant_swap_slots(
+                    self.weights.raw,
+                    slot as i32,
+                    bank.weights.raw,
+                    staged as i32,
+                )
+            },
+            "promote staged expert",
+        )
+    }
+    pub fn weight_bytes(&self) -> u64 {
+        unsafe { rk_npu_moe_w8_weights_device_bytes(self.weights.raw) }
+    }
+    pub fn blob_version() -> u32 {
+        RK_NPU_MOE_QUANT_BLOB_VERSION
+    }
+    pub fn blob_bytes(&self) -> usize {
+        (unsafe { rk_npu_moe_quant_expert_blob_bytes(self.weights.raw) }) as usize
+    }
+    pub fn export(&self, expert: usize) -> Result<Vec<u8>> {
+        ensure!(expert < self.key.2, "expert index out of range");
+        let bytes = unsafe { rk_npu_moe_quant_expert_blob_bytes(self.weights.raw) } as usize;
+        ensure!(bytes > 0, "expert bank has no packed cache representation");
+        let mut data = vec![0; bytes];
+        check(
+            unsafe {
+                rk_npu_moe_quant_export_expert(
+                    self.weights.raw,
+                    expert as i32,
+                    data.as_mut_ptr().cast(),
+                    bytes as u64,
+                )
+            },
+            "export packed expert",
+        )?;
+        Ok(data)
+    }
+    pub fn import(&mut self, slot: usize, data: &[u8]) -> Result<()> {
+        ensure!(slot < self.key.2, "expert slot out of range");
+        check(
+            unsafe {
+                rk_npu_moe_quant_import_expert(
+                    self.weights.raw,
+                    slot as i32,
+                    data.as_ptr().cast(),
+                    data.len() as u64,
+                )
+            },
+            "import packed expert",
+        )
+    }
+    pub fn max_rows(&self) -> usize {
+        self.owner.0.lock().unwrap().options.chunk
+    }
+    pub fn run(
+        &self,
+        input: &[f32],
+        ids: &[i32],
+        routes: &[f32],
+        output: &mut [f32],
+        rows: usize,
+    ) -> Result<()> {
+        self.execute(input, ids, routes, output, rows, ptr::null_mut())
+    }
+    pub(crate) fn run_profiled(
+        &self,
+        input: &[f32],
+        ids: &[i32],
+        routes: &[f32],
+        output: &mut [f32],
+        rows: usize,
+    ) -> Result<Value> {
+        let mut t = rk_npu_moe_w8_timings::default();
+        self.execute(input, ids, routes, output, rows, &mut t)?;
+        Ok(json!({
+            "input_us":t.input_us,"schedule_us":t.schedule_us,"build_us":t.build_us,
+            "sync_us":t.sync_us,"gather_us":t.gather_us,"gate_us":t.gate_us,
+            "middle_npu_us":t.middle_npu_us,"middle_cpu_us":t.middle_cpu_us,
+            "down_us":t.down_us,"combine_us":t.combine_us,"lut_load_us":t.lut_load_us,
+            "total_us":t.total_us,"gather_tasks":t.gather_tasks,
+            "middle_tasks":t.middle_tasks,"gemm_tasks":t.gemm_tasks
+        }))
+    }
+    fn execute(
+        &self,
+        input: &[f32],
+        ids: &[i32],
+        routes: &[f32],
+        output: &mut [f32],
+        rows: usize,
+        timing: *mut rk_npu_moe_w8_timings,
+    ) -> Result<()> {
+        let (h, _, _, top, _) = self.key;
+        ensure!(
+            input.len() == rows * h
+                && output.len() == rows * h
+                && ids.len() == rows * top
+                && routes.len() == ids.len(),
+            "grouped MoE input shape mismatch"
+        );
+        let b = self.owner.0.lock().unwrap();
+        let work = b.moe_work.get(&self.key).context("missing MoE workspace")?;
+        check(
+            unsafe {
+                rk_npu_moe_w8_run_f32(
+                    work.workspace.raw,
+                    self.weights.raw,
+                    rows as i32,
+                    input.as_ptr(),
+                    ids.as_ptr(),
+                    routes.as_ptr(),
+                    output.as_mut_ptr(),
+                    timing,
+                )
+            },
+            "grouped routed FFN",
+        )
+    }
+}

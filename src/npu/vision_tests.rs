@@ -19,6 +19,9 @@ fn fp16_linear_and_noncausal_attention_match_cpu() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;
@@ -144,6 +147,9 @@ fn full_attention_uses_temporary_buffers_for_actual_patch_rows() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;

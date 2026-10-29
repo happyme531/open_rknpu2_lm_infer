@@ -56,6 +56,26 @@ pub(crate) fn groups(
     })
 }
 
+impl PrefillStep {
+    /// Join adjacent physical batches within a logical block. A checkpoint
+    /// always starts a new block so its save position cannot move.
+    pub fn coalesce(steps: Vec<Self>, max_rows: usize) -> Vec<Self> {
+        let mut result: Vec<Self> = Vec::new();
+        for step in steps {
+            if let Some(previous) = result.last_mut()
+                && !step.checkpoint
+                && previous.range.end == step.range.start
+                && step.range.end - previous.range.start <= max_rows
+            {
+                previous.range.end = step.range.end;
+            } else {
+                result.push(step);
+            }
+        }
+        result
+    }
+}
+
 /// One prepared forward. The input stays borrowed until its plan is consumed.
 pub struct PreparedPrefill<'a> {
     pub(crate) input: &'a PreparedInput,
@@ -108,5 +128,21 @@ mod tests {
             [vec![128], vec![128, 128], vec![128, 128], vec![1]]
         );
         assert_eq!(groups(&steps, 128, 1).count(), steps.len());
+    }
+
+    #[test]
+    fn logical_streaming_blocks_preserve_checkpoints_and_physical_tail() {
+        let mut steps = PrefillStep::chunks(1409, 128);
+        steps[1].checkpoint = true;
+        steps[6].checkpoint = true;
+        let steps = PrefillStep::coalesce(steps, 1024);
+        let plan: Vec<_> = groups(&steps, 128, 1)
+            .map(|group| {
+                assert_eq!(group.len(), 1);
+                (group[0].range.clone(), group[0].checkpoint)
+            })
+            .collect();
+        assert_eq!(plan, [(0..128, false), (128..768, true), (768..1409, true)]);
+        assert_eq!((steps.last().unwrap().range.len() - 1) % 128 + 1, 1);
     }
 }

@@ -13,27 +13,53 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--binary", type=Path, help="Executable to package (defaults to Cargo target/release)")
+    parser.add_argument("--models", help="Require this exact comma-separated family list in the built executable")
+    parser.add_argument("--name", help="Require this project name in the built executable")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    metadata = json.loads(subprocess.check_output(
-        ["cargo", "metadata", "--format-version", "1", "--locked"], cwd=root, text=True,
-    ))
-    project = next(package for package in metadata["packages"]
+    cargo_metadata = ["cargo", "metadata", "--format-version", "1", "--locked"]
+    basic = json.loads(subprocess.check_output(cargo_metadata + ["--no-deps"], cwd=root, text=True))
+    project = next(package for package in basic["packages"]
                    if Path(package["manifest_path"]) == root / "Cargo.toml")
     version = project["version"]
+    target = next(target["name"] for target in project["targets"] if "bin" in target["kind"])
+    executable = (args.binary or Path(basic["target_directory"]) / "release" / target).resolve()
+    build = json.loads(subprocess.check_output([str(executable), "models"], text=True))
+    project_name = build["project_name"]
+    if args.name is not None and args.name != project_name:
+        parser.error(f"binary project name {project_name!r} does not match requested {args.name!r}; rebuild with --name")
+    families = sorted(family["name"] for family in build["model_families"])
+    if not families or build["version"] != version:
+        parser.error("binary must enable a model family and match the Cargo package version")
+    if args.models is not None:
+        requested = sorted(set(args.models.split(",")))
+        if requested != families:
+            parser.error(f"binary families {families} do not match requested {requested}; rebuild with the intended features")
+    features = [f"model-{name}" for name in families]
+    metadata = json.loads(subprocess.check_output(
+        cargo_metadata + ["--no-default-features", "--features", ",".join(features)], cwd=root, text=True,
+    ))
     if os.environ.get("GITHUB_REF_TYPE") == "tag":
         if os.environ["GITHUB_REF_NAME"] != f"v{version}":
             parser.error("release tag must match the Cargo package version")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    prefix = f"open_rknpu2_lm_infer-v{version}"
+    all_families = sorted(name.removeprefix("model-") for name in project["features"] if name.startswith("model-"))
+    variant = "" if families == all_families else "-" + "-".join(families)
+    prefix = f"{project_name}-v{version}{variant}"
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary)
         binary = staging / f"{prefix}-linux-aarch64"
         (binary / "bin").mkdir(parents=True)
-        shutil.copy2(root / "target/release/open_rknpu2_lm_infer", binary / "bin")
-        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock"]:
-            shutil.copy2(root / name, binary / name)
+        shutil.copy2(executable, binary / "bin" / project_name)
+        (binary / "build-info.json").write_text(json.dumps(build, indent=2) + "\n")
+        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "README_zh.md", "Cargo.lock",
+                     "src/model/experts/Strata-LICENSE", "src/model/experts/Omni-LICENSE",
+                     "src/model/dflash/DeepSpec-LICENSE"]:
+            destination = binary / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / name, destination)
         docs = subprocess.check_output(
             ["git", "ls-files", "-z", "--", "llm_generated_docs"], cwd=root,
         ).decode().split("\0")

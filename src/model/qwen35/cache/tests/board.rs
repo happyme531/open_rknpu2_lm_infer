@@ -60,6 +60,8 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+        experts: Default::default(),
+
         speculation: crate::model::SpeculativeConfig {
             kind,
             max_draft: 3,
@@ -70,6 +72,12 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     if let Some(cache) = std::env::var_os("RKNPU_MTP_TUNE_CACHE") {
         options.tune = true;
         options.tune_cache = cache.into();
+    }
+    if let Some(store) = std::env::var_os("RKNPU_PREFIX_EXPERT_STORE") {
+        options.experts.cache = Some(store.into());
+    }
+    if std::env::var_os("RKNPU_PREFIX_STREAM").is_some() {
+        options.experts.storage = crate::model::experts::Storage::Stream;
     }
     crate::npu::configure_cpu(&mut options)?;
     let codec = TextCodec::load(&options.path)?;
@@ -88,6 +96,15 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     );
     let cancel = AtomicBool::new(false);
     let prepared = model.prepare_prepared(&input, 0)?;
+    if model.paging.is_some() && model.mtp.is_none() {
+        assert!(
+            prepared
+                .steps
+                .iter()
+                .any(|step| step.range.len() > model.options.chunk),
+            "streaming prepared input did not retain a logical prompt block"
+        );
+    }
     let expected = model.forward_prepared(prepared, &cancel)?.to_vec();
     let expected_positions = vec![
         input.user_starts[0],
@@ -149,8 +166,11 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         restored,
         model.prefix_cache.bytes()
     );
-    planned_tail_workspaces_survive_prefill(&mut model, &cancel)?;
-    for cpu in [false, true] {
+    let npu_gdn = model.stats()["gdn_npu_workspace_rows"].is_array();
+    if npu_gdn {
+        planned_tail_workspaces_survive_prefill(&mut model, &cancel)?;
+    }
+    for cpu in [false, true].into_iter().filter(|cpu| npu_gdn || *cpu) {
         if cpu {
             model.work.recurrent = crate::layers::gated_delta::Scratch::default();
             if let Some(work) = &mut model.secondary_work {
@@ -187,21 +207,26 @@ fn planned_tail_workspaces_survive_prefill(model: &mut Qwen35, cancel: &AtomicBo
         let after = model.stats();
         assert!(after["gdn_npu_calls"].as_u64().unwrap() > 0);
         assert_eq!(after["gdn_npu_workspace_creations"], creations);
-        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!(expected));
-        eprintln!("planned GDN workspaces PASS rows={expected:?} prefill_creations=0");
+        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
+        eprintln!(
+            "planned GDN workspaces PASS rows={expected:?} prefill_creations=0 released_on_decode=true"
+        );
     }
-    // A standalone call outside a prepared plan retains the original bounded
-    // full-window plus single-tail policy.
-    model.forward(&[1; 20])?;
-    assert_eq!(
-        model.stats()["gdn_npu_workspace_rows"],
-        serde_json::json!([20, 128])
-    );
-    model.forward(&[1; 74])?;
-    assert_eq!(
-        model.stats()["gdn_npu_workspace_rows"],
-        serde_json::json!([74, 128])
-    );
+    // Short standalone prompts prepare only their actual rows, then release
+    // their NPU GDN scratch when projecting the last row for generation.
+    for rows in [20, 74] {
+        model.reset()?;
+        model.prepare(rows)?;
+        let before = model.stats();
+        assert_eq!(before["gdn_npu_workspace_rows"], serde_json::json!([rows]));
+        model.forward(&vec![1; rows])?;
+        let after = model.stats();
+        assert_eq!(
+            after["gdn_npu_workspace_creations"],
+            before["gdn_npu_workspace_creations"]
+        );
+        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
+    }
     Ok(())
 }
 
@@ -219,13 +244,16 @@ fn restored_tail_keeps_earlier_checkpoint(model: &mut Qwen35, cancel: &AtomicBoo
     assert_eq!(model.prefix_cache.positions(), [468, 596]);
     let saves = model.prefix_cache.saves;
     let save_ms = model.prefix_cache.save_ms;
-    let snapshot = model.prefix_cache.entries[1].recurrent.as_ptr();
+    let snapshot = model.prefix_cache.entries[1].state.recurrent.as_ptr();
     assert_eq!(model.restore_prefix(599)?, 596);
     let prepared = model.prepare_prepared(&input, 596)?;
     exact(model.forward_prepared(prepared, cancel)?, &expected);
     exact(&state(model), &expected_state);
     assert_eq!(model.prefix_cache.positions(), [468, 596]);
-    assert_eq!(model.prefix_cache.entries[1].recurrent.as_ptr(), snapshot);
+    assert_eq!(
+        model.prefix_cache.entries[1].state.recurrent.as_ptr(),
+        snapshot
+    );
     assert_eq!(model.prefix_cache.saves, saves);
     assert_eq!(model.prefix_cache.save_ms, save_ms);
     assert_eq!(model.prefix_cache.entries[1].task, model.prefix_cache.task);

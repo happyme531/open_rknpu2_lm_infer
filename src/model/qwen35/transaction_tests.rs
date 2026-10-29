@@ -64,6 +64,9 @@ fn complete_target_commit_abort_and_next_output() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     if let Some(path) = std::env::var_os("RKNPU_MTP_TUNE_CACHE") {

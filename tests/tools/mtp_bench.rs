@@ -211,6 +211,9 @@ fn main() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: open_rknpu2_lm_infer::model::SpeculativeConfig {
             kind: open_rknpu2_lm_infer::model::SpeculativeType::DraftMtp,
             max_draft: schedule[0],

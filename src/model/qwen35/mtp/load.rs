@@ -53,16 +53,18 @@ impl Predictor {
                 h,
             )?,
             output: Linear::floating(&backend, store, &format!("{p}.self_attn.o_proj"), h, q)?,
-            gate_up: Projection::floating(
-                &backend,
-                store,
-                vec![
-                    (format!("{p}.mlp.gate_proj"), f),
-                    (format!("{p}.mlp.up_proj"), f),
-                ],
-                h,
-            )?,
-            down: Linear::floating(&backend, store, &format!("{p}.mlp.down_proj"), h, f)?,
+            ffn: crate::model::qwen35::decoder::FeedForward::Dense {
+                gate_up: Projection::floating(
+                    &backend,
+                    store,
+                    vec![
+                        (format!("{p}.mlp.gate_proj"), f),
+                        (format!("{p}.mlp.up_proj"), f),
+                    ],
+                    h,
+                )?,
+                down: Linear::floating(&backend, store, &format!("{p}.mlp.down_proj"), h, f)?,
+            },
             mixer: Mixer::Attention {
                 cache,
                 q_norm: vector(store, &format!("{p}.self_attn.q_norm"), c.head_dim)?,

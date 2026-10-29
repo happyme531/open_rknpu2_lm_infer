@@ -294,7 +294,7 @@ pub async fn chat(
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        " ◆ OPEN RKNPU2 ",
+                        format!(" ◆ {} ", crate::PROJECT_NAME),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),

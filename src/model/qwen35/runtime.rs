@@ -31,6 +31,7 @@ pub struct Qwen35 {
     pub(super) cpu: Cpu,
     pub(super) backends: Vec<Backend>,
     pub(super) layers: crate::model::pipeline::Layers<Layer>,
+    pub(super) paging: Option<crate::model::experts::paged::Paging>,
     pub(super) embedding: Tensor,
     pub(super) final_norm: Vec<f32>,
     pub(super) head: crate::model::output_head::OutputHead,
@@ -54,30 +55,51 @@ pub struct Qwen35 {
     pub(super) features: super::features::Features,
     pub(super) secondary_features: Option<super::features::Features>,
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
+    pub(super) workspaces: crate::model::workspace::Workspaces,
     pub(super) prefix_cache: super::cache::PrefixCache,
 }
 
 impl Qwen35 {
-    fn prepare_rows(&mut self, mut rows: Vec<usize>) -> Result<()> {
-        let mut primary_rows = vec![1, self.options.chunk];
-        primary_rows.extend(1..=self.speculation_window() + 1);
-        rows.extend(&primary_rows);
-        rows.sort_unstable();
-        rows.dedup();
-        for backend in self.backends.iter().chain(self.head.backend()) {
+    fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
+        let prefill_rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
+        let mut rows = prefill_rows.clone();
+        let head_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        self.workspaces.prepare(&mut rows, &head_rows);
+        for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
-                crate::progress::prefill_shape(!primary_rows.contains(rows), || {
+                crate::progress::prefill_shape(*rows > 1 && *rows != self.options.chunk, || {
                     backend.prepare(*rows)
                 })?;
             }
         }
-        self.work.recurrent.prepare(&rows)?;
-        if let Some(lane) = &self.secondary {
-            lane.prepare(self.options.chunk)?;
+        // Generation projects only the prompt's final row; full-row scoring
+        // prepares its own head workspace when token_nll is requested.
+        if let Some(backend) = self.head.backend() {
+            backend.retain_workspaces(&head_rows)?;
+            for rows in head_rows {
+                backend.prepare(rows)?;
+            }
         }
-        if let Some(work) = &mut self.secondary_work {
-            work.recurrent.prepare(&[self.options.chunk])?;
+        self.work.recurrent.prepare(&prefill_rows)?;
+        if let Some(lane) = &self.secondary {
+            if prefill_rows.contains(&self.options.chunk) {
+                lane.prepare(self.options.chunk)?;
+                self.secondary_work
+                    .as_mut()
+                    .unwrap()
+                    .recurrent
+                    .prepare(&[self.options.chunk])?;
+            } else {
+                for backend in lane.backends() {
+                    backend.retain_workspaces(&[])?;
+                }
+                self.secondary_work
+                    .as_mut()
+                    .unwrap()
+                    .recurrent
+                    .retain_workspaces(&[]);
+            }
         }
         if let Some(draft) = &self.dflash {
             draft.prepare(&rows, self.options.speculation.window())?;
@@ -92,8 +114,10 @@ impl Qwen35 {
         );
         options.validate_speculation()?;
         let mut model = super::load::load(options)?;
-        if model.options.speculation.kind == crate::model::SpeculativeType::DraftDflash
-            && model.options.speculation.window() > 0
+        if matches!(
+            model.options.speculation.kind,
+            crate::model::SpeculativeType::DraftDflash | crate::model::SpeculativeType::DraftDspark
+        ) && model.options.speculation.window() > 0
         {
             model.load_dflash()?;
         }
@@ -144,6 +168,9 @@ impl Qwen35 {
         cancelled: Option<&AtomicBool>,
         logits: bool,
     ) -> Result<()> {
+        if tokens.len() > 1 {
+            self.workspaces.reset();
+        }
         self.check_input(tokens)?;
         ensure!(
             self.round.is_none(),
@@ -154,16 +181,21 @@ impl Qwen35 {
             let mut rows = 0;
             for (first, second) in crate::model::prefill::batches(
                 tokens,
-                self.options.chunk,
+                self.prompt_chunk_rows(),
                 self.options.prefill_ubatches,
             ) {
                 let inputs = [(first, None), (second.unwrap_or_default(), None)];
                 let count = if second.is_some() { 2 } else { 1 };
                 crate::progress::prefill_shape(first.len() != self.options.chunk, || {
-                    self.execute(&inputs[..count], cancelled, false)
+                    if self.paging.is_some() {
+                        self.prompt_chunk(first, cancelled, None)
+                    } else {
+                        self.execute(&inputs[..count], cancelled, false)
+                    }
                 })?;
                 rows = inputs[count - 1].0.len();
             }
+            rows = (rows - 1) % self.options.chunk + 1;
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
                 "generation cancelled"
@@ -224,6 +256,27 @@ impl Qwen35 {
         }
         Ok(values)
     }
+
+    pub(super) fn release_prefill_workspaces(&mut self) -> Result<()> {
+        if self.workspaces.is_decoding() {
+            return Ok(());
+        }
+        let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        if self.workspaces.enter_decode(
+            self.backends
+                .iter()
+                .chain(self.head.backend())
+                .chain(self.secondary.iter().flat_map(|lane| lane.backends())),
+            &rows,
+        )? {
+            // GDN verification and one-row AR execute on CPU.
+            self.work.recurrent.retain_workspaces(&[1]);
+            if let Some(work) = &mut self.secondary_work {
+                work.recurrent.retain_workspaces(&[]);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl LanguageModel for Qwen35 {
@@ -237,6 +290,9 @@ impl LanguageModel for Qwen35 {
         self.position
     }
     fn reset(&mut self) -> Result<()> {
+        if let Some(paging) = &self.paging {
+            paging.reset();
+        }
         for layer in self.layers.iter_mut() {
             match &mut layer.mixer {
                 Mixer::Recurrent { state, .. } => state.reset(),
@@ -244,6 +300,7 @@ impl LanguageModel for Qwen35 {
             }
         }
         self.position = 0;
+        self.workspaces.reset();
         self.round = None;
         self.features.reset();
         if let Some(features) = &mut self.secondary_features {
@@ -259,7 +316,7 @@ impl LanguageModel for Qwen35 {
         self.prefix_cache.clear();
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
-        self.phases = Timings::default();
+        self.phases.reset();
         self.work.recurrent.reset_statistics();
         if let Some(work) = &mut self.secondary_work {
             work.recurrent.reset_statistics();
@@ -308,11 +365,7 @@ impl LanguageModel for Qwen35 {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "Qwen3.5 prompt exceeds context"
         );
-        let mut rows = vec![1, self.options.chunk, prompt_tokens.min(self.options.chunk)];
-        if !prompt_tokens.is_multiple_of(self.options.chunk) {
-            rows.push(prompt_tokens % self.options.chunk);
-        }
-        self.prepare_rows(rows)
+        self.prepare_rows(vec![prompt_tokens])
     }
     fn prepare_prepared<'a>(
         &mut self,
@@ -323,10 +376,17 @@ impl LanguageModel for Qwen35 {
             start < input.tokens.len() && input.tokens.len() <= self.options.context,
             "invalid prepared prompt"
         );
+        let steps = self.prefix_cache.plan(input, start, self.options.chunk);
+        let logical_rows = self.prompt_chunk_rows();
+        let steps = if logical_rows > self.options.chunk {
+            crate::model::PrefillStep::coalesce(steps, logical_rows)
+        } else {
+            steps
+        };
         let prepared = PreparedPrefill {
             input,
             start,
-            steps: self.prefix_cache.plan(input, start, self.options.chunk),
+            steps,
             checkpoint: self.prefix_cache.last_position(),
         };
         let rows = prepared.steps.iter().map(|s| s.range.len()).collect();
@@ -382,7 +442,7 @@ impl LanguageModel for Qwen35 {
             return Ok(());
         }
         ensure!(
-            self.dflash.is_none(),
+            !self.has_dflash(),
             "MTP and DFlash cannot be enabled together"
         );
         ensure!(
@@ -407,7 +467,7 @@ impl LanguageModel for Qwen35 {
         Ok(())
     }
     fn speculation_window(&self) -> usize {
-        if self.dflash.is_some() {
+        if self.has_dflash() {
             self.options.speculation.window()
         } else {
             self.mtp.as_ref().map_or(0, |m| m.max_draft)
@@ -443,6 +503,20 @@ impl LanguageModel for Qwen35 {
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<f32>>> {
         self.dflash_logits(anchor, drafts, cancel)
+    }
+    fn adjust_draft_logits(
+        &self,
+        row: usize,
+        previous: u32,
+        logits: &mut [f32],
+        cutoff: f64,
+    ) -> Result<Option<f64>> {
+        match &self.dflash {
+            Some(draft) => self.phases.trace("draft Markov", || {
+                draft.adjust(row, previous, logits, cutoff)
+            }),
+            None => Ok(None),
+        }
     }
     fn verify_tokens(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
         Qwen35::verify_tokens(self, tokens, cancel)

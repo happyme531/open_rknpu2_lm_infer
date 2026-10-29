@@ -99,6 +99,7 @@ impl Backend {
         options.tune_search = false;
         Ok(Self(Arc::new(Mutex::new(BackendInner {
             work: BTreeMap::new(),
+            moe_work: BTreeMap::new(),
             attention,
             material,
             w8_partitions: source.w8_partitions.clone(),

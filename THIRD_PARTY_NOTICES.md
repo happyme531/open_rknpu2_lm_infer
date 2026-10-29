@@ -11,3 +11,24 @@ The CPU kernels preserve arithmetic from the adjacent native inference demo and 
 The Qwen3.5 C++ CPU module in `native/cpu_kernels/` adapts the gated delta loop and NEON helpers from llama.cpp / ggml. The Rust vector SiLU also adapts ggml arithmetic. Their MIT copyright and permission notice is retained in [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md) and must accompany distributions of this code.
 
 The DFlash adapter retains the Z Lab MIT notice in `src/model/dflash/LICENSE` and [llm_generated_docs/THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md), which accompanies binary distributions.
+
+The streamed MoE prompt scheduler and adjacent-record staging adapt Strata
+`src/prefill/prefill.cpp` and `src/core/expert_source.cpp`, revision
+`cbfd5b926b794b356195d3cb600191b0c3567540` (https://github.com/Niko1221/Strata).
+The per-layer decode LRU, request protection and prediction-aware eviction
+adapt OpenBMB/llama.cpp-omni `src/llama-moe-slot.cpp`, revision
+`a64932ec615e1463158129feaf2f0752d0c07a2e`
+(https://github.com/OpenBMB/llama.cpp-omni). Their MIT notices are retained in
+[src/model/experts/Strata-LICENSE](src/model/experts/Strata-LICENSE) and
+[src/model/experts/Omni-LICENSE](src/model/experts/Omni-LICENSE).
+
+The DSpark Markov correction and confidence head follow DeepSeek's DeepSpec
+`deepspec/modeling/dspark/markov_head.py` and `common.py`
+(https://github.com/deepseek-ai/DeepSpec). Its MIT notice is retained in
+[src/model/dflash/DeepSpec-LICENSE](src/model/dflash/DeepSpec-LICENSE).
+
+The optional low-weight route pruning follows Strata `src/dsv41/ds4_model.cu`
+(`STRATA_DS4_DISK_SKIP_W`), revision `4b9e05a2a806a3fe24f7b2560d98626c37dade35`.
+This implementation extends pruning to resident routes and prefill, and always
+keeps the strongest route. It retains the same unnormalized remaining weights.
+The MIT notice is retained in [Strata-LICENSE](src/model/experts/Strata-LICENSE).

@@ -112,6 +112,9 @@ fn main() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     })?;
     let mut checks = Vec::new();

@@ -20,7 +20,9 @@ Resident recurrent prefix checkpoints follow `llama-memory-recurrent.cpp` and
 `tools/server/server-context.cpp` at upstream revision
 `7894e8b92481a8bb8ffe94f73b656ffe0dd01e10`: snapshot recurrent/convolution
 state, retain ordinary attention KV, and resume from a checkpoint within the
-shared prefix. The Rust implementation also restores its MTP seed and draft KV.
+shared prefix. The shared Rust policy in `src/model/prefix_cache/` serves
+Qwen3.5 GDN and Ling3tiny KDA/convolution checkpoints. Qwen3.5 also restores
+its MTP seed and draft KV.
 ChatML user/tool delimiter matching follows `common/chat.cpp` and
 `common/parsers/qwen3-coder.cpp` at the same revision.
 Prompt-cache flag/environment precedence and per-request `cache_prompt`
@@ -51,6 +53,15 @@ organization of `ggml_compute_forward_gated_delta_net_one_chunk` from
 [llama.cpp, revision a17e94d229fc7fed1567a799baebd11b771fe5af](https://github.com/ggml-org/llama.cpp/blob/a17e94d229fc7fed1567a799baebd11b771fe5af/ggml/src/ggml-cpu/ops.cpp).
 The adapter uses safetensors head ordering, rectangular state
 dimensions, FP32 state and compact replay.
+
+`native/cpu_kernels/kda.cpp` and `src/ops/kda.rs` adapt the same operator's
+KDA branch: per-key-channel exponential decay, delta update and transposed
+FP32 state. The Ling decoder follows the supplied inclusionAI
+`Ling-3.0-tiny/modeling_bailing_moe_v3.py` for KDA gate activation,
+adjacent-pair RoPE and bias-corrected group-limited sigmoid routing.
+That reference is Copyright 2025 Antgroup and The HuggingFace Inc. team,
+licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
 
 The four-accumulator NEON reduction in `native/cpu_kernels/vec.h` follows
 `ggml-cpu/vec.cpp` and `simd-mappings.h` at the same revision. The NEON

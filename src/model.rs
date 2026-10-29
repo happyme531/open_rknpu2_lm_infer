@@ -3,21 +3,75 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod checkpoint;
+#[allow(
+    dead_code,
+    reason = "Shared CPU adapters remain available in every model build."
+)]
 pub(crate) mod cpu;
+#[cfg(any(
+    feature = "model-qwen3",
+    feature = "model-llama",
+    feature = "model-granite"
+))]
 pub mod dense;
 pub mod dflash;
+#[allow(
+    dead_code,
+    reason = "Shared expert scheduling remains available in every model build."
+)]
+pub mod experts;
+#[cfg(feature = "model-ling3tiny")]
+pub mod ling3tiny;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
+#[allow(
+    dead_code,
+    reason = "The layer pipeline is shared across model builds."
+)]
 pub(crate) mod pipeline;
+#[allow(
+    dead_code,
+    reason = "Prepared input has a stable shape across model builds."
+)]
 mod prefill;
+#[allow(
+    dead_code,
+    reason = "Shared prefix caching is compiled independently of its model consumers."
+)]
+mod prefix_cache;
 pub(crate) mod projection;
 pub(crate) use prefill::PrefillStep;
 pub use prefill::PreparedPrefill;
 mod speculation;
 pub use speculation::{SpeculativeConfig, SpeculativeType};
+#[cfg(any(feature = "model-qwen35", feature = "model-minicpmv47"))]
 pub mod qwen35;
+mod registry;
+pub use registry::{build_info, ensure_enabled};
+#[allow(
+    dead_code,
+    reason = "Shared tracing and test helpers are independent of model selection."
+)]
 pub(crate) mod trace;
+pub(crate) mod workspace;
+
+pub struct LinearShape {
+    pub name: &'static str,
+    pub rows: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+pub fn vision_tuning_shapes(path: &std::path::Path, rows: &[usize]) -> Result<Vec<LinearShape>> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    let family = registry::require(&config)?;
+    let shapes = family
+        .vision_shapes
+        .ok_or_else(|| anyhow::anyhow!("this model family has no supported vision encoder"))?;
+    shapes(path, rows)
+}
 
 /// ViT activation storage and CPU arithmetic. NPU GEMMs remain FP16 in both modes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -53,6 +107,7 @@ pub struct ModelOptions {
     pub tune_cache: PathBuf,
     pub attention_tile: usize,
     pub vision_dtype: VisionDtype,
+    pub experts: experts::Options,
     pub checkpoints: CheckpointOptions,
     pub speculation: SpeculativeConfig,
 }
@@ -197,6 +252,18 @@ pub trait LanguageModel {
     ) -> Result<Option<Vec<f32>>> {
         Ok(None)
     }
+    /// Optional sequential correction to a parallel draft row. Returns a
+    /// learned acceptance probability when the drafter supplies one. Below
+    /// cutoff, correction may be omitted and the caller must discard that row.
+    fn adjust_draft_logits(
+        &self,
+        _row: usize,
+        _previous: u32,
+        _logits: &mut [f32],
+        _cutoff: f64,
+    ) -> Result<Option<f64>> {
+        Ok(None)
+    }
     fn verify_tokens(
         &mut self,
         _tokens: &[u32],
@@ -250,22 +317,27 @@ pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
     let spec = options.speculation.clone();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+    let family = registry::require(&config)?;
+    anyhow::ensure!(
+        options.experts.storage != experts::Storage::Stream
+            || matches!(
+                config["model_type"].as_str(),
+                Some("qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7" | "bailing_hybrid")
+            ),
+        "expert streaming requires a MoE checkpoint"
+    );
     anyhow::ensure!(
         spec.window() == 0
             || matches!(
                 config["model_type"].as_str(),
-                Some("qwen3_5" | "qwen3_5_text")
+                Some(
+                    "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "minicpmv4_7"
+                )
             ),
-        "speculative decoding is supported only for Qwen3.5 checkpoints"
+        "speculative decoding requires a Qwen3.5 or MiniCPM-V 4.7 checkpoint"
     );
     crate::npu::configure_cpu(&mut options)?;
-    let mut model: Box<dyn LanguageModel> = match config["model_type"].as_str() {
-        Some("qwen3" | "llama" | "granite") => Box::new(dense::Dense::load(options)?),
-        Some("qwen3_5" | "qwen3_5_text") => Box::new(qwen35::Qwen35::load(options)?),
-        other => anyhow::bail!(
-            "unsupported model architecture: {other:?}; supported: qwen3, llama, granite, qwen3_5, qwen3_5_text"
-        ),
-    };
+    let mut model = (family.load)(options)?;
     if spec.kind == SpeculativeType::DraftMtp && spec.window() > 0 {
         model.enable_mtp(spec.window())?;
     }

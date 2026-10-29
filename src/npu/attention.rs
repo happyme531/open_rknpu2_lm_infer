@@ -16,7 +16,7 @@ pub struct FullAttention {
     pub(super) owner: Backend,
 }
 
-fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
+pub(super) fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
     let mut first = 0;
     #[cfg(target_arch = "aarch64")]
     while first + 8 <= input.len() {

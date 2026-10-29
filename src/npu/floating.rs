@@ -76,6 +76,10 @@ impl FloatBackend {
         backend.source = TuningSource::Dflash;
         backend
     }
+    #[allow(
+        dead_code,
+        reason = "The shared floating backend is available without a Qwen decoder."
+    )]
     pub(crate) fn for_mtp(device: Backend) -> Self {
         let mut backend = Self::for_decoder(device);
         backend.source = TuningSource::Mtp;
@@ -314,6 +318,16 @@ impl FloatBackend {
     }
 }
 impl FloatLinear {
+    #[cfg(test)]
+    #[allow(dead_code, reason = "Shared workspace inspection for model tests.")]
+    pub(crate) fn prepared_workspace(&self) -> Option<(usize, usize)> {
+        self.owner
+            .work
+            .lock()
+            .unwrap()
+            .get(&(self.k, self.n))
+            .map(|w| (w.strategy.M as usize, w.workspace.raw as usize))
+    }
     pub fn prepare(&self, rows: usize) -> Result<()> {
         self.owner
             .prepare_for_weights(self.k, self.n, rows, self.weight.raw)

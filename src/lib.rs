@@ -1,3 +1,5 @@
+pub const PROJECT_NAME: &str = env!("RKNPU_PROJECT_NAME");
+
 pub mod api;
 pub mod bench;
 pub mod cli;

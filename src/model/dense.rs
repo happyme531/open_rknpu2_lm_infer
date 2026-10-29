@@ -83,6 +83,7 @@ pub struct Dense {
     logits_scaling: f32,
     timings: Timings,
     dual_groups: usize,
+    workspaces: super::workspace::Workspaces,
 }
 
 impl Dense {
@@ -95,6 +96,7 @@ impl Dense {
         let trace = Trace::from_environment()?;
         let config: Value =
             serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
+        super::registry::require(&config)?;
         let architecture = config["model_type"]
             .as_str()
             .context("missing model_type")?;
@@ -387,6 +389,7 @@ impl Dense {
             reserved_tokens,
             logits_scaling,
             dual_groups: 0,
+            workspaces: Default::default(),
             timings: Timings {
                 load: elapsed(start),
                 ..Default::default()
@@ -410,6 +413,9 @@ impl Dense {
     }
 
     fn group(&mut self, tokens: &[&[u32]], cancelled: Option<&AtomicBool>) -> Result<()> {
+        if tokens.iter().any(|batch| batch.len() > 1) {
+            self.workspaces.reset();
+        }
         let start = Instant::now();
         let mut position = self.position;
         for (batch, tokens) in self.batches.iter_mut().zip(tokens) {
@@ -495,13 +501,13 @@ impl Dense {
             })?;
             last_rows = batches[count - 1].len();
             let completed = self.position - start;
-            if completed < tokens.len() {
-                if let Some(progress) = progress.as_mut() {
-                    progress(crate::progress::ModelProgress::Prefill {
-                        completed,
-                        total: tokens.len(),
-                    });
-                }
+            if completed < tokens.len()
+                && let Some(progress) = progress.as_mut()
+            {
+                progress(crate::progress::ModelProgress::Prefill {
+                    completed,
+                    total: tokens.len(),
+                });
             }
         }
         ensure!(
@@ -527,6 +533,7 @@ impl LanguageModel for Dense {
         }
         self.position = 0;
         self.dual_groups = 0;
+        self.workspaces.reset();
         self.timings.linear = 0.0;
         self.timings.attention = 0.0;
         self.timings.cpu = 0.0;
@@ -570,28 +577,27 @@ impl LanguageModel for Dense {
             .chain(self.head.backend())
             .map(Backend::tune_operations)
             .sum();
-        let mut rows = vec![1, self.options.chunk];
-        if !prompt_tokens.is_multiple_of(self.options.chunk) {
-            rows.push(prompt_tokens % self.options.chunk);
-        }
-        rows.sort_unstable();
-        rows.dedup();
+        let mut rows = super::workspace::physical_rows([prompt_tokens], self.options.chunk);
+        self.workspaces.prepare(&mut rows, &[1]);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
-            backend.prepare(1)?;
-            crate::progress::prefill_shape(prompt_tokens < self.options.chunk, || {
-                backend.prepare(prompt_tokens.min(self.options.chunk))
-            })?;
-            if !prompt_tokens.is_multiple_of(self.options.chunk) {
-                crate::progress::prefill_shape(true, || {
-                    backend.prepare(prompt_tokens % self.options.chunk)
+            for &rows in &rows {
+                crate::progress::prefill_shape(rows != 1 && rows != self.options.chunk, || {
+                    backend.prepare(rows)
                 })?;
             }
         }
         if let Some(secondary) = &self.secondary {
-            secondary.prepare(self.options.chunk)?;
+            if prompt_tokens >= 2 * self.options.chunk {
+                secondary.prepare(self.options.chunk)?;
+            } else {
+                for backend in secondary.backends() {
+                    backend.retain_workspaces(&[])?;
+                }
+            }
         }
         if let Some(head) = self.head.backend() {
+            head.retain_workspaces(&[1])?;
             head.prepare(1)?;
         }
         self.timings.prepare += elapsed(start);

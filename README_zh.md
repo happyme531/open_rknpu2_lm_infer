@@ -96,6 +96,7 @@ Qwen3/Qwen3.5 PPL 于 2026-10-25 重测，使用 WikiText-2 raw test 的前 32 �
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
+| bailing_hybrid (Ling3tiny) | [Ling-3.0-tiny-QQQ-W4A8-Mixed-CT](llm_generated_docs/LING3TINY_SUPPORT.md) |
 
 程序支持线性层使用w4a8或w8a8(可以混合使用)per-channel per-token对称量化的 compressed-tensors 格式的模型。因此你也可以根据以上示例模型，尝试加载其他大小的模型，试验不同的混合量化配置和量化算法。
 

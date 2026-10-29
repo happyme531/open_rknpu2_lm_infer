@@ -32,7 +32,7 @@ impl Mixer {
             Mixer::Recurrent { weights, state } => {
                 let (cw, vw, hv) = (c.gdn.conv_width(), c.gdn.value_width(), c.gdn.value_heads());
                 let width = cw + vw + 2 * hv;
-                timings.measure(Phase::Linear, || {
+                timings.stage(Phase::Linear, "target GDN input projection", || {
                     inputs.run(
                         &w.normalized[..rows * h],
                         &mut w.mixed[..rows * width],
@@ -41,7 +41,7 @@ impl Mixer {
                     )
                 })?;
                 let (split_ms, copy_ms) =
-                    timings.measure(Phase::Gdn, || -> Result<(f64, f64)> {
+                    timings.stage(Phase::Gdn, "target GDN state", || -> Result<(f64, f64)> {
                         let split_ms = if trace.enabled() {
                             let start = Instant::now();
                             let mut qkv = Vec::with_capacity(rows * cw);
@@ -87,7 +87,7 @@ impl Mixer {
                     c.head_dim,
                 );
                 let width = 2 * q + 2 * kv;
-                timings.measure(Phase::Linear, || {
+                timings.stage(Phase::Linear, "target attention input projection", || {
                     inputs.run(
                         &w.normalized[..rows * h],
                         &mut w.mixed[..rows * width],
@@ -95,7 +95,7 @@ impl Mixer {
                         &mut w.scatter,
                     )
                 })?;
-                timings.measure(Phase::Cpu, || -> Result<()> {
+                timings.stage(Phase::Cpu, "target QKV norm rope", || -> Result<()> {
                     for (t, row) in w.mixed[..rows * width].chunks(width).enumerate() {
                         attention::split_query_gate(
                             &row[..2 * q],
@@ -137,7 +137,7 @@ impl Mixer {
                     trace.save(position, index, "value", &w.value[..rows * kv])?;
                     Ok(())
                 })?;
-                timings.measure(Phase::Attention, || {
+                timings.stage(Phase::Attention, "target attention", || {
                     cache.run(
                         &w.query[..rows * q],
                         &w.key[..rows * kv],
@@ -150,7 +150,7 @@ impl Mixer {
                 if verify && rows > 1 {
                     timings.record_attention_verification(rows);
                 }
-                timings.measure(Phase::Cpu, || {
+                timings.stage(Phase::Cpu, "target attention gate", || {
                     activation::sigmoid_gate(&mut w.attended[..rows * q], &w.gate[..rows * q])
                 })?;
                 q

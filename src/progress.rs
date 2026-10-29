@@ -69,11 +69,7 @@ fn speed(value: Option<f64>) -> String {
     value.map_or_else(|| "--".into(), |v| format!("{v:.1}"))
 }
 pub(crate) fn bar(done: usize, total: usize) -> String {
-    let fill = if total > 0 {
-        done.min(total) * 20 / total
-    } else {
-        0
-    };
+    let fill = (done.min(total) * 20).checked_div(total).unwrap_or(0);
     format!("[{}{}]", "#".repeat(fill), ".".repeat(20 - fill))
 }
 pub(crate) fn eta(done: usize, total: usize, seconds: f64) -> String {

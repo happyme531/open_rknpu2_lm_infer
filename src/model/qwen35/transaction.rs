@@ -21,16 +21,19 @@ impl Qwen35 {
     /// Return one next-token logit row per real input, without committing state.
     /// Rows are [pending anchor, proposals...], with no NPU padding in this ABI.
     pub fn verify_tokens(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
+        let verify_start = Instant::now();
         ensure!(
             self.round.is_none(),
             "Qwen3.5 verification transaction is active"
         );
         self.check_input(tokens)?;
         ensure!(
-            tokens.len() <= 8 && tokens.len() <= self.options.chunk,
-            "verification requires at most min(8, ubatch) real rows"
+            tokens.len() <= 8.max(self.options.speculation.window() + 1)
+                && tokens.len() <= self.options.chunk,
+            "verification exceeds the reserved speculative window or ubatch"
         );
         self.reserve(self.position + tokens.len())?;
+        self.release_prefill_workspaces()?;
         self.round = Some(Round {
             tokens: tokens.to_vec(),
             hidden: Vec::new(),
@@ -41,28 +44,38 @@ impl Qwen35 {
             let head_start = Instant::now();
             let rows = tokens.len();
             let h = self.config.hidden_size;
-            norm::rms_norm(
-                &self.work.hidden[..rows * h],
-                &self.final_norm,
-                self.config.epsilon,
-                true,
-                &mut self.work.normalized[..rows * h],
-            )?;
-            self.round
-                .as_mut()
-                .unwrap()
-                .hidden
-                .extend_from_slice(&self.work.normalized[..rows * h]);
-            self.logits.resize(rows * self.info.vocab_size, 0.);
-            self.head.run(
-                &self.cpu,
-                &self.work.normalized[..rows * h],
-                &mut self.logits,
-                rows,
-            )?;
+            self.phases.context(self.position, rows, -1, true);
+            self.phases
+                .trace("target head preparation", || -> Result<()> {
+                    norm::rms_norm(
+                        &self.work.hidden[..rows * h],
+                        &self.final_norm,
+                        self.config.epsilon,
+                        true,
+                        &mut self.work.normalized[..rows * h],
+                    )?;
+                    self.round
+                        .as_mut()
+                        .unwrap()
+                        .hidden
+                        .extend_from_slice(&self.work.normalized[..rows * h]);
+                    self.logits.resize(rows * self.info.vocab_size, 0.);
+                    self.head.prepare(rows)
+                })?;
+            self.phases.trace("target head", || {
+                self.head.run(
+                    &self.cpu,
+                    &self.work.normalized[..rows * h],
+                    &mut self.logits,
+                    rows,
+                )
+            })?;
             self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
-            debug_assert!(
-                self.logits.iter().all(|v| v.is_finite()),
+            ensure!(
+                self.phases.trace("target logits finite check", || self
+                    .logits
+                    .iter()
+                    .all(|v| v.is_finite())),
                 "nonfinite verification logits"
             );
             Ok(())
@@ -71,6 +84,7 @@ impl Qwen35 {
             self.abort_verification()?;
             return Err(error);
         }
+        self.phases.span("target verify", verify_start);
         Ok(&self.logits)
     }
 

@@ -51,6 +51,9 @@ fn official_fp32_mtp_and_coordinate_adapter() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     crate::npu::configure_cpu(&mut options)?;

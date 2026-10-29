@@ -37,6 +37,9 @@ fn npu_prefill_threshold_state_handoff_and_layer_reuse() -> Result<()> {
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     crate::npu::configure_cpu(&mut options)?;

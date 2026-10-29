@@ -20,6 +20,9 @@ fn floating_profiles_preserve_weights_and_reload_without_search() -> Result<()> 
         attention_tile: 512,
         vision_dtype: Default::default(),
         checkpoints: Default::default(),
+
+        experts: Default::default(),
+
         speculation: Default::default(),
     };
     configure_cpu(&mut options)?;
@@ -102,6 +105,9 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
             attention_tile: 512,
             vision_dtype: Default::default(),
             checkpoints: Default::default(),
+
+            experts: Default::default(),
+
             speculation: Default::default(),
         };
         configure_cpu(&mut options)?;

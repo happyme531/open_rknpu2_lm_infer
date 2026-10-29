@@ -93,7 +93,7 @@ fn swiglu_block(gates: &[f32], ups: &[f32], y: &mut [f32]) {
     unsafe { rknpu2_cpu_swiglu(gates.as_ptr(), ups.as_ptr(), y.as_mut_ptr(), y.len()) };
 }
 
-fn dense_dot(weight: &Tensor, row: usize, input: &[f32]) -> f32 {
+pub(crate) fn dense_dot(weight: &Tensor, row: usize, input: &[f32]) -> f32 {
     let base = row * input.len();
     let mut sum = 0.0;
     let mut i = 0;
@@ -299,11 +299,74 @@ impl Cpu {
             })
         });
     }
+    pub fn dense_head_batch(&self, weight: &Tensor, input: &[f32], output: &mut [f32]) {
+        let [n, k] = weight.shape[..] else {
+            unreachable!("validated dense matrix");
+        };
+        assert_eq!(input.len() % k, 0);
+        assert_eq!(output.len(), input.len() / k * n);
+        // Batch the scheduling only: each output keeps the single-row dot's
+        // accumulation order, including its SIMD reduction and scalar tail.
+        self.pool.install(|| {
+            output.par_iter_mut().enumerate().for_each(|(index, out)| {
+                let row = index / n;
+                *out = dense_dot(weight, index % n, &input[row * k..(row + 1) * k]);
+            })
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batched_dense_preserves_row_order_and_exact_dots() -> Result<()> {
+        use crate::model::checkpoint::TensorStore;
+        use half::{bf16, f16};
+        use safetensors::{Dtype, tensor::TensorView};
+        let cpu = Cpu::new(4)?;
+        let directory = tempfile::tempdir()?;
+        for (n, k) in [(7, 19), (256, 2048)] {
+            for dtype in [Dtype::BF16, Dtype::F16, Dtype::F32] {
+                let data: Vec<u8> = (0..n * k)
+                    .flat_map(|i| {
+                        let value = ((i * 37 % 509) as f32 - 254.) * 0.00791;
+                        match dtype {
+                            Dtype::BF16 => bf16::from_f32(value).to_bits().to_le_bytes().to_vec(),
+                            Dtype::F16 => f16::from_f32(value).to_bits().to_le_bytes().to_vec(),
+                            _ => value.to_le_bytes().to_vec(),
+                        }
+                    })
+                    .collect();
+                let view = TensorView::new(dtype, vec![n, k], &data)?;
+                safetensors::serialize_to_file(
+                    [("weight", view)],
+                    None,
+                    &directory.path().join("model.safetensors"),
+                )?;
+                let weight = TensorStore::open(directory.path())?.get("weight")?;
+                for rows in [1, 4, 8, 16, 128] {
+                    let input: Vec<_> = (0..rows * k)
+                        .map(|i| ((i * 53 % 487) as f32 - 243.) * 0.019)
+                        .collect();
+                    let mut actual = vec![f32::NAN; rows * n];
+                    let mut expected = actual.clone();
+                    for (x, y) in input.chunks_exact(k).zip(expected.chunks_exact_mut(n)) {
+                        cpu.dense_head(&weight, x, y);
+                    }
+                    cpu.dense_head_batch(&weight, &input, &mut actual);
+                    for (index, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{dtype:?} {rows}x{n}x{k} at {index}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
         for (i, (a, b)) in actual.iter().zip(expected).enumerate() {
             assert!(

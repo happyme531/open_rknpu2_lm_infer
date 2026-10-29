@@ -70,6 +70,7 @@ impl Engine {
     }
 
     pub fn start_with_cache_prompt(options: ModelOptions, cache_prompt: bool) -> Result<Self> {
+        model::ensure_enabled(&options.path)?;
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);

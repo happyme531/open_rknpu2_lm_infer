@@ -21,6 +21,7 @@ pub struct DFlash {
     pub(super) context: usize,
     pub(super) chunk: usize,
     pub(super) position: usize,
+    pub(super) markov: Option<super::markov::Markov>,
 }
 impl DFlash {
     fn context_projection(&self, features: &[f32]) -> Result<Vec<f32>> {
@@ -41,19 +42,22 @@ impl DFlash {
         Ok(normalized)
     }
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(markov) = &mut self.markov {
+            markov.reset();
+        }
         for l in &self.layers {
             l.cache.reset()?;
         }
         self.position = 0;
         Ok(())
     }
-    pub(crate) fn abort(&self) -> Result<()> {
+    pub fn abort(&self) -> Result<()> {
         for layer in &self.layers {
             layer.cache.truncate(self.position)?;
         }
         Ok(())
     }
-    pub(crate) fn restore_prefix(&mut self, position: usize) -> Result<()> {
+    pub fn restore_prefix(&mut self, position: usize) -> Result<()> {
         ensure!(position <= self.position, "cannot extend DFlash prefix");
         for layer in &self.layers {
             layer.cache.truncate(position)?;
@@ -61,7 +65,7 @@ impl DFlash {
         self.position = position;
         Ok(())
     }
-    pub(crate) fn backends(&self) -> &[Backend] {
+    pub fn backends(&self) -> &[Backend] {
         &self.backends
     }
     pub fn prepare_context(&mut self, features: &[f32], cancel: Option<&AtomicBool>) -> Result<()> {
@@ -109,7 +113,8 @@ impl DFlash {
             "DFlash cache/target position mismatch"
         );
         ensure!(
-            (2..=self.config.dflash_config.block_size).contains(&rows),
+            ((1 + self.config.proposal_offset())..=self.config.dflash_config.block_size)
+                .contains(&rows),
             "invalid DFlash block length"
         );
         let context = if new_rows > 0 {
@@ -137,7 +142,22 @@ impl DFlash {
             &self.final_norm,
             self.config.rms_norm_eps,
         );
+        if let Some(markov) = &mut self.markov {
+            markov.remember(&normalized);
+        }
         Ok(normalized)
+    }
+    pub fn adjust(
+        &self,
+        row: usize,
+        previous: u32,
+        logits: &mut [f32],
+        cutoff: f64,
+    ) -> Result<Option<f64>> {
+        match &self.markov {
+            Some(markov) => markov.adjust(&self.cpu, row, previous, logits, cutoff),
+            None => Ok(None),
+        }
     }
     pub fn prepare(&self, prefix_rows: &[usize], max_draft: usize) -> Result<()> {
         let c = &self.config;
@@ -150,13 +170,15 @@ impl DFlash {
         let down_parts = f.div_ceil(4096);
         let down_k = f.div_ceil(down_parts).div_ceil(32) * 32;
         for b in &self.floating {
-            for m in 2..=max_draft + 1 {
+            let first = 1 + c.proposal_offset();
+            let last = max_draft + c.proposal_offset();
+            for m in first..=last {
                 for (k, n) in [(h, q), (q, h), (h, f), (down_k, h)] {
                     b.prepare(k, n, m)?;
                 }
             }
             let mut rows = prefix_rows.to_vec();
-            rows.extend(1..=max_draft + 1);
+            rows.extend(1..=last);
             rows.sort_unstable();
             rows.dedup();
             for m in rows {

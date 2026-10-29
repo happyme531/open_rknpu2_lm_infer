@@ -65,6 +65,10 @@ impl Features {
 }
 
 impl Qwen35 {
+    pub(super) fn has_dflash(&self) -> bool {
+        self.dflash.is_some()
+    }
+
     pub(super) fn load_dflash(&mut self) -> Result<()> {
         ensure!(
             !self
@@ -83,12 +87,17 @@ impl Qwen35 {
             .expect("validated draft path");
         let draft = crate::model::dflash::DFlash::load(&self.options, path)?;
         ensure!(
+            draft.config.dspark()
+                == (self.options.speculation.kind == crate::model::SpeculativeType::DraftDspark),
+            "draft checkpoint architecture does not match spec-type"
+        );
+        ensure!(
             draft.config.hidden_size == self.config.hidden_size
                 && draft.config.vocab_size == self.info.vocab_size,
             "DFlash target hidden size or vocabulary mismatch"
         );
         ensure!(
-            self.options.speculation.window() < draft.config.dflash_config.block_size,
+            self.options.speculation.window() <= draft.config.max_proposals(),
             "spec-draft-n-max exceeds the draft checkpoint block size"
         );
         self.capture_features(&draft.config.dflash_config.target_layer_ids)?;
@@ -112,30 +121,32 @@ impl Qwen35 {
         drafts: usize,
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<f32>>> {
-        if self.dflash.is_none() {
+        self.release_prefill_workspaces()?;
+        let Some(draft) = &self.dflash else {
             return Ok(None);
-        }
+        };
         ensure!(
             drafts > 0 && drafts <= self.speculation_window() && self.round.is_none(),
             "invalid DFlash draft window"
         );
-        let mask = self
-            .dflash
-            .as_ref()
-            .unwrap()
-            .config
-            .dflash_config
-            .mask_token_id;
-        let mut tokens = vec![mask; drafts + 1];
+        let mask = draft.config.dflash_config.mask_token_id;
+        let offset = draft.config.proposal_offset();
+        let mut tokens = vec![mask; drafts + offset];
         tokens[0] = anchor;
         let embeddings = self.token_embeddings(&tokens)?;
+        self.phases.context(self.position, drafts, -1, false);
+        let network_start = Instant::now();
         let hidden =
             self.dflash
                 .as_mut()
                 .unwrap()
                 .draft(&[], &embeddings, self.position, cancel)?;
+        self.phases.span("draft network", network_start);
         let h = self.config.hidden_size;
-        Ok(Some(self.project_hidden(&hidden[h..], drafts)?))
+        let head_start = Instant::now();
+        let logits = self.project_hidden(&hidden[offset * h..], drafts)?;
+        self.phases.span("draft shared head", head_start);
+        Ok(Some(logits))
     }
     pub fn capture_features(&mut self, layers: &[usize]) -> Result<()> {
         ensure!(

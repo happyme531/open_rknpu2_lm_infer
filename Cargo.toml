@@ -7,6 +7,40 @@ description = "Rust LLM inference on RK3588 using the open RKNPU2 driver"
 license = "AGPL-3.0-only"
 autoexamples = false
 
+[features]
+default = ["all-models"]
+all-models = ["model-qwen3", "model-llama", "model-granite", "model-qwen35", "model-minicpmv47", "model-ling3tiny"]
+model-qwen3 = []
+model-llama = []
+model-granite = []
+model-qwen35 = []
+model-minicpmv47 = []
+model-ling3tiny = []
+
+[[example]]
+name = "kda_check_cost"
+required-features = ["model-ling3tiny"]
+path = "tests/tools/kda_check_cost.rs"
+test = false
+
+[[example]]
+name = "ling3tiny_check"
+required-features = ["model-ling3tiny"]
+path = "tests/tools/ling3tiny_check.rs"
+test = false
+
+[[example]]
+name = "minicpmv47_check"
+required-features = ["model-minicpmv47"]
+path = "tests/tools/minicpmv47_check.rs"
+test = false
+
+[[example]]
+name = "minicpmv47_bench"
+required-features = ["model-minicpmv47"]
+path = "tests/tools/minicpmv47_bench.rs"
+test = false
+
 # Standalone test and benchmark tools. Example targets keep them separately
 # runnable without executing model/device programs during the default tests.
 [[example]]
@@ -31,11 +65,13 @@ test = false
 
 [[example]]
 name = "qwen35_check"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_check.rs"
 test = false
 
 [[example]]
 name = "qwen35_inventory"
+required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_inventory.rs"
 test = false
 
@@ -51,11 +87,13 @@ test = false
 
 [[example]]
 name = "vision_probe"
+required-features = ["model-qwen35"]
 path = "tests/tools/vision_probe.rs"
 test = false
 
 [[example]]
 name = "vision_profile"
+required-features = ["model-qwen35"]
 path = "tests/tools/vision_profile.rs"
 test = false
 
