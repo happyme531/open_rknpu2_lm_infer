@@ -76,8 +76,8 @@ jobs:
         env:
           RKNPU_PROJECT_NAME: customer_infer
         run: |
-          python3 scripts/build_release.py --models ling3tiny --output /tmp/customer-infer
-          cargo test --release --locked --no-default-features --features model-ling3tiny --test model_selection
+          python3 scripts/build_release.py --models qwen3 --output /tmp/customer-infer
+          cargo test --release --locked --no-default-features --features model-qwen3 --test model_selection
       - name: Release build
         run: cargo build --release --locked
       - name: CLI smoke test

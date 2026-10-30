@@ -207,9 +207,15 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         } else {
             0
         };
-        // Payload is only part of the 32-bit IOVA footprint: shared projection,
-        // GDN and Attention workspaces and allocation alignment also need room.
-        let budget = 1usize << 30;
+        // Resident MoE needs four expert layers per domain to fit the target
+        // and draft into the available domains. Its CPU GDN and small shared
+        // FFN leave 256 MiB of the 2 GiB IOVA range for workspaces/alignment.
+        // Dense and streamed models retain the larger workspace reserve.
+        let budget = if config.moe.is_some() && paging.is_none() {
+            (2usize << 30) - (256 << 20)
+        } else {
+            1usize << 30
+        };
         ensure!(
             estimate + kv < budget,
             "Qwen3.5 layer exceeds IOMMU domain budget"

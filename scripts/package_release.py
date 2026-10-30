@@ -45,8 +45,8 @@ def main():
             parser.error("release tag must match the Cargo package version")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    all_families = sorted(name.removeprefix("model-") for name in project["features"] if name.startswith("model-"))
-    variant = "" if families == all_families else "-" + "-".join(families)
+    default_families = sorted(name.removeprefix("model-") for name in project["features"]["all-models"])
+    variant = "" if families == default_families else "-" + "-".join(families)
     prefix = f"{project_name}-v{version}{variant}"
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary)

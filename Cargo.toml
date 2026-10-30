@@ -9,7 +9,7 @@ autoexamples = false
 
 [features]
 default = ["all-models"]
-all-models = ["model-qwen3", "model-llama", "model-granite", "model-qwen35", "model-minicpmv47", "model-ling3tiny"]
+all-models = ["model-qwen3", "model-llama", "model-granite", "model-qwen35", "model-minicpmv47"]
 model-qwen3 = []
 model-llama = []
 model-granite = []

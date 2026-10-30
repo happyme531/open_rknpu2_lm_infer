@@ -7,7 +7,7 @@
     feature = "model-ling3tiny"
 )))]
 compile_error!(
-    "select at least one model family, e.g. --features model-ling3tiny, or use default features"
+    "select at least one model family, e.g. --features model-qwen3, or use default features"
 );
 
 use std::{env, os::unix::process::CommandExt, process::Command};

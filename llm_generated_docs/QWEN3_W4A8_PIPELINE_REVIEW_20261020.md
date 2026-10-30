@@ -4,6 +4,10 @@
 
 FFN down 的后续单算子结果与逐波分析见 [Down 关键路径与 3T 预算](QWEN3_FFN_DOWN_BOTTLENECK_20261020.md)：该形状主要受主干 K 波中的 CPU 输入准备/partial 处理限制，最终尾部占比明显低于本页主要分析的 Gate/up。
 
+后续 [CPU 主体与 NPU 尾部归约实验](QWEN3_W4A8_NPU_REDUCE_TAIL_20261022.md) 已验证 Gate/up 的两者可重叠；复用普通 Conv 归约与 offline INT32 ADD 时，主要无事件对照仍慢 5.73%–9.14%，并发期间 CPU 阶段变慢。
+
+本页第 5 节的 [两波 CPU 融合消费已完成真实输入验证](QWEN3_W4A8_CPU_TWO_WAVE_FUSION_20261022.md)：保留原 FP64 激活时完整 FFN 快 6.20%、输出逐字节一致；结合已有 FP32 算法后快 11.12%，Gate/up 快 15.62%。
+
 **M128 Gate/up 的关键路径已经落在 CPU 的输出同步、整数归约和 SwiGLU 上。下一步最值得尝试的是输出同步与 CPU 消费之间的流水，同时修正非最终归约的工作分配。单独提前提交更多 NPU wave，能够减少设备空档，但按当前阶段耗时几乎不能缩短完整调用。**
 
 ## 1. 当前算子究竟执行什么
