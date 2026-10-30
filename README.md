@@ -21,6 +21,8 @@
 - 🎯 **Better accuracy than the vendor SDK**: Advanced quantization algorithms reduce WikiText-2 perplexity by 2.17% for Qwen3-4B and 2.28% for MiniCPM5-2B compared with rknn-llm W8A8.
 - 🔓 **Fully open source**: Built on our high-performance, open-source RKNPU2 operator library, [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/). The entire inference pipeline runs without proprietary vendor libraries, so you can study it, optimize it, and add support for new models.
 - 📦 **Mixed W4/W8 quantization**: A mix of 4-bit and 8-bit weights with dynamic 8-bit activations uses less memory than the vendor's W8A8 quantization. Weights are loaded on demand through mmap; Qwen3-4B reaches a peak RSS of approximately 3.9 GiB with a 4K context.
+- 🧠 **MoE with lower memory use**: Compatible MoE models can keep experts resident or stream packed expert weights from disk, with per-layer NPU caching and prefetching.
+- ⚡ **Speculative decoding**: Generate candidate tokens with Qwen3.5 MTP or a matching DFlash/DSpark draft model, then verify them with the target model.
 - 🧩 **Ready to use**: A single binary provides a CLI, a terminal chat TUI, and an OpenAI-compatible API, with support for streaming, thinking, function calling, and prefix caching.
 
 ## Performance
@@ -37,6 +39,18 @@
 | decode128 @1024 | 5.416 | 11.409 ± 0.003 | +110.7% | 11.436 ± 0.002 | +111.16% |
 | decode128 @3800 | 4.565 | 10.661 ± 0.002 | +133.5% | 10.674 ± 0.006 | +133.83% |
 
+#### Long Context (MTP Disabled)
+
+| Context length | Prefill tps | Decode128 tps | Peak RSS (GiB) |
+| --- | ---: | ---: | ---: |
+| 4K | 158.3 | 9.21 | 3.69 |
+| 8K | 149.0 | 8.57 | 3.70 |
+| 16K | 135.6 | 7.59 | 4.02 |
+| 32K | 115.3 | 6.19 | 4.79 |
+| 64K | 82.0 | 4.42 | 6.49 |
+
+Note: rknn-llm supports a maximum context length of 16K.
+
 ### Qwen3-4B
 
 | Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer | Speedup over vendor SDK | +Dual ubatch scheduling | Speedup over vendor SDK |
@@ -47,6 +61,16 @@
 | decode128 @512 | 5.772 ± 0.002 | 10.726 ± 0.001 | +85.8% | 10.667 ± 0.051 | +84.81% |
 | decode128 @1024 | 5.125 ± 0.004 | 10.311 ± 0.006 | +101.2% | 10.284 ± 0.002 | +100.66% |
 | decode128 @3800 | 2.310 ± 0.005 | 8.544 ± 0.002 | +269.9% | 8.525 ± 0.000 | +269.05% |
+
+### MiniCPM-V 4.7 35B-A3B (Text, DSpark)
+
+Measured with two complete coding requests from Arena-Hard-v2, containing 498 and 2110 tokens including the chat template, with one run per configuration and prompt. Routed experts use W4A8, the shared FFN and output head use W8A8, and the DSpark draft uses FP16. All runs use default operators. Throughput is in tok/s.
+
+| Configuration | pp498 | decode128 @498 | pp2110 | decode128 @2110 | Peak RSS (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| All experts resident + DSpark 3 | 59.00 | 8.41 | 63.06 | 9.31 | 19.67 / 20.12 |
+| Streaming + DSpark 3 | 33.98 | 4.92 | 44.44 | 5.74 | 5.46 / 5.88 |
+| Streaming + DSpark 3 + expert skipping | 41.19 | 7.89 | 54.78 | 8.02 | 5.34 / 5.69 |
 
 <details>
 <summary>Historical benchmark results</summary>
@@ -90,13 +114,14 @@ Qwen3/Qwen3.5 PPL was remeasured on 2026-10-25 using the first 32 independent 51
 
 ## Supported Models
 
-| Architecture | Validated checkpoint |
+| Architecture (`model_type`) | Checkpoint / status |
 |---|---|
 | qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
-| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
-| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
-| bailing_hybrid (Ling3tiny) | [Ling-3.0-tiny-QQQ-W4A8-Mixed-CT](llm_generated_docs/LING3TINY_SUPPORT.md) |
+| qwen3_5_moe (text component only) / qwen3_5_moe_text |  |
+| minicpmv4_7 (text component only) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](llm_generated_docs/MINICPMV47_SUPPORT.md) (text only) |
+| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
+| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
@@ -129,6 +154,8 @@ Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-c
 
 Use `--compress-w8a8` to losslessly compress all W8A8 linear weights. Tiles stay raw unless their encoded size is smaller. See [W8A8 weight compression](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md) for startup and memory accounting details.
 
+## Features
+
 ### Image Input and MTP
 
 Use a Qwen3.5-4B model directory containing both vision and MTP weights. The following command uses the K1 configuration from the image-text benchmark:
@@ -139,7 +166,7 @@ Use a Qwen3.5-4B model directory containing both vision and MTP weights. The fol
 
 Images are passed to the model at their original resolution unless they exceed the model's limits. Different resolutions are supported dynamically, but vision encoding may be slower if the corresponding number of vision tokens has not been tuned.
 
-## Getting full tuned performance
+### Tuning
 
 The default inference strategies do not deliver optimal performance. You can manually tune once for a specific model.
 
@@ -156,11 +183,79 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
 
-`run`, `chat`, and `serve` show prefill progress, cached token counts, throughput, and ETA by default, followed by recent and average decode speed. With MTP/DFlash enabled, the display also includes acceptance, tokens per round, round count, and average draft/verify time. Throughput measures complete model calls; decode excludes the first token produced by prefill. Recent speed uses complete rounds from roughly the last second.
+`run`, `chat`, and `serve` show prefill progress, cached token counts, throughput, and ETA by default, followed by recent and average decode speed. With speculative decoding enabled, the display also includes acceptance, tokens per round, round count, and average draft/verify time. DSpark currently appears as `DFlash` in the progress display and as `draft-dspark` in `--stats`. Throughput measures complete model calls; decode excludes the first token produced by prefill. Recent speed uses complete rounds from roughly the last second.
 
 `run` writes status to stderr and generated text to stdout; `chat` uses a separate status area. `serve` logs progress on the server, preserving the HTTP/SSE response format. Redirected logs use plain text at five-second intervals, plus phase transitions and completion. Vision tuning shows overall shape progress alongside the native candidate search progress.
 
 A shape used without an applicable tuning profile triggers one notice per process. Target, DFlash, and vision projections include a tuning command; MTP floating projections identify the missing CLI tuning support. Partial prefill batches, including checkpoint splits, do not trigger the notice. Explicit `--no-tune` also suppresses it.
+
+### MoE Expert Storage and Prefetching
+
+Models such as Qwen3.5 MoE and MiniCPM-V 4.7 support two expert storage modes:
+
+- **Resident** (default): Load routed experts into memory.
+- **Streaming**: Keep only some routed experts in memory and load the others from disk on demand, substantially reducing memory use for expert weights.
+
+For example, with a compatible quantized MiniCPM-V 4.7 checkpoint:
+
+```sh
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+EXPERT_STORE=/path/to/expert-store # A fast drive connected via M.2 PCIe 3.0 x4 is strongly recommended
+./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream \
+  --expert-store "$EXPERT_STORE" --expert-cache-percent 8 \
+  run --conversation --temp 0 -n 128 --stats -p 'Please introduce yourself.'
+```
+
+Streaming mode requires `--expert-store`. The first startup prepares packed NPU records from the checkpoint, requiring extra time and disk space; subsequent runs reuse a matching expert store. Expert records for the tested MiniCPM-V 4.7 35B-A3B checkpoint occupy approximately 15.2 GiB, in addition to the original model files. Actual disk use depends on the model.
+
+`--expert-cache-percent` controls the percentage of routed experts to cache and defaults to `8`. A larger cache reduces disk reads and improves performance at the cost of more memory.
+
+### Prefix Caching
+
+Prompt prefix reuse is independent of the disk expert store and NPU expert cache. The server enables prefix caching by default. Disable it server-wide with `serve --no-cache-prompt`, or for an individual OpenAI-compatible request with `extra_body={"cache_prompt": False}`. The number of reused tokens is returned in `usage.prompt_tokens_details.cached_tokens`.
+
+For models with SSM layers, `--ctx-checkpoints` sets the maximum number of state checkpoints (default: 32), and `--checkpoint-min-step` sets their minimum spacing (default: 8192 tokens). `--ctx-checkpoints 0` disables these state checkpoints while leaving the server's prompt cache enabled.
+
+### Speculative Decoding
+
+Speculative decoding is disabled by default. Select a compatible target model and draft for `run`, `chat`, or `serve`.
+
+| `--spec-type` | Target model and draft |
+|---|---|
+| `draft-mtp` | A Qwen3.5 checkpoint containing supported MTP layers; no separate draft directory is needed. |
+| `draft-dflash` | An unrotated Qwen3.5 target model and a matching DFlash draft. The validated pairing is Qwen3.5-4B C4 with [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash); the QQQ-Rot checkpoint in the model table is incompatible with this draft. |
+| `draft-dspark` | A MiniCPM-V 4.7 35B-A3B text target model and the matching [DSpark draft](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-DSpark). |
+
+For example, with a Qwen3.5-4B checkpoint containing MTP weights:
+
+```sh
+./bin/open_rknpu2_lm_infer -m models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot \
+  --spec-type draft-mtp --spec-draft-n-max 1 \
+  run --conversation --temp 0 -n 128 --stats -p 'Please introduce yourself.'
+```
+
+For DFlash, first prepare a compatible **unrotated** quantized Qwen3.5-4B C4 target model, then download the draft revision validated by this project:
+
+```sh
+hf download z-lab/Qwen3.5-4B-DFlash --revision 9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf --local-dir models/Qwen3.5-4B-DFlash
+./bin/open_rknpu2_lm_infer -m /path/to/Qwen3.5-4B-C4 \
+  --ctx-size 4096 --spec-type draft-dflash \
+  --spec-draft-model models/Qwen3.5-4B-DFlash --spec-draft-n-max 3 \
+  run --conversation --temp 0 -n 128 --stats -p 'Please introduce yourself.'
+```
+
+For DSpark, reuse the MiniCPM quantized target model and expert store from above:
+
+```sh
+hf download openbmb/MiniCPM-V-4.7-35B-A3B-DSpark --local-dir models/MiniCPM-V-4.7-35B-A3B-DSpark
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+EXPERT_STORE=/path/to/expert-store
+./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream --expert-store "$EXPERT_STORE" \
+  --spec-type draft-dspark --spec-draft-model models/MiniCPM-V-4.7-35B-A3B-DSpark \
+  --spec-draft-n-max 3 run --conversation --temp 0 -n 128 --stats -p 'Please introduce yourself.'
+```
+
+`--spec-draft-n-max` sets the maximum number of proposed tokens per round (default: 3; set to 0 to disable speculative decoding). MTP and DFlash support up to 7, and DSpark up to 15; the value must also be smaller than `--ubatch-size` and comply with the draft checkpoint's limits. `--spec-draft-model` also accepts the aliases `--model-draft` and `-md`. Use `--spec-draft-p-min` to truncate low-confidence proposals, and `--spec-draft-sampling` to select `greedy` (default) or `probabilistic` draft sampling. `run --stats` reports proposed and accepted token counts, along with draft and verification times.
 
 ### Dual Ubatch Prefill Scheduling
 
@@ -170,7 +265,7 @@ Use `--prefill-ubatches 2` to overlap two physical ubatches from the same prompt
 ./bin/open_rknpu2_lm_infer --model MODEL --ubatch-size 128 --prefill-ubatches 2 bench -p 4096 -n 0
 ```
 
-This can significantly improve prefill speed, but requires additional memory for activations and internal buffers (typically ~1.5 GB), so it is disabled by default.
+This can significantly improve prefill speed, but requires additional memory for activations and internal buffers (typically ~1.5 GB), so it is disabled by default. Qwen3.5 MoE, MiniCPM-V 4.7, and Ling require `--prefill-ubatches 1`.
 
 ## Architecture
 
@@ -179,16 +274,16 @@ This can significantly improve prefill speed, but requires additional memory for
                  │
    Engine ── Dedicated inference thread · Request queue · Sampling · Prefix KV reuse
                  │
-   LanguageModel ── Qwen3 / Llama / Granite / Qwen3.5 (vision + MTP)
+   LanguageModel ── Dense / Qwen3.5 / Qwen3.5 MoE / MiniCPM-V 4.7 / Ling*
         │                         │
    CPU (Rust + C++)          NPU (rk_npu_matmul, C ABI)
-   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · Attention · ViT · GDN
+   Norm · RoPE · Conv · GDN   W4A8/W8A8 Linear · MoE · Attention · ViT · GDN
                                   │
                          Open-source RKNPU2 kernel driver
 ```
 
 
-Shared CPU operators live in `src/ops/`, reusable GDN layers and state transactions in `src/layers/`, and checkpoint loading and model execution in `src/model/`. Dense and experimental Qwen3.5 share output projections, tracing and quantized projection components. See the [module layout](llm_generated_docs/RUNTIME_MODULE_LAYOUT.md).
+*Ling requires an optional build feature. Shared CPU operators live in `src/ops/`, reusable GDN layers and state transactions in `src/layers/`, and checkpoint loading and model execution in `src/model/`. See the [module layout](llm_generated_docs/RUNTIME_MODULE_LAYOUT.md).
 
 ## Development
 
@@ -203,6 +298,8 @@ cd open_rknpu2_lm_infer
 git submodule update --init --depth 1
 cargo build --release --locked
 ```
+
+To add Ling alongside the default model families, build with `cargo build --release --locked --features model-ling3tiny`.
 
 Set the model directory, then run:
 
