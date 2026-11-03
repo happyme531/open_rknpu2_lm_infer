@@ -14,6 +14,9 @@ concurrency:
 jobs:
   check:
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: write
   publish:
     name: Publish release
     needs: check
@@ -35,3 +38,12 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
             --verify-tag --title "$GITHUB_REF_NAME" \
             --notes-file llm_generated_docs/RELEASE_NOTES.md --latest
+  container:
+    name: Publish container
+    needs: publish
+    uses: ./.github/workflows/container.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: ${{ github.ref_name }}

@@ -149,6 +149,15 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
 
+在 RK3588 主机上使用 Docker 部署时，克隆本仓库并使用内置的 Compose 模板：
+
+```sh
+export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+docker compose up -d
+```
+
+模板映射 NPU DRM 设备、持久保存调优数据，并在 `http://127.0.0.1:8080` 提供 API。设备选择、版本和配置见 [Docker 部署说明](llm_generated_docs/DOCKER.md)。
+
 ## 功能一览
 
 ### 图像输入与MTP

@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      container_version:
+        description: Publish a container for this existing release; leave empty to run checks
+        type: string
+        required: false
   workflow_call:
 
 permissions:
@@ -16,6 +21,7 @@ concurrency:
 
 jobs:
   check:
+    if: github.event_name != 'workflow_dispatch' || inputs.container_version == ''
     name: ARM64 build and checks
     runs-on: ubuntu-24.04-arm
     container: debian:bullseye
@@ -92,3 +98,11 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
+  container:
+    if: github.event_name == 'workflow_dispatch' && inputs.container_version != ''
+    uses: ./.github/workflows/container.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: ${{ inputs.container_version }}
