@@ -152,8 +152,6 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
 
-Use `--compress-w8a8` to losslessly compress all W8A8 linear weights. Tiles stay raw unless their encoded size is smaller. See [W8A8 weight compression](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md) for startup and memory accounting details.
-
 ## Features
 
 ### Image Input and MTP
@@ -183,17 +181,7 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
 
-`--batches` prepares both decoder and quantized output-head profiles. Include the verify buckets used by speculative decoding: for example, a maximum of six draft tokens needs the M=8 head bucket. Ordinary generation prepares only its decode/verify head shapes.
-
-Use the same `--tune-cache PATH` for tuning and inference. Without an explicit path, the program uses systemd's `CACHE_DIRECTORY` (the first directory when several are listed), then `$XDG_CACHE_HOME/open_rknpu2_lm_infer`, then `$HOME/.cache/open_rknpu2_lm_infer`. With none of these set, it uses `MODEL/.cache/open_rknpu2_lm_infer`. Startup logs show the resolved path and the initial cache hit/miss and fallback-shape counts.
-
-For a systemd service, set `CacheDirectory=open_rknpu2_lm_infer` in its `[Service]` section to provide a persistent writable cache. Run `tune` as the service user with `--tune-cache /var/cache/open_rknpu2_lm_infer` and the same CPU/NPU settings. For a read-only model directory, set `CacheDirectory` or an explicit writable `--tune-cache` path. Inference loads existing profiles; `tune` creates missing profiles.
-
-`run`, `chat`, and `serve` show prefill progress, cached token counts, throughput, and ETA by default, followed by recent and average decode speed. With speculative decoding enabled, the display also includes acceptance, tokens per round, round count, and average draft/verify time. DSpark currently appears as `DFlash` in the progress display and as `draft-dspark` in `--stats`. Throughput measures complete model calls; decode excludes the first token produced by prefill. Recent speed uses complete rounds from roughly the last second.
-
-`run` writes status to stderr and generated text to stdout; `chat` uses a separate status area. `serve` logs progress on the server, preserving the HTTP/SSE response format. Redirected logs use plain text at five-second intervals, plus phase transitions and completion. Vision tuning shows overall shape progress alongside the native candidate search progress.
-
-A shape used without an applicable tuning profile triggers one notice per process. Target, DFlash, and vision projections include a tuning command; MTP floating projections identify the missing CLI tuning support. Partial prefill batches, including checkpoint splits, do not trigger the notice. Explicit `--no-tune` also suppresses it.
+Use the same `--tune-cache PATH` for tuning and inference. Without an explicit path, the program uses systemd's `CACHE_DIRECTORY` (the first directory when several are listed), then `$XDG_CACHE_HOME/open_rknpu2_lm_infer`, then `$HOME/.cache/open_rknpu2_lm_infer`. With none of these set, it uses `MODEL/.cache/open_rknpu2_lm_infer`.
 
 ### MoE Expert Storage and Prefetching
 
@@ -272,6 +260,10 @@ Use `--prefill-ubatches 2` to overlap two physical ubatches from the same prompt
 ```
 
 This can significantly improve prefill speed, but requires additional memory for activations and internal buffers (typically ~1.5 GB), so it is disabled by default. Qwen3.5 MoE, MiniCPM-V 4.7, and Ling require `--prefill-ubatches 1`.
+
+### Hardware-Accelerated INT8 Weight Compression
+
+Use `--compress-w8a8` to enable lossless compression of W8A8 linear-layer weights. This can substantially reduce memory use without affecting inference accuracy, but may slightly reduce inference speed and significantly increase server startup time.
 
 ## Architecture
 

@@ -149,8 +149,6 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
 
-可选 `--compress-w8a8` 对所有 W8A8 线性层权重做无损压缩，仅在 tile 体积严格变小时使用压缩存储，详见 [W8A8 权重无损压缩](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md)。
-
 ## 功能一览
 
 ### 图像输入与MTP
@@ -180,17 +178,7 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
 
-`--batches` 同时准备 decoder 和量化输出头的调优配置。开启投机解码时，应包含验证实际使用的 bucket，例如最多6个 draft token 需要 M=8 的输出头配置。普通生成只准备 decode 和 verify 使用的输出头 shape。
-
-调优和推理应使用相同的 `--tune-cache PATH`。未显式指定时，依次使用 systemd 的 `CACHE_DIRECTORY`（配置多个目录时取第一个）、`$XDG_CACHE_HOME/open_rknpu2_lm_infer`、`$HOME/.cache/open_rknpu2_lm_infer`；这些变量均未设置时，使用 `MODEL/.cache/open_rknpu2_lm_infer`。启动日志会显示实际路径以及初始缓存命中、缺失和 fallback shape 数量。
-
-systemd 服务可在 `[Service]` 中设置 `CacheDirectory=open_rknpu2_lm_infer`，提供持久且可写的缓存。使用服务用户执行 `tune`，指定 `--tune-cache /var/cache/open_rknpu2_lm_infer`，并保持 CPU/NPU 设置一致。模型目录只读时，应设置 `CacheDirectory` 或显式指定可写的 `--tune-cache`。推理读取已有配置，缺失配置由 `tune` 生成。
-
-`run`、`chat` 和 `serve` 默认显示 prefill 进度、缓存命中 token 数、处理速度及 ETA，并在 decode 时显示近期和平均速度。开启投机解码时，还会显示接受率、平均每轮产出、轮数及 draft/verify 平均耗时。DSpark 目前在进度显示中标为 `DFlash`，`--stats` 中的类型为 `draft-dspark`。速度按完整模型调用统计，decode 不包含 prefill 产生的首 token；近期速度取最近约一秒的完整轮次。
-
-`run` 的状态写入 stderr，生成正文写入 stdout；`chat` 在独立状态区显示；`serve` 在服务端终端记录状态，HTTP/SSE 格式保持不变。重定向日志使用每五秒一次的纯文本更新，同时记录阶段切换和结束状态。视觉调优同时显示整体 shape 进度和当前 shape 的候选搜索进度。
-
-发现实际使用的 shape 缺少可用调优缓存时，每个进程只提示一次。target、DFlash 和视觉投影提示对应调优命令；MTP 浮点投影会说明当前 CLI 未提供对应调优入口。prefill 尾块及 checkpoint 切分产生的部分块不触发提示；`--no-tune` 主动禁用调优时也不提示。
+调优和推理应使用相同的 `--tune-cache PATH`。未显式指定时，依次使用 systemd 的 `CACHE_DIRECTORY`（配置多个目录时取第一个）、`$XDG_CACHE_HOME/open_rknpu2_lm_infer`、`$HOME/.cache/open_rknpu2_lm_infer`；这些变量均未设置时，使用 `MODEL/.cache/open_rknpu2_lm_infer`。
 
 ### MoE 专家存储与预取
 
@@ -269,6 +257,10 @@ EXPERT_STORE=/path/to/expert-store
 ```
 
 开启后可以显著提升 prefill 速度，但会增加额外的激活值和内部缓冲区内存占用（典型 ~1.5 GB），因此默认不启用。Qwen3.5 MoE、MiniCPM-V 4.7 和 Ling 要求 `--prefill-ubatches 1`。
+
+### 硬件加速的 int8 权重压缩
+
+加入 `--compress-w8a8` 参数可以启用 W8A8 线性层权重无损压缩。可以在完全不影响推理精度的同时明显节省内存占用，但可能略微降低推理速度，并大幅增加服务启动耗时。
 
 ## 架构
 
