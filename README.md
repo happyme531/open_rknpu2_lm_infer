@@ -152,6 +152,15 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
 
+For Docker deployment on the RK3588 host, clone this repository and use the included Compose template:
+
+```sh
+export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+docker compose up --build -d
+```
+
+The template maps the NPU DRM device, preserves tuning data and exposes the API at `http://127.0.0.1:8080`. See [Docker deployment](llm_generated_docs/DOCKER.md) for device selection, versions and configuration.
+
 Use `--compress-w8a8` to losslessly compress all W8A8 linear weights. Tiles stay raw unless their encoded size is smaller. See [W8A8 weight compression](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md) for startup and memory accounting details.
 
 ## Features
