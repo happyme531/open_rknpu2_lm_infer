@@ -1,3 +1,4 @@
+mod cache;
 mod tune;
 use crate::{
     engine::{Engine, GenerationEvent, GenerationRequest, Prompt},
@@ -84,7 +85,11 @@ pub struct ModelArgs {
     pub npu_mask: u32,
     #[arg(short = 'C', long, global = true, default_value = "0xf0", value_parser = parse_u64)]
     pub cpu_mask: u64,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Directory containing tuning profiles; use the same path for tune and inference"
+    )]
     pub tune_cache: Option<PathBuf>,
     #[arg(
         long,
@@ -247,6 +252,10 @@ impl ModelArgs {
         if self.npu_mask == 0 || self.npu_mask > 7 {
             bail!("npu-mask must select one or more of the three NPU cores (1..7)");
         }
+        let tune_cache = self
+            .tune_cache
+            .clone()
+            .unwrap_or_else(|| cache::default(&path));
         let options = ModelOptions {
             path,
             context,
@@ -258,7 +267,7 @@ impl ModelArgs {
             tune: !self.no_tune,
             tune_search: false,
             compress_w8a8: self.compress_w8a8,
-            tune_cache: self.tune_cache.clone().unwrap_or_else(default_tune_cache),
+            tune_cache,
             attention_tile: self.attention_tile,
             vision_dtype: self.vision_dtype,
             checkpoints: crate::model::CheckpointOptions {
@@ -277,13 +286,6 @@ impl ModelArgs {
         };
         Ok(options)
     }
-}
-fn default_tune_cache() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join(crate::PROJECT_NAME)
 }
 #[derive(Subcommand)]
 pub enum Command {
@@ -385,7 +387,7 @@ pub enum Command {
         #[arg(long = "image", requires = "vision")]
         images: Vec<PathBuf>,
         #[arg(long, value_delimiter = ',', num_args = 1..,
-            help = "Actual prefill lengths to prepare; default: 1 and --ubatch-size")]
+            help = "Decoder and output-head batch lengths to tune; default: 1 and --ubatch-size")]
         batches: Vec<usize>,
         #[arg(long, help = "Write final statistics as JSON")]
         report: Option<PathBuf>,

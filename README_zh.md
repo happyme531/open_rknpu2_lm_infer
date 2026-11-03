@@ -158,8 +158,6 @@ docker compose up --build -d
 
 模板映射 NPU DRM 设备、持久保存调优数据，并在 `http://127.0.0.1:8080` 提供 API。设备选择、版本和配置见 [Docker 部署说明](llm_generated_docs/DOCKER.md)。
 
-可选 `--compress-w8a8` 对所有 W8A8 线性层权重做无损压缩，仅在 tile 体积严格变小时使用压缩存储，详见 [W8A8 权重无损压缩](llm_generated_docs/W8A8_LOSSLESS_COMPRESSION.md)。
-
 ## 功能一览
 
 ### 图像输入与MTP
@@ -182,18 +180,14 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 # 调优推测解码相关的batch，提升推测解码的速度
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,128
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,8,128
 # 使用指定输入分辨率调优视觉编码器
 #./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
 ```
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
 
-`run`、`chat` 和 `serve` 默认显示 prefill 进度、缓存命中 token 数、处理速度及 ETA，并在 decode 时显示近期和平均速度。开启投机解码时，还会显示接受率、平均每轮产出、轮数及 draft/verify 平均耗时。DSpark 目前在进度显示中标为 `DFlash`，`--stats` 中的类型为 `draft-dspark`。速度按完整模型调用统计，decode 不包含 prefill 产生的首 token；近期速度取最近约一秒的完整轮次。
-
-`run` 的状态写入 stderr，生成正文写入 stdout；`chat` 在独立状态区显示；`serve` 在服务端终端记录状态，HTTP/SSE 格式保持不变。重定向日志使用每五秒一次的纯文本更新，同时记录阶段切换和结束状态。视觉调优同时显示整体 shape 进度和当前 shape 的候选搜索进度。
-
-发现实际使用的 shape 缺少可用调优缓存时，每个进程只提示一次。target、DFlash 和视觉投影提示对应调优命令；MTP 浮点投影会说明当前 CLI 未提供对应调优入口。prefill 尾块及 checkpoint 切分产生的部分块不触发提示；`--no-tune` 主动禁用调优时也不提示。
+调优和推理应使用相同的 `--tune-cache PATH`。未显式指定时，依次使用 systemd 的 `CACHE_DIRECTORY`（配置多个目录时取第一个）、`$XDG_CACHE_HOME/open_rknpu2_lm_infer`、`$HOME/.cache/open_rknpu2_lm_infer`；这些变量均未设置时，使用 `MODEL/.cache/open_rknpu2_lm_infer`。
 
 ### MoE 专家存储与预取
 
@@ -272,6 +266,10 @@ EXPERT_STORE=/path/to/expert-store
 ```
 
 开启后可以显著提升 prefill 速度，但会增加额外的激活值和内部缓冲区内存占用（典型 ~1.5 GB），因此默认不启用。Qwen3.5 MoE、MiniCPM-V 4.7 和 Ling 要求 `--prefill-ubatches 1`。
+
+### 硬件加速的 int8 权重压缩
+
+加入 `--compress-w8a8` 参数可以启用 W8A8 线性层权重无损压缩。可以在完全不影响推理精度的同时明显节省内存占用，但可能略微降低推理速度，并大幅增加服务启动耗时。
 
 ## 架构
 

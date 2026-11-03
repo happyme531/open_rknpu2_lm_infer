@@ -63,8 +63,13 @@ impl Qwen35 {
     fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
         let prefill_rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
         let mut rows = prefill_rows.clone();
-        let head_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
-        self.workspaces.prepare(&mut rows, &head_rows);
+        let decode_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+        let head_rows = crate::model::workspace::head_rows(
+            &prefill_rows,
+            &decode_rows,
+            self.options.tune_search,
+        );
+        self.workspaces.prepare(&mut rows, &decode_rows);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
             for rows in &rows {
@@ -73,8 +78,8 @@ impl Qwen35 {
                 })?;
             }
         }
-        // Generation projects only the prompt's final row; full-row scoring
-        // prepares its own head workspace when token_nll is requested.
+        // Generation projects only the prompt's final row. Explicit tuning
+        // also prepares the requested scoring and verification head batches.
         if let Some(backend) = self.head.backend() {
             backend.retain_workspaces(&head_rows)?;
             for rows in head_rows {

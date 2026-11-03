@@ -578,6 +578,7 @@ impl LanguageModel for Dense {
             .map(Backend::tune_operations)
             .sum();
         let mut rows = super::workspace::physical_rows([prompt_tokens], self.options.chunk);
+        let head_rows = super::workspace::head_rows(&rows, &[1], self.options.tune_search);
         self.workspaces.prepare(&mut rows, &[1]);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
@@ -597,8 +598,10 @@ impl LanguageModel for Dense {
             }
         }
         if let Some(head) = self.head.backend() {
-            head.retain_workspaces(&[1])?;
-            head.prepare(1)?;
+            head.retain_workspaces(&head_rows)?;
+            for rows in head_rows {
+                head.prepare(rows)?;
+            }
         }
         self.timings.prepare += elapsed(start);
         if self

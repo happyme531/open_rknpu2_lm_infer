@@ -6,7 +6,11 @@ pub(super) struct ParsedRequest {
     pub(super) stream: bool,
     pub(super) include_usage: bool,
     pub(super) tools_enabled: bool,
+    pub(super) tool_schemas: ToolSchemas,
 }
+/// Each request function's JSON Schema `properties`, by function name; types
+/// the text values of Qwen3-Coder XML tool calls.
+pub(super) type ToolSchemas = Arc<std::collections::HashMap<String, Value>>;
 pub(super) fn function_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -303,6 +307,20 @@ pub(super) fn parse_request(
     unsupported(&v, "function_call", |x| x.as_str() == Some("none"))?;
     let tools = parse_tools(&v, chat)?;
     let tools_enabled = tools.is_some();
+    let tool_schemas = Arc::new(
+        tools
+            .iter()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|tool| {
+                let function = &tool["function"];
+                Some((
+                    function["name"].as_str()?.to_owned(),
+                    function["parameters"]["properties"].clone(),
+                ))
+            })
+            .collect(),
+    );
     for name in [
         "suffix",
         "prediction",
@@ -483,6 +501,7 @@ pub(super) fn parse_request(
         stream,
         include_usage,
         tools_enabled,
+        tool_schemas,
     })
 }
 

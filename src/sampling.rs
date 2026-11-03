@@ -198,8 +198,36 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        if self.greedy() {
+            return self.greedy_token(logits);
+        }
         let distribution = self.distribution(logits)?;
         Ok(self.draw(&distribution))
+    }
+    /// Use another sampler's processors and history with this sampler's RNG.
+    pub fn sample_via(&mut self, history: &mut Self, logits: &[f32]) -> Result<u32> {
+        if history.greedy() {
+            return history.greedy_token(logits);
+        }
+        let distribution = history.distribution(logits)?;
+        Ok(self.draw(&distribution))
+    }
+
+    fn greedy_token(&self, logits: &[f32]) -> Result<u32> {
+        ensure!(
+            !logits.is_empty() && logits.len() == self.counts.len(),
+            "invalid logits vocabulary"
+        );
+        let mut best = (0, f32::NEG_INFINITY);
+        for (token, &original) in logits.iter().enumerate() {
+            debug_assert!(original.is_finite(), "nonfinite logit at token {token}");
+            let value = self.processed_logit(token, original);
+            // Retain the first token when processed logits tie.
+            if value > best.1 {
+                best = (token as u32, value);
+            }
+        }
+        Ok(best.0)
     }
     /// Proposal history and RNG are independent of committed target history.
     pub fn fork(&self) -> Self {
@@ -252,28 +280,20 @@ impl Sampler {
         distribution.values.last().unwrap().0
     }
     pub fn distribution(&mut self, logits: &[f32]) -> Result<Distribution> {
+        if self.greedy() {
+            return Ok(Distribution {
+                values: vec![(self.greedy_token(logits)?, 1.)],
+            });
+        }
         ensure!(
             !logits.is_empty() && logits.len() == self.counts.len(),
             "invalid logits vocabulary"
         );
         self.candidates.clear();
-        let mut best = (0, f32::NEG_INFINITY);
         for (token, &original) in logits.iter().enumerate() {
             debug_assert!(original.is_finite(), "nonfinite logit at token {token}");
             let value = self.processed_logit(token, original);
-            if self.greedy() {
-                // Retain the first token when processed logits tie.
-                if value > best.1 {
-                    best = (token as u32, value);
-                }
-            } else {
-                self.candidates.push((token as u32, value));
-            }
-        }
-        if self.greedy() {
-            return Ok(Distribution {
-                values: vec![(best.0, 1.)],
-            });
+            self.candidates.push((token as u32, value));
         }
         let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
         let k = self.params.top_k;
@@ -281,27 +301,35 @@ impl Sampler {
             self.candidates.select_nth_unstable_by(k - 1, order);
             self.candidates.truncate(k);
         }
-        self.candidates.sort_unstable_by(order);
+        let truncated = k == 0
+            && self.candidates.len() > 64
+            && (self.params.top_p < 1. || self.params.min_p > 0.)
+            && self.truncate_candidates();
+        if !truncated {
+            self.candidates.sort_unstable_by(order);
+        }
         let maximum = self.candidates[0].1;
         let mut sum = 0.0f64;
         for candidate in &mut self.candidates {
             candidate.1 = ((candidate.1 - maximum) / self.params.temperature).exp();
             sum += candidate.1 as f64;
         }
-        let minimum = self.candidates[0].1 * self.params.min_p;
-        let mut cumulative = 0.0f64;
-        let mut keep = 0;
-        for candidate in &self.candidates {
-            if candidate.1 < minimum {
-                break;
+        if !truncated {
+            let minimum = self.candidates[0].1 * self.params.min_p;
+            let mut cumulative = 0.0f64;
+            let mut keep = 0;
+            for candidate in &self.candidates {
+                if candidate.1 < minimum {
+                    break;
+                }
+                cumulative += candidate.1 as f64;
+                keep += 1;
+                if cumulative >= sum * self.params.top_p as f64 {
+                    break;
+                }
             }
-            cumulative += candidate.1 as f64;
-            keep += 1;
-            if cumulative >= sum * self.params.top_p as f64 {
-                break;
-            }
+            self.candidates.truncate(keep.max(1));
         }
-        self.candidates.truncate(keep.max(1));
         let total: f64 = self.candidates.iter().map(|c| c.1 as f64).sum();
         Ok(Distribution {
             values: self
@@ -311,11 +339,263 @@ impl Sampler {
                 .collect(),
         })
     }
+
+    /// Select and sort only the logit prefix needed by top-p/min-p. Keep logits
+    /// intact: exponentiation can round distinct logits to the same weight.
+    fn truncate_candidates(&mut self) -> bool {
+        let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+        let (minimum, maximum) = self.candidates.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(minimum, maximum), c| (minimum.min(c.1), maximum.max(c.1)),
+        );
+        let weight = |value: f32| ((value - maximum) / self.params.temperature).exp();
+        let minimum_weight = weight(minimum);
+        // If min-p retains every token and top-p needs at least a quarter of
+        // the vocabulary, a full sort avoids repeated prefix partitions.
+        if minimum_weight >= self.params.min_p && minimum_weight * self.params.top_p >= 0.25 {
+            return false;
+        }
+        let sum: f64 = self.candidates.iter().map(|c| weight(c.1) as f64).sum();
+        let cutoff = sum * self.params.top_p as f64;
+        // Both positive f64 sums differ from the exact sum by at most roughly
+        // n*epsilon. Resolve a cutoff within that interval with the full sort,
+        // preserving the original descending accumulation and kept token set.
+        let error = 2. * self.candidates.len() as f64 * f64::EPSILON * sum;
+        let mut head = self.candidates.len().min(64);
+        while head < self.candidates.len() {
+            self.candidates.select_nth_unstable_by(head - 1, order);
+            self.candidates[..head].sort_unstable_by(order);
+            let mut cumulative = 0.;
+            for (index, candidate) in self.candidates[..head].iter().enumerate() {
+                let value = weight(candidate.1);
+                if value < self.params.min_p {
+                    self.candidates.truncate(index.max(1));
+                    return true;
+                }
+                cumulative += value as f64;
+                if cumulative >= cutoff + error {
+                    self.candidates.truncate(index + 1);
+                    return true;
+                }
+                if cumulative >= cutoff - error {
+                    return false;
+                }
+            }
+            head = (head * 4).min(self.candidates.len());
+        }
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_sort_distribution(sampler: &Sampler, logits: &[f32]) -> Distribution {
+        let params = &sampler.params;
+        let mut sorted: Vec<_> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| (i as u32, sampler.processed_logit(i, value)))
+            .collect();
+        sorted.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        if params.top_k > 0 {
+            sorted.truncate(params.top_k);
+        }
+        let maximum = sorted[0].1;
+        for (_, value) in &mut sorted {
+            *value = ((*value - maximum) / params.temperature).exp();
+        }
+        let sum: f64 = sorted.iter().map(|(_, value)| *value as f64).sum();
+        let minimum = sorted[0].1 * params.min_p;
+        let mut cumulative = 0.;
+        let mut kept = Vec::new();
+        for candidate in sorted {
+            if candidate.1 < minimum {
+                break;
+            }
+            cumulative += candidate.1 as f64;
+            kept.push(candidate);
+            if cumulative >= sum * params.top_p as f64 {
+                break;
+            }
+        }
+        let total: f64 = kept.iter().map(|(_, value)| *value as f64).sum();
+        Distribution {
+            values: kept
+                .into_iter()
+                .map(|(i, value)| (i, value as f64 / total))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn untruncated_sampling_preserves_the_seeded_token_sequence() -> Result<()> {
+        let mut sampler = Sampler::new(
+            SamplingParams {
+                seed: Some(42),
+                ..Default::default()
+            },
+            4,
+            &[],
+        )?;
+        let actual: Vec<_> = (0..16)
+            .map(|_| sampler.sample(&[-1., 0.5, 1.5, -2.]).unwrap())
+            .collect();
+        assert_eq!(actual, [1, 0, 2, 2, 2, 2, 2, 1, 1, 2, 2, 1, 0, 2, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn nucleus_cutoff_preserves_logit_order_when_exp_rounds_equal() -> Result<()> {
+        let mut sampler = Sampler::new(
+            SamplingParams {
+                top_p: 0.5,
+                ..Default::default()
+            },
+            2,
+            &[],
+        )?;
+        let distribution = sampler.distribution(&[0., 1e-8])?;
+        assert_eq!(distribution.probability(0), 0.);
+        assert_eq!(distribution.probability(1), 1.);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_nucleus_matches_full_sort_probabilities_and_seeded_draws() -> Result<()> {
+        for vocab in [257, 4096] {
+            for case in 0..6 {
+                let mut logits: Vec<_> = (0..vocab)
+                    .map(|i| match case {
+                        0 => 0.,
+                        1 => ((i * 17) % 113) as f32 * 0.25 - 14.,
+                        2 => -(((i * 31) % vocab) as f32) * 0.1,
+                        3 => -100.,
+                        4 => -(((i * 7) % 11) as f32) * 1e-8,
+                        _ => {
+                            if i % 2 == 0 {
+                                -0.
+                            } else {
+                                0.
+                            }
+                        }
+                    })
+                    .collect();
+                if case == 3 {
+                    logits[1] = 0.;
+                }
+                for (top_p, min_p) in [
+                    (0., 0.),
+                    (0.5, 0.),
+                    (0.95, 0.),
+                    (1., 0.),
+                    (1., 0.05),
+                    (0.95, 0.05),
+                    (1., 1.),
+                ] {
+                    for temperature in [0.6, 1.] {
+                        let params = SamplingParams {
+                            temperature,
+                            top_p,
+                            min_p,
+                            seed: Some(42),
+                            repeat_penalty: 1.1,
+                            presence_penalty: 0.2,
+                            frequency_penalty: 0.1,
+                            ..Default::default()
+                        };
+                        let mut actual = Sampler::new(params, vocab, &[0, 0])?;
+                        let mut reference = actual.clone();
+                        for _ in 0..4 {
+                            let expected = full_sort_distribution(&reference, &logits);
+                            assert_eq!(
+                                actual.distribution(&logits)?.values,
+                                expected.values,
+                                "vocab={vocab},case={case},p={top_p},min_p={min_p},t={temperature}"
+                            );
+                            let token = actual.sample(&logits)?;
+                            assert_eq!(token, reference.draw(&expected));
+                            actual.observe(token);
+                            reference.observe(token);
+                        }
+                    }
+                }
+            }
+        }
+        let mut logits = vec![-100.; 257];
+        logits[0] = 0.;
+        logits[1] = 1e-8;
+        let mut sampler = Sampler::new(
+            SamplingParams {
+                top_p: 0.5,
+                ..Default::default()
+            },
+            logits.len(),
+            &[],
+        )?;
+        assert_eq!(sampler.distribution(&logits)?.values, vec![(1, 1.)]);
+        Ok(())
+    }
+
+    #[test]
+    fn sample_via_uses_history_processors_and_caller_rng() -> Result<()> {
+        for temperature in [0., 0.7, 1.] {
+            for top_p in [0.5, 1.] {
+                let mut caller = Sampler::new(
+                    SamplingParams {
+                        seed: Some(17),
+                        ..Default::default()
+                    },
+                    257,
+                    &[2],
+                )?;
+                let mut history = Sampler::new(
+                    SamplingParams {
+                        temperature,
+                        top_p,
+                        seed: Some(42),
+                        frequency_penalty: 0.5,
+                        ..Default::default()
+                    },
+                    257,
+                    &[0, 0, 1],
+                )?;
+                let mut reference_caller = caller.clone();
+                let mut reference_history = history.clone();
+                let logits: Vec<_> = (0..257).map(|i| (i % 7) as f32).collect();
+                for _ in 0..16 {
+                    let distribution = reference_history.distribution(&logits)?;
+                    let expected = reference_caller.draw(&distribution);
+                    assert_eq!(caller.sample_via(&mut history, &logits)?, expected);
+                    history.observe(expected);
+                    reference_history.observe(expected);
+                }
+                assert_eq!(caller.counts, [vec![0, 0, 1], vec![0; 254]].concat());
+                assert_eq!(history.counts, reference_history.counts);
+                assert_eq!(caller.sample(&logits)?, reference_caller.sample(&logits)?);
+                assert!(caller.sample_via(&mut history, &[]).is_err());
+                assert!(history.sample(&[]).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_candidate_step_does_not_advance_the_rng() -> Result<()> {
+        let mut sampler = Sampler::new(
+            SamplingParams {
+                seed: Some(42),
+                ..Default::default()
+            },
+            2,
+            &[],
+        )?;
+        assert_eq!(sampler.sample(&[0., -100.])?, 0);
+        let actual: Vec<_> = (0..8).map(|_| sampler.sample(&[0., 0.]).unwrap()).collect();
+        assert_eq!(actual, [1, 1, 0, 1, 0, 0, 0, 1]);
+        Ok(())
+    }
 
     #[test]
     fn partial_top_k_matches_full_sort_probabilities_and_seeded_draws() -> Result<()> {
@@ -343,40 +623,7 @@ mod tests {
                             }
                         })
                         .collect();
-                    let mut sorted: Vec<_> = logits
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &value)| (i as u32, reference.processed_logit(i, value)))
-                        .collect();
-                    sorted.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-                    if k > 0 {
-                        sorted.truncate(k);
-                    }
-                    let maximum = sorted[0].1;
-                    for (_, value) in &mut sorted {
-                        *value = ((*value - maximum) / params.temperature).exp();
-                    }
-                    let sum: f64 = sorted.iter().map(|(_, value)| *value as f64).sum();
-                    let minimum = sorted[0].1 * params.min_p;
-                    let mut cumulative = 0.;
-                    let mut kept = Vec::new();
-                    for candidate in sorted {
-                        if candidate.1 < minimum {
-                            break;
-                        }
-                        cumulative += candidate.1 as f64;
-                        kept.push(candidate);
-                        if cumulative >= sum * params.top_p as f64 {
-                            break;
-                        }
-                    }
-                    let total: f64 = kept.iter().map(|(_, value)| *value as f64).sum();
-                    let expected = Distribution {
-                        values: kept
-                            .into_iter()
-                            .map(|(i, value)| (i, value as f64 / total))
-                            .collect(),
-                    };
+                    let expected = full_sort_distribution(&reference, &logits);
                     assert_eq!(
                         actual.distribution(&logits)?.values,
                         expected.values,

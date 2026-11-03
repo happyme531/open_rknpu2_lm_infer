@@ -13,7 +13,9 @@ pub enum ToolCallParser {
 impl ToolCallParser {
     pub fn startup_message(self) -> &'static str {
         match self {
-            Self::ToolCallJson => "Tool call parser: tool-call-json (default JSON protocol)",
+            Self::ToolCallJson => {
+                "Tool call parser: tool-call-json (default; JSON or Qwen3-Coder XML in <tool_call>)"
+            }
             Self::Minicpm5 => {
                 "Tool call parser: minicpm5 (XML; streaming emits complete function blocks)"
             }
@@ -136,6 +138,62 @@ impl MiniCpm5Stream {
     }
 }
 
+fn schema_has_string_type(schema: &Value) -> bool {
+    match &schema["type"] {
+        Value::String(kind) if kind == "string" => return true,
+        Value::Array(kinds) if kinds.iter().any(|kind| kind == "string") => return true,
+        _ => (),
+    }
+    ["anyOf", "oneOf"].iter().any(|key| {
+        schema[key]
+            .as_array()
+            .is_some_and(|variants| variants.iter().any(schema_has_string_type))
+    })
+}
+
+/// Qwen3-Coder's XML body inside `<tool_call>`, as the Qwen3.5, Qwen3.6 and
+/// MiniCPM-V 4.7 templates render it:
+/// `<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>`.
+/// One newline on each side of a value is template framing. Values are typed
+/// by the function's schema, as vLLM's Qwen3-Coder parser does: an undeclared
+/// or string-typed parameter keeps its text, any other is decoded as a JSON
+/// literal when it parses.
+pub(super) fn parse_qwen3_coder(
+    payload: &str,
+    schemas: &super::request::ToolSchemas,
+) -> Option<Value> {
+    let (name, rest) = payload.trim().strip_prefix("<function=")?.split_once('>')?;
+    if !super::request::function_name(name) {
+        return None;
+    }
+    let properties = schemas.get(name).filter(|x| x.is_object());
+    let mut rest = rest.strip_suffix("</function>")?;
+    let mut arguments = Map::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let (key, tail) = rest.strip_prefix("<parameter=")?.split_once('>')?;
+        let (raw, tail) = tail.split_once("</parameter>")?;
+        if key.is_empty() || arguments.contains_key(key) {
+            return None;
+        }
+        let raw = raw.strip_prefix('\n').unwrap_or(raw);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        let schema = properties.and_then(|x| x.get(key));
+        let text = schema.is_none_or(schema_has_string_type);
+        let value = if text {
+            Value::String(raw.to_owned())
+        } else {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+        };
+        arguments.insert(key.to_owned(), value);
+        rest = tail;
+    }
+    Some(json!({"name": name, "arguments": serde_json::to_string(&arguments).ok()?}))
+}
+
 pub(super) fn parse_minicpm5(text: &str, response_id: &str) -> Vec<Value> {
     MiniCpm5Stream::new(response_id.to_owned()).push(text, true)
 }
@@ -214,6 +272,30 @@ mod tests {
                 .startup_message()
                 .contains("streaming emits complete function blocks")
         );
+    }
+
+    #[test]
+    fn qwen3_coder_preserves_nullable_string_parameters() {
+        for schema in [
+            json!({"type":"string"}),
+            json!({"type":["string","null"]}),
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+            json!({"oneOf":[{"type":"string"},{"type":"null"}]}),
+        ] {
+            let schemas = std::sync::Arc::new(
+                [("f".to_owned(), json!({"x":schema}))]
+                    .into_iter()
+                    .collect(),
+            );
+            for raw in ["123", "true", "null", "\"quoted\"", "  text\n "] {
+                let payload =
+                    format!("<function=f>\n<parameter=x>\n{raw}\n</parameter>\n</function>");
+                let function = parse_qwen3_coder(&payload, &schemas).unwrap();
+                let arguments: Value =
+                    serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(arguments["x"], raw, "schema: {schema}");
+            }
+        }
     }
 
     #[test]

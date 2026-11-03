@@ -58,6 +58,18 @@ pub(crate) fn physical_rows(lengths: impl IntoIterator<Item = usize>, ubatch: us
     rows
 }
 
+/// Explicit tuning covers scoring/verification heads at the requested batches.
+/// Ordinary generation prepares only its decode and verification row counts.
+pub(crate) fn head_rows(prefill: &[usize], decode: &[usize], tuning: bool) -> Vec<usize> {
+    let mut rows = decode.to_vec();
+    if tuning {
+        rows.extend_from_slice(prefill);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +80,13 @@ mod tests {
         assert_eq!(physical_rows([20, 1024, 330, 4], 128), [4, 20, 74, 128]);
         assert_eq!(physical_rows([128, 256], 128), [128]);
         assert!(physical_rows([0], 128).is_empty());
+    }
+
+    #[test]
+    fn explicit_tuning_covers_requested_head_batches_without_inflating_generation() {
+        let prefill = physical_rows([2, 4, 8, 128], 128);
+        assert_eq!(head_rows(&prefill, &[1], true), [1, 2, 4, 8, 128]);
+        assert_eq!(head_rows(&prefill, &[1], false), [1]);
+        assert_eq!(head_rows(&[128], &[1, 2, 3], false), [1, 2, 3]);
     }
 }

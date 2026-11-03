@@ -19,7 +19,7 @@ CLI `run`、`chat` 与 HTTP API 的默认温度均为 `1`，默认生成上限�
 
 支持 `tools` 中的 `type:function`，以及 `tool_choice:auto` / `none`。请求通过 checkpoint 自带的工具模板格式化。完整合法的 `<tool_call>` 块转换成标准 `tool_calls`；流模式在单个完整工具块结束时发送该调用的 name 和 arguments。多个调用有独立 index/id。
 
-工具响应解析支持 Qwen3 的 JSON 工具块。Granite 与 MiniCPM5 使用不同的原生 XML 函数格式，目前保留为文本；普通聊天、thinking、文本补全和流式输出可共用生成引擎。
+工具响应解析支持 Qwen3 的 JSON 工具块，以及 Qwen3.5、Qwen3.6 与 MiniCPM-V 4.7 模板在 `<tool_call>` 内使用的 Qwen3-Coder XML（`<function=…>` 与 `<parameter=…>`）；XML 参数值按请求 schema 定型：未声明或 string 类型保留原文，其他类型能解析为 JSON 字面量时解码。Granite 与 MiniCPM5 使用不同的原生 XML 函数格式，目前保留为文本；普通聊天、thinking、文本补全和流式输出可共用生成引擎。
 
 ```json
 {
