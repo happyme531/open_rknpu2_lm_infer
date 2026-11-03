@@ -1,7 +1,7 @@
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS download
 
 ARG TARGETARCH
-ARG VERSION=0.10.0
+ARG VERSION=0.11.0
 
 RUN if [ "$TARGETARCH" != arm64 ]; then \
         echo 'This image requires --platform linux/arm64 (RK3588).' >&2; exit 1; \
@@ -34,7 +34,7 @@ RUN set -eu; \
 
 FROM scratch
 
-ARG VERSION=0.10.0
+ARG VERSION=0.11.0
 LABEL org.opencontainers.image.source="https://github.com/happyme531/open_rknpu2_lm_infer" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}"

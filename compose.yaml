@@ -1,13 +1,9 @@
 services:
   llm:
-    image: open-rknpu2-lm-infer:${RKNPU_VERSION:-0.10.0}
+    image: ghcr.io/happyme531/open_rknpu2_lm_infer:${RKNPU_VERSION:-0.11.0}
     platform: linux/arm64
-    build:
-      context: .
-      args:
-        VERSION: ${RKNPU_VERSION:-0.10.0}
     devices:
-      - "${RKNPU_DEVICE:-/dev/dri/renderD129}:/dev/dri/card1"
+      - "${RKNPU_DEVICE:-/dev/dri/renderD129}:/dev/dri/renderD129"
     ports:
       - "${RKNPU_BIND_ADDRESS:-127.0.0.1}:${RKNPU_PORT:-8080}:8080"
     volumes:

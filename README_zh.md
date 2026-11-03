@@ -153,7 +153,7 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 
 ```sh
 export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-docker compose up --build -d
+docker compose up -d
 ```
 
 模板映射 NPU DRM 设备、持久保存调优数据，并在 `http://127.0.0.1:8080` 提供 API。设备选择、版本和配置见 [Docker 部署说明](llm_generated_docs/DOCKER.md)。

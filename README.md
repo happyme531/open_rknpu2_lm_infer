@@ -156,7 +156,7 @@ For Docker deployment on the RK3588 host, clone this repository and use the incl
 
 ```sh
 export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-docker compose up --build -d
+docker compose up -d
 ```
 
 The template maps the NPU DRM device, preserves tuning data and exposes the API at `http://127.0.0.1:8080`. See [Docker deployment](llm_generated_docs/DOCKER.md) for device selection, versions and configuration.

@@ -16,6 +16,21 @@ Release CI 由 v 开头的 tag 触发，复用同一套检查和构建。tag 必
 
 二进制使用 glibc 2.31 构建，适用于 Debian 11 或更新的 ARM64 Linux。系统需要 libstdc++6、libgomp1 和可用的 RK3588 NPU DRM 驱动。解压后通过 bin/open_rknpu2_lm_infer 运行。
 
+## GHCR 镜像
+
+Release 附件发布后，容器工作流从该附件构建 ARM64 scratch 镜像，验证 CLI 启动后推送至
+`ghcr.io/happyme531/open_rknpu2_lm_infer:VERSION`。当前最新稳定 Release 同时发布 `latest`。
+使用 Actions 的 `GITHUB_TOKEN` 和 job 级 `packages: write` 权限，不需要另配 PAT。
+
+补发已有 Release 的镜像时，手动运行 CI，并填写 `container_version`；该模式只执行镜像发布：
+
+```sh
+gh workflow run ci.yml -f container_version=0.11.0
+```
+
+首次发布后需将 GHCR package 的 visibility 设为 public，用户即可免登录拉取。
+部署及本地构建方式见 [DOCKER.md](DOCKER.md)。
+
 源码包保留 submodule 的 Git 元数据和固定提交，可直接执行 cargo build --release --locked。依赖仍由上游仓库维护。源码与文档只收录Git跟踪的文件，本地未跟踪实验不进入附件；二进制附件包含scripts/run_board.py，以便按README显式调优和固定频率测速。
 
 ## 板端验证
