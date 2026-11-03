@@ -231,6 +231,7 @@ async fn respond(
             parsed.tools_enabled,
             preopened_thinking,
             state.tool_call_parser,
+            parsed.tool_schemas,
         ));
     }
     while let Some(event) = handle.events.recv().await {
@@ -251,6 +252,7 @@ async fn respond(
                         parsed.tools_enabled,
                         preopened_thinking,
                         state.tool_call_parser,
+                        &parsed.tool_schemas,
                     )
                 } else {
                     json!({"index":0,"text":result.text,"logprobs":null,"finish_reason":result.finish_reason})
@@ -279,8 +281,10 @@ fn split_thinking(text: &str, preopened: bool) -> (&str, Option<&str>) {
 }
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
-fn parse_tool_block(payload: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(payload).ok()?;
+fn parse_tool_block(payload: &str, schemas: &ToolSchemas) -> Option<Value> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return tool_parser::parse_qwen3_coder(payload, schemas);
+    };
     let name = value["name"].as_str().filter(|name| function_name(name))?;
     let arguments = match &value["arguments"] {
         Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
@@ -297,6 +301,7 @@ struct ToolStream {
     calls: usize,
     response_id: String,
     xml: Option<tool_parser::MiniCpm5Stream>,
+    schemas: ToolSchemas,
 }
 impl ToolStream {
     fn new(enabled: bool, response_id: String) -> Self {
@@ -306,10 +311,17 @@ impl ToolStream {
             calls: 0,
             response_id,
             xml: None,
+            schemas: Default::default(),
         }
     }
-    fn with_parser(enabled: bool, response_id: String, parser: ToolCallParser) -> Self {
+    fn with_parser(
+        enabled: bool,
+        response_id: String,
+        parser: ToolCallParser,
+        schemas: ToolSchemas,
+    ) -> Self {
         let mut stream = Self::new(enabled, response_id.clone());
+        stream.schemas = schemas;
         if enabled && parser == ToolCallParser::Minicpm5 {
             stream.xml = Some(tool_parser::MiniCpm5Stream::new(response_id));
         }
@@ -339,7 +351,9 @@ impl ToolStream {
                 if let Some(end) = self.pending[TOOL_OPEN.len()..].find(TOOL_CLOSE) {
                     let end = end + TOOL_OPEN.len();
                     let consumed = end + TOOL_CLOSE.len();
-                    if let Some(function) = parse_tool_block(&self.pending[TOOL_OPEN.len()..end]) {
+                    if let Some(function) =
+                        parse_tool_block(&self.pending[TOOL_OPEN.len()..end], &self.schemas)
+                    {
                         out.push(json!({"tool_calls":[{"index":self.calls,"id":format!("{}_call_{}",self.response_id,self.calls),"type":"function","function":function}]}));
                         self.calls += 1;
                     } else {
@@ -386,6 +400,7 @@ fn chat_choice(
         tools_enabled,
         preopened_thinking,
         ToolCallParser::ToolCallJson,
+        &Default::default(),
     )
 }
 
@@ -395,9 +410,11 @@ fn chat_choice_with_parser(
     tools_enabled: bool,
     preopened_thinking: bool,
     protocol: ToolCallParser,
+    schemas: &ToolSchemas,
 ) -> Value {
     let (text, reasoning) = split_thinking(&result.text, preopened_thinking);
     let mut parser = ToolStream::new(tools_enabled, id.to_owned());
+    parser.schemas = schemas.clone();
     let mut content = String::new();
     let mut calls = vec![];
     let deltas = if tools_enabled && protocol == ToolCallParser::Minicpm5 {
@@ -532,8 +549,9 @@ fn stream_response(
     tools_enabled: bool,
     preopened_thinking: bool,
     parser: ToolCallParser,
+    schemas: ToolSchemas,
 ) -> Response {
-    let tools = ToolStream::with_parser(tools_enabled, id.clone(), parser);
+    let tools = ToolStream::with_parser(tools_enabled, id.clone(), parser, schemas);
     let state = StreamState {
         handle,
         id,
@@ -767,6 +785,10 @@ mod tests {
         ]);
         let parsed = parse_request(v.clone(), true, "qwen", 4096).unwrap();
         assert!(parsed.tools_enabled);
+        assert_eq!(
+            parsed.tool_schemas["weather"],
+            json!({"city":{"type":"string"}})
+        );
         match parsed.request.prompt {
             Prompt::Chat {
                 messages, tools, ..
@@ -847,6 +869,70 @@ mod tests {
             vec![json!({"content":"<tool_call>"})]
         );
     }
+    #[test]
+    fn qwen3_coder_xml_is_typed_by_the_request_schema_at_every_token_boundary() {
+        let call = "<tool_call>\n<function=edit>\n<parameter=path>\nsrc/a.rs\n</parameter>\n\
+            <parameter=newText>\n\"quoted\"\n  indented\n\n</parameter>\n<parameter=line>\n42\n</parameter>\n\
+            <parameter=flags>\n[\"a\"]\n</parameter>\n<parameter=note>\nnull\n</parameter>\n\
+            <parameter=extra>\n7\n</parameter>\n</function>\n</tool_call>";
+        let mut parser = ToolStream::new(true, "test".into());
+        parser.schemas = Arc::new(
+            [(
+                "edit".to_owned(),
+                json!({"path":{"type":"string"},"newText":{"type":"string"},"line":{"type":"integer"},
+                    "flags":{"type":"array"},"note":{"type":["string","null"]}}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut deltas = vec![];
+        for character in format!("before{call}after").chars() {
+            deltas.extend(parser.push(&character.to_string(), false));
+        }
+        deltas.extend(parser.push("", true));
+        let content: String = deltas
+            .iter()
+            .filter_map(|x| x["content"].as_str())
+            .collect();
+        assert_eq!(content, "beforeafter");
+        assert_eq!(parser.calls, 1);
+        let call = deltas
+            .iter()
+            .find(|x| x.get("tool_calls").is_some())
+            .unwrap();
+        let function = &call["tool_calls"][0]["function"];
+        assert_eq!(function["name"], "edit");
+        let arguments: Value =
+            serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            arguments,
+            json!({"path":"src/a.rs","newText":"\"quoted\"\n  indented\n","line":42,
+                "flags":["a"],"note":"null","extra":"7"})
+        );
+    }
+    #[test]
+    fn qwen3_coder_xml_without_schema_keeps_text_and_malformed_stays_text() {
+        let valid = "<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n\
+            <parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>";
+        let malformed =
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</function>\n</tool_call>";
+        let result = GenerationResult {
+            text: format!("{valid}{malformed}"),
+            finish_reason: "stop".into(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            cached_tokens: 0,
+            timings: Value::Null,
+            stats: Value::Null,
+        };
+        let choice = chat_choice(&result, "test", true, false);
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(choice["message"]["content"], malformed);
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"command\":\"ls -la\",\"timeout\":\"30\"}"
+        );
+    }
     #[tokio::test]
     async fn sse_emits_complete_tool_call_then_tool_finish_reason() {
         use http_body_util::BodyExt;
@@ -885,6 +971,7 @@ mod tests {
             true,
             false,
             ToolCallParser::ToolCallJson,
+            Default::default(),
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&bytes).unwrap();
@@ -948,6 +1035,7 @@ mod tests {
             false,
             false,
             ToolCallParser::ToolCallJson,
+            Default::default(),
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
@@ -997,6 +1085,7 @@ mod tests {
             false,
             false,
             ToolCallParser::ToolCallJson,
+            Default::default(),
         );
         assert!(!cancel.load(Ordering::Relaxed));
         drop(response);
@@ -1034,6 +1123,7 @@ mod tests {
                 true,
                 false,
                 ToolCallParser::Minicpm5,
+                Default::default(),
             );
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             let body = std::str::from_utf8(&bytes).unwrap();
@@ -1079,6 +1169,7 @@ mod tests {
             true,
             false,
             ToolCallParser::Minicpm5,
+            Default::default(),
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&bytes).unwrap();
