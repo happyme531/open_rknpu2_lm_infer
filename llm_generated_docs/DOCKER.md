@@ -47,6 +47,8 @@ docker compose run --rm --no-deps llm chat
 
 Compose downloads the prebuilt image from GHCR; no local build is needed. Choose an image version by setting `RKNPU_VERSION` without the `v` prefix. The `latest` tag tracks the latest stable GitHub Release. Use `docker compose pull` followed by `docker compose up -d` to update.
 
+The Compose render-node mapping requires v0.11.0 or newer.
+
 For a local image build, the [Dockerfile](../Dockerfile) downloads the selected GitHub Release rather than compiling the checkout. Debian 12 is used only in intermediate build stages to obtain runtime libraries. A published release must provide the standard `open_rknpu2_lm_infer-vVERSION-linux-aarch64.tar.gz` asset. Build and check it without model weights or an NPU:
 
 ```sh
@@ -57,3 +59,5 @@ docker run --rm --platform linux/arm64 ghcr.io/happyme531/open_rknpu2_lm_infer:0
 ```
 
 An x86 build host needs ARM64 emulation for the runtime package installation and CLI checks. These checks establish image construction and executable startup; model loading, NPU ioctl permissions and inference still require an RK3588 host.
+
+The v0.11.0 prebuilt image has passed [RK3588 inference validation](DOCKER_VALIDATION_20261104.md), including native/container logits comparison and API/SSE checks.
