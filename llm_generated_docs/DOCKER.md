@@ -10,19 +10,21 @@ Download a supported model on the host as described in the [Quick Start](../READ
 
 ```sh
 export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
-export RKNPU_DEVICE=/dev/dri/card1
+export RKNPU_DEVICE=/dev/dri/renderD129
 docker compose up --build -d
 docker compose logs -f llm
 ```
 
-`RKNPU_DEVICE` must be the host's **NPU DRM device**, not a GPU/display node. The native allocator and submit path open `/dev/dri/card1` inside the container. Compose maps the selected host device to that exact path and grants device access without `privileged`. If your system exposes the same NPU DRM device as `/dev/rknpu`, set `RKNPU_DEVICE=/dev/rknpu` instead. Check the host's device/driver association when card numbering differs.
+`RKNPU_DEVICE` selects the host's **NPU DRM device**, defaulting to `/dev/dri/renderD129`. The v0.10.0 release opens `/dev/dri/card1` inside the container, so Compose maps the host render node to that path. Device identity comes from its major/minor numbers and is preserved by the mapping. No `privileged` mode is needed. Check the host's device/driver association if numbering differs, and set `RKNPU_DEVICE` to the actual NPU node.
 
 The model directory is mounted read-only at `/models`; missing host directories cause an error. Tuning files persist in the `tune-cache` named volume at `/cache/open_rknpu2_lm_infer` across container rebuilds and recreation. `docker compose down` retains that volume; `docker compose down -v` removes it.
+
+The Docker daemon must be able to read the host model directory. If an SSHFS mount only permits access by its mounting user, copy the model to a local directory before using it as a container mount.
 
 The server listens on `0.0.0.0:8080` inside the container, and Compose publishes it at `http://127.0.0.1:8080` on the host by default:
 
 ```sh
-curl http://127.0.0.1:8080/v1/models
+curl --noproxy 127.0.0.1 http://127.0.0.1:8080/v1/models
 ```
 
 To allow access from other machines, set `RKNPU_BIND_ADDRESS=0.0.0.0`. Set `OPEN_RKNPU_API_KEY` before starting Compose to require a bearer API key. `RKNPU_PORT` changes the published host port. Edit `command` in [compose.yaml](../compose.yaml) to add options such as `--ctx-size` or speculative decoding; additional model, image or expert-store paths require their own mounts.
