@@ -159,35 +159,37 @@ pub fn run_round_with_options(
         let mut output = Vec::new();
         let mut accepted = 0;
         for (r, q) in distributions.iter().enumerate() {
-            let p = target_history.distribution(&logits[r * vocab..(r + 1) * vocab])?;
             let proposal = inputs[r + 1];
-            let sampled = if options.sampling == DraftSampling::Greedy {
-                Some(sampler.draw(&p))
+            let (token, matches) = if options.sampling == DraftSampling::Greedy {
+                // Same sampling law as distribution()+draw, without the
+                // vocabulary-sized sort per verification row.
+                let token =
+                    sampler.sample_via(&mut target_history, &logits[r * vocab..(r + 1) * vocab])?;
+                (token, token == proposal)
             } else {
-                None
-            };
-            let matches = if let Some(token) = sampled {
-                token == proposal
-            } else {
-                sampler.accept(&p, q, proposal)?
+                let p = target_history.distribution(&logits[r * vocab..(r + 1) * vocab])?;
+                let matches = sampler.accept(&p, q, proposal)?;
+                let token = if matches {
+                    proposal
+                } else {
+                    sampler.draw(&p.residual(q)?)
+                };
+                (token, matches)
             };
             if matches {
                 output.push(proposal);
                 target_history.observe(proposal);
                 accepted += 1;
             } else {
-                output.push(if let Some(token) = sampled {
-                    token
-                } else {
-                    sampler.draw(&p.residual(q)?)
-                });
+                output.push(token);
                 break;
             }
         }
         if accepted == distributions.len() {
             let r = accepted;
-            let p = target_history.distribution(&logits[r * vocab..(r + 1) * vocab])?;
-            output.push(sampler.draw(&p));
+            output.push(
+                sampler.sample_via(&mut target_history, &logits[r * vocab..(r + 1) * vocab])?,
+            );
         }
         Ok(VerifiedRound {
             inputs,

@@ -128,17 +128,25 @@ impl Distribution {
 }
 
 impl Sampler {
-    fn processed_logit(&self, token: usize, original: f32) -> f32 {
-        let count = self.counts[token];
+    fn processed_logit_of(
+        params: &SamplingParams,
+        counts: &[u32],
+        token: usize,
+        original: f32,
+    ) -> f32 {
+        let count = counts[token];
         if count == 0 {
             return original;
         }
         let value = if original >= 0. {
-            original / self.params.repeat_penalty
+            original / params.repeat_penalty
         } else {
-            original * self.params.repeat_penalty
+            original * params.repeat_penalty
         };
-        value - (self.params.presence_penalty + self.params.frequency_penalty * count as f32)
+        value - (params.presence_penalty + params.frequency_penalty * count as f32)
+    }
+    fn processed_logit(&self, token: usize, original: f32) -> f32 {
+        Self::processed_logit_of(&self.params, &self.counts, token, original)
     }
 
     /// Maximum softmax probability among the selected candidates. Greedy draft
@@ -198,8 +206,85 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        if Self::untruncated(&self.params) {
+            let (params, counts, rng) = (&self.params, &self.counts, &mut self.rng);
+            return Ok(Self::categorical(params, counts, rng, logits));
+        }
         let distribution = self.distribution(logits)?;
         Ok(self.draw(&distribution))
+    }
+    /// Sample with another sampler's processors and history but this
+    /// sampler's RNG, as the MTP verification loop requires. The greedy path
+    /// is exactly the old argmax; the untruncated path has the same
+    /// categorical law as distribution()+draw without the vocabulary sort.
+    pub fn sample_via(&mut self, history: &mut Self, logits: &[f32]) -> Result<u32> {
+        if history.greedy() {
+            let mut best = (0u32, f32::NEG_INFINITY);
+            for (token, &original) in logits.iter().enumerate() {
+                let value = history.processed_logit(token, original);
+                if value > best.1 {
+                    best = (token as u32, value);
+                }
+            }
+            return Ok(best.0);
+        }
+        if Self::untruncated(&history.params) {
+            let (params, counts, rng) = (&history.params, &history.counts, &mut self.rng);
+            return Ok(Self::categorical(params, counts, rng, logits));
+        }
+        let distribution = history.distribution(logits)?;
+        Ok(self.draw(&distribution))
+    }
+    /// No top_k/top_p/min_p filter truncates the softmax, and sampling (not
+    /// greedy argmax) is requested.
+    fn untruncated(params: &SamplingParams) -> bool {
+        params.temperature > 0.
+            && params.top_k == 0
+            && params.top_p >= 1.0
+            && params.min_p == 0.0
+    }
+    /// Order-independent cumulative draw over the full softmax: the returned
+    /// token has exactly its softmax probability, without sorting the whole
+    /// vocabulary. Consumes one RNG draw, like Sampler::draw.
+    fn categorical(
+        params: &SamplingParams,
+        counts: &[u32],
+        rng: &mut ChaCha8Rng,
+        logits: &[f32],
+    ) -> u32 {
+        let mut maximum = f32::NEG_INFINITY;
+        let mut max_token = 0u32;
+        for (token, &original) in logits.iter().enumerate() {
+            let value = Self::processed_logit_of(params, counts, token, original);
+            if value > maximum {
+                maximum = value;
+                max_token = token as u32;
+            }
+        }
+        let temperature = params.temperature;
+        let weight = |value: f32| -> f64 {
+            if value == maximum {
+                1.
+            } else {
+                f32::exp((value - maximum) / temperature) as f64
+            }
+        };
+        let mut sum = 0.0f64;
+        for (token, &original) in logits.iter().enumerate() {
+            sum += weight(Self::processed_logit_of(params, counts, token, original));
+        }
+        if !(sum > 0. && sum.is_finite()) {
+            return max_token;
+        }
+        let target = rng.r#gen::<f64>() * sum;
+        let mut cumulative = 0.0f64;
+        for (token, &original) in logits.iter().enumerate() {
+            cumulative += weight(Self::processed_logit_of(params, counts, token, original));
+            if target < cumulative {
+                return token as u32;
+            }
+        }
+        max_token
     }
     /// Proposal history and RNG are independent of committed target history.
     pub fn fork(&self) -> Self {
@@ -281,6 +366,9 @@ impl Sampler {
             self.candidates.select_nth_unstable_by(k - 1, order);
             self.candidates.truncate(k);
         }
+        if k == 0 && (self.params.top_p < 1.0 || self.params.min_p > 0.0) {
+            return self.truncated_distribution();
+        }
         self.candidates.sort_unstable_by(order);
         let maximum = self.candidates[0].1;
         let mut sum = 0.0f64;
@@ -298,6 +386,62 @@ impl Sampler {
             cumulative += candidate.1 as f64;
             keep += 1;
             if cumulative >= sum * self.params.top_p as f64 {
+                break;
+            }
+        }
+        self.candidates.truncate(keep.max(1));
+        let total: f64 = self.candidates.iter().map(|c| c.1 as f64).sum();
+        Ok(Distribution {
+            values: self
+                .candidates
+                .iter()
+                .map(|&(t, p)| (t, p as f64 / total))
+                .collect(),
+        })
+    }
+    /// top_k=0 with top_p/min_p truncation: convert candidates to softmax
+    /// weights, then grow a sorted head until it covers the top_p cutoff.
+    /// Only the head is sorted instead of the whole vocabulary; the kept
+    /// tokens and their order match the full sort up to f32 exp rounding at
+    /// the selection boundary.
+    fn truncated_distribution(&mut self) -> Result<Distribution> {
+        let order = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+        let temperature = self.params.temperature;
+        let mut maximum = f32::NEG_INFINITY;
+        for &(_, value) in &self.candidates {
+            if value > maximum {
+                maximum = value;
+            }
+        }
+        let mut sum = 0.0f64;
+        for candidate in &mut self.candidates {
+            candidate.1 = ((candidate.1 - maximum) / temperature).exp();
+            sum += candidate.1 as f64;
+        }
+        // The maximum weight is exp(0) = 1, so the min_p threshold is min_p.
+        let minimum = self.params.min_p;
+        let cutoff = sum * self.params.top_p as f64;
+        let mut m = self.candidates.len().min(64);
+        loop {
+            if m < self.candidates.len() {
+                self.candidates.select_nth_unstable_by(m - 1, order);
+            }
+            self.candidates[..m].sort_unstable_by(order);
+            let head: f64 = self.candidates[..m].iter().map(|&(_, w)| w as f64).sum();
+            if head >= cutoff || m >= self.candidates.len() {
+                break;
+            }
+            m = (m * 4).min(self.candidates.len());
+        }
+        let mut cumulative = 0.0f64;
+        let mut keep = 0;
+        for candidate in &self.candidates[..m] {
+            if candidate.1 < minimum {
+                break;
+            }
+            cumulative += candidate.1 as f64;
+            keep += 1;
+            if cumulative >= cutoff {
                 break;
             }
         }
