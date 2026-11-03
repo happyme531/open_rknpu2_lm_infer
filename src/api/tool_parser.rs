@@ -138,6 +138,19 @@ impl MiniCpm5Stream {
     }
 }
 
+fn schema_has_string_type(schema: &Value) -> bool {
+    match &schema["type"] {
+        Value::String(kind) if kind == "string" => return true,
+        Value::Array(kinds) if kinds.iter().any(|kind| kind == "string") => return true,
+        _ => (),
+    }
+    ["anyOf", "oneOf"].iter().any(|key| {
+        schema[key]
+            .as_array()
+            .is_some_and(|variants| variants.iter().any(schema_has_string_type))
+    })
+}
+
 /// Qwen3-Coder's XML body inside `<tool_call>`, as the Qwen3.5, Qwen3.6 and
 /// MiniCPM-V 4.7 templates render it:
 /// `<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>`.
@@ -169,12 +182,7 @@ pub(super) fn parse_qwen3_coder(
         let raw = raw.strip_prefix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
         let schema = properties.and_then(|x| x.get(key));
-        let text = match schema.map(|x| &x["type"]) {
-            None => true,
-            Some(Value::String(kind)) => kind == "string",
-            Some(Value::Array(kinds)) => kinds.iter().any(|x| x == "string"),
-            Some(_) => false,
-        };
+        let text = schema.is_none_or(schema_has_string_type);
         let value = if text {
             Value::String(raw.to_owned())
         } else {
@@ -264,6 +272,30 @@ mod tests {
                 .startup_message()
                 .contains("streaming emits complete function blocks")
         );
+    }
+
+    #[test]
+    fn qwen3_coder_preserves_nullable_string_parameters() {
+        for schema in [
+            json!({"type":"string"}),
+            json!({"type":["string","null"]}),
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+            json!({"oneOf":[{"type":"string"},{"type":"null"}]}),
+        ] {
+            let schemas = std::sync::Arc::new(
+                [("f".to_owned(), json!({"x":schema}))]
+                    .into_iter()
+                    .collect(),
+            );
+            for raw in ["123", "true", "null", "\"quoted\"", "  text\n "] {
+                let payload =
+                    format!("<function=f>\n<parameter=x>\n{raw}\n</parameter>\n</function>");
+                let function = parse_qwen3_coder(&payload, &schemas).unwrap();
+                let arguments: Value =
+                    serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(arguments["x"], raw, "schema: {schema}");
+            }
+        }
     }
 
     #[test]
