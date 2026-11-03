@@ -1121,14 +1121,8 @@ mod tests {
             vec![json!({"content":"answer"})]
         );
     }
-    fn minicpmv47_fixture(name: &str) -> String {
-        std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/minicpmv47_tool_history")
-                .join(name),
-        )
-        .unwrap()
-    }
+    const MINICPMV47_TEMPLATE: &str =
+        include_str!("../tests/fixtures/minicpmv47_tool_history/chat_template.jinja");
 
     fn minicpmv47_render(
         codec: &crate::text::TextCodec,
@@ -1146,12 +1140,38 @@ mod tests {
 
     #[test]
     fn minicpmv47_tool_history_matches_transformers() {
-        let codec =
-            crate::text::TextCodec::from_template(minicpmv47_fixture("chat_template.jinja"));
-        let case: Value = serde_json::from_str(&minicpmv47_fixture("case.json")).unwrap();
+        let codec = crate::text::TextCodec::from_template(MINICPMV47_TEMPLATE.into());
+        let case: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/minicpmv47_tool_history/case.json"
+        ))
+        .unwrap();
         assert_eq!(
             minicpmv47_render(&codec, &case["tools"], case["messages"].as_array().unwrap()),
-            minicpmv47_fixture("expected.txt")
+            include_str!("../tests/fixtures/minicpmv47_tool_history/expected.txt")
+        );
+    }
+
+    #[test]
+    fn minicpmv47_string_arguments_keep_python_float_rounding() {
+        let codec = crate::text::TextCodec::from_template(MINICPMV47_TEMPLATE.into());
+        let messages = json!([
+            {"role":"user", "content":"Record the measurement."},
+            {"role":"assistant", "content":null, "tool_calls":[{
+                "id":"c0", "type":"function", "function":{
+                    "name":"record",
+                    "arguments":r#"{"measurement":{"small":2.9802322387695312e-8,"large":1706789742950125.2}}"#
+                }
+            }]},
+            {"role":"tool", "tool_call_id":"c0", "content":"Recorded."}
+        ]);
+        let rendered = minicpmv47_render(&codec, &Value::Null, messages.as_array().unwrap());
+        assert!(
+            rendered.contains(concat!(
+                "<parameter=measurement>\n",
+                "{\"small\": 2.9802322387695312e-08, \"large\": 1706789742950125.2}",
+                "\n</parameter>"
+            )),
+            "{rendered}"
         );
     }
 }

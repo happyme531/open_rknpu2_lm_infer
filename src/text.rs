@@ -139,10 +139,16 @@ fn python_float(value: f64) -> String {
     if value == 0.0 {
         return format!("{sign}0.0");
     }
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific.split_once('e').unwrap();
-    let exponent: i32 = exponent.parse().unwrap();
+    // Serde's shortest representation uses ties-to-even, as Python does.
+    let shortest = serde_json::Number::from_f64(value.abs())
+        .unwrap()
+        .to_string();
+    let (mantissa, exponent) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
     let digits = mantissa.replace('.', "");
+    let leading = digits.len() - digits.trim_start_matches('0').len();
+    let exponent = exponent.parse::<i32>().unwrap() + decimal as i32 - leading as i32 - 1;
+    let digits = digits[leading..].trim_end_matches('0');
     if (-4..16).contains(&exponent) {
         let point = exponent + 1;
         if point <= 0 {
@@ -565,6 +571,8 @@ mod tests {
             (1e15, "1000000000000000.0"),
             (123.0, "123.0"),
             (-2.5e-300, "-2.5e-300"),
+            (2.9802322387695312e-8, "2.9802322387695312e-08"),
+            (1706789742950125.2, "1706789742950125.2"),
         ] {
             assert_eq!(python_float(value), expected);
         }
