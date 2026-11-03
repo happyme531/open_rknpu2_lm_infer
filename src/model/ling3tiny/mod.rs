@@ -177,6 +177,7 @@ impl Ling3Tiny {
     fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
         let floating_rows = rows[0].min(self.options.chunk);
         let mut rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
+        let head_rows = crate::model::workspace::head_rows(&rows, &[1], self.options.tune_search);
         self.workspaces.prepare(&mut rows, &[1]);
         for backend in &self.backends {
             backend.retain_workspaces(&rows)?;
@@ -196,9 +197,12 @@ impl Ling3Tiny {
             layer.mixer.prepare(floating_rows)?;
         }
         if let Some(head) = self.head.backend() {
-            head.retain_workspaces(&[1])?;
+            head.retain_workspaces(&head_rows)?;
         }
-        self.head.prepare(1)
+        for rows in head_rows {
+            self.head.prepare(rows)?;
+        }
+        Ok(())
     }
     fn output(&mut self) -> Result<&[f32]> {
         if self

@@ -66,4 +66,4 @@ python3 scripts/package_release.py --binary dist/customer_infer/customer_infer -
 
 交付名称在编译时写入程序；`--help`、`--version`、`models` 的 `project_name` 和 `build-info.json` 保持一致。发布包自动从实际程序读取名称，输出 `NAME-vVERSION-FAMILIES-linux-aarch64.tar.gz` 和对应源码包，包内程序为 `bin/NAME`。打包时的 `--name` 用于核对名称，名称不符会报错。
 
-内部 Cargo package/crate 名称固定，代码导入和 Cargo 原始 target 文件名保持稳定。直接使用 Cargo 时通过 `RKNPU_PROJECT_NAME=customer_infer cargo build ...` 设置显示名称，再由构建/打包脚本输出交付文件名。默认缓存路径为 `$XDG_CACHE_HOME/NAME` 或 `$HOME/.cache/NAME`；复用已有调优缓存时显式传入 `--tune-cache`。
+内部 Cargo package/crate 名称固定，代码导入和 Cargo 原始 target 文件名保持稳定。直接使用 Cargo 时通过 `RKNPU_PROJECT_NAME=customer_infer cargo build ...` 设置显示名称，再由构建/打包脚本输出交付文件名。默认缓存依次使用 systemd 的 `CACHE_DIRECTORY`、`$XDG_CACHE_HOME/NAME`、`$HOME/.cache/NAME`，这些变量均未设置时使用 `MODEL/.cache/NAME`。systemd 配置的目录直接使用；其他位置按交付名称区分。复用已有调优缓存时显式传入 `--tune-cache`。

@@ -176,12 +176,18 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 # Tune batches used by speculative decoding to improve its speed
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,128
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,8,128
 # Tune the vision encoder for a specific input resolution
 #./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
 ```
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
+
+`--batches` prepares both decoder and quantized output-head profiles. Include the verify buckets used by speculative decoding: for example, a maximum of six draft tokens needs the M=8 head bucket. Ordinary generation prepares only its decode/verify head shapes.
+
+Use the same `--tune-cache PATH` for tuning and inference. Without an explicit path, the program uses systemd's `CACHE_DIRECTORY` (the first directory when several are listed), then `$XDG_CACHE_HOME/open_rknpu2_lm_infer`, then `$HOME/.cache/open_rknpu2_lm_infer`. With none of these set, it uses `MODEL/.cache/open_rknpu2_lm_infer`. Startup logs show the resolved path and the initial cache hit/miss and fallback-shape counts.
+
+For a systemd service, set `CacheDirectory=open_rknpu2_lm_infer` in its `[Service]` section to provide a persistent writable cache. Run `tune` as the service user with `--tune-cache /var/cache/open_rknpu2_lm_infer` and the same CPU/NPU settings. For a read-only model directory, set `CacheDirectory` or an explicit writable `--tune-cache` path. Inference loads existing profiles; `tune` creates missing profiles.
 
 `run`, `chat`, and `serve` show prefill progress, cached token counts, throughput, and ETA by default, followed by recent and average decode speed. With speculative decoding enabled, the display also includes acceptance, tokens per round, round count, and average draft/verify time. DSpark currently appears as `DFlash` in the progress display and as `draft-dspark` in `--stats`. Throughput measures complete model calls; decode excludes the first token produced by prefill. Recent speed uses complete rounds from roughly the last second.
 

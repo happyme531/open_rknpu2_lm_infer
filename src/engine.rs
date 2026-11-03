@@ -96,8 +96,19 @@ impl Engine {
                     let chunk = options.chunk;
                     let mut options = options;
                     options.tune_search = false;
+                    let tune_cache = options.tune.then(|| options.tune_cache.clone());
                     let mut model = model::load(options)?;
                     model.prepare(chunk)?;
+                    if let Some(path) = tune_cache {
+                        let stats = model.stats();
+                        eprintln!(
+                            "Tuning cache at startup: {}; hits={}, misses={}, fallback shapes={}",
+                            path.display(),
+                            stats["tune_cache_hits"],
+                            stats["tune_cache_misses"],
+                            stats["strategy_fallbacks"]
+                        );
+                    }
                     Ok(model)
                 })();
                 let mut model = match loaded {

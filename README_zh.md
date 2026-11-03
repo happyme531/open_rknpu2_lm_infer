@@ -173,12 +173,18 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
 # 调优推测解码相关的batch，提升推测解码的速度
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,128
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,8,128
 # 使用指定输入分辨率调优视觉编码器
 #./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
 ```
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
+
+`--batches` 同时准备 decoder 和量化输出头的调优配置。开启投机解码时，应包含验证实际使用的 bucket，例如最多6个 draft token 需要 M=8 的输出头配置。普通生成只准备 decode 和 verify 使用的输出头 shape。
+
+调优和推理应使用相同的 `--tune-cache PATH`。未显式指定时，依次使用 systemd 的 `CACHE_DIRECTORY`（配置多个目录时取第一个）、`$XDG_CACHE_HOME/open_rknpu2_lm_infer`、`$HOME/.cache/open_rknpu2_lm_infer`；这些变量均未设置时，使用 `MODEL/.cache/open_rknpu2_lm_infer`。启动日志会显示实际路径以及初始缓存命中、缺失和 fallback shape 数量。
+
+systemd 服务可在 `[Service]` 中设置 `CacheDirectory=open_rknpu2_lm_infer`，提供持久且可写的缓存。使用服务用户执行 `tune`，指定 `--tune-cache /var/cache/open_rknpu2_lm_infer`，并保持 CPU/NPU 设置一致。模型目录只读时，应设置 `CacheDirectory` 或显式指定可写的 `--tune-cache`。推理读取已有配置，缺失配置由 `tune` 生成。
 
 `run`、`chat` 和 `serve` 默认显示 prefill 进度、缓存命中 token 数、处理速度及 ETA，并在 decode 时显示近期和平均速度。开启投机解码时，还会显示接受率、平均每轮产出、轮数及 draft/verify 平均耗时。DSpark 目前在进度显示中标为 `DFlash`，`--stats` 中的类型为 `draft-dspark`。速度按完整模型调用统计，decode 不包含 prefill 产生的首 token；近期速度取最近约一秒的完整轮次。
 
