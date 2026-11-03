@@ -121,30 +121,222 @@ fn template_value(value: &Value) -> Result<minijinja::Value> {
     })
 }
 
-// Transformers templates can pass ensure_ascii to tojson. Delegate all existing
-// behavior (including indentation and HTML escaping) to MiniJinja unchanged.
+/// Separators, indentation and escaping of transformers' `tojson`, which is
+/// `json.dumps(x, ensure_ascii=False, indent=None, separators=None,
+/// sort_keys=False)`.
+struct JsonStyle {
+    indent: Option<String>,
+    item: String,
+    key: String,
+    sort_keys: bool,
+    ensure_ascii: bool,
+}
+
+fn json_error(message: String) -> minijinja::Error {
+    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message)
+}
+
+/// Python's `repr` of a float: the shortest round-trip digits, positional
+/// for decimal exponents -4..16 and otherwise `d.ddde±XX`.
+fn python_float(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0.0");
+    }
+    // Serde's shortest representation uses ties-to-even, as Python does.
+    let shortest = serde_json::Number::from_f64(value.abs())
+        .unwrap()
+        .to_string();
+    let (mantissa, exponent) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let digits = mantissa.replace('.', "");
+    let leading = digits.len() - digits.trim_start_matches('0').len();
+    let exponent = exponent.parse::<i32>().unwrap() + decimal as i32 - leading as i32 - 1;
+    let digits = digits[leading..].trim_end_matches('0');
+    if (-4..16).contains(&exponent) {
+        let point = exponent + 1;
+        if point <= 0 {
+            format!("{sign}0.{}{digits}", "0".repeat((-point) as usize))
+        } else if point as usize >= digits.len() {
+            format!(
+                "{sign}{digits}{}.0",
+                "0".repeat(point as usize - digits.len())
+            )
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{sign}{whole}.{fraction}")
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let mantissa = if rest.is_empty() {
+            first.to_owned()
+        } else {
+            format!("{first}.{rest}")
+        };
+        let direction = if exponent < 0 { '-' } else { '+' };
+        format!("{sign}{mantissa}e{direction}{:02}", exponent.abs())
+    }
+}
+
+fn python_string(out: &mut String, text: &str, ensure_ascii: bool) {
+    use std::fmt::Write;
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            ch if ch < ' ' || (ensure_ascii && !(' '..='~').contains(&ch)) => {
+                for unit in ch.encode_utf16(&mut [0; 2]) {
+                    write!(out, "\\u{unit:04x}").unwrap();
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
+/// A map key as `json.dumps` writes it: strings unchanged, scalars converted.
+fn python_key(key: &minijinja::Value) -> Result<String, minijinja::Error> {
+    use minijinja::value::ValueKind;
+    Ok(match key.kind() {
+        ValueKind::String => key.as_str().unwrap_or_default().to_owned(),
+        ValueKind::Bool => if key.is_true() { "true" } else { "false" }.into(),
+        ValueKind::None | ValueKind::Undefined => "null".into(),
+        ValueKind::Number if key.is_integer() => key.to_string(),
+        ValueKind::Number => python_float(f64::try_from(key.clone())?),
+        kind => {
+            return Err(json_error(format!(
+                "keys must be str, int, float, bool or None, not {kind}"
+            )));
+        }
+    })
+}
+
+fn python_json(
+    out: &mut String,
+    value: &minijinja::Value,
+    style: &JsonStyle,
+    depth: usize,
+) -> Result<(), minijinja::Error> {
+    use minijinja::value::ValueKind;
+    let newline = |out: &mut String, depth: usize| {
+        if let Some(indent) = &style.indent {
+            out.push('\n');
+            out.push_str(&indent.repeat(depth));
+        }
+    };
+    match value.kind() {
+        ValueKind::Undefined | ValueKind::None => out.push_str("null"),
+        ValueKind::Bool => out.push_str(if value.is_true() { "true" } else { "false" }),
+        ValueKind::Number if value.is_integer() => out.push_str(&value.to_string()),
+        ValueKind::Number => out.push_str(&python_float(f64::try_from(value.clone())?)),
+        ValueKind::String => {
+            python_string(out, value.as_str().unwrap_or_default(), style.ensure_ascii)
+        }
+        ValueKind::Seq | ValueKind::Iterable => {
+            let items: Vec<_> = value.try_iter()?.collect();
+            if items.is_empty() {
+                out.push_str("[]");
+                return Ok(());
+            }
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(&style.item);
+                }
+                newline(out, depth + 1);
+                python_json(out, item, style, depth + 1)?;
+            }
+            newline(out, depth);
+            out.push(']');
+        }
+        ValueKind::Map => {
+            let mut entries = value
+                .try_iter()?
+                .map(|key| Ok((python_key(&key)?, value.get_item(&key)?)))
+                .collect::<Result<Vec<_>, minijinja::Error>>()?;
+            if style.sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            if entries.is_empty() {
+                out.push_str("{}");
+                return Ok(());
+            }
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(&style.item);
+                }
+                newline(out, depth + 1);
+                python_string(out, key, style.ensure_ascii);
+                out.push_str(&style.key);
+                python_json(out, item, style, depth + 1)?;
+            }
+            newline(out, depth);
+            out.push('}');
+        }
+        kind => {
+            return Err(json_error(format!(
+                "Object of type {kind} is not JSON serializable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// transformers replaces Jinja's tojson, which escapes HTML characters, with
+// json.dumps: ", " and ": " separators, no escaping, keys in their given
+// order. Re-rendered tool-call arguments must match what the model learned
+// and generated, or the prefix cache cannot be reused.
 fn template_tojson(
     value: &minijinja::Value,
     indent: Option<minijinja::Value>,
     args: minijinja::value::Kwargs,
 ) -> std::result::Result<minijinja::Value, minijinja::Error> {
-    let ensure_ascii: Option<bool> = args.get("ensure_ascii")?;
-    let rendered = minijinja::filters::tojson(value, indent, args)?;
-    if ensure_ascii != Some(true) {
-        return Ok(rendered);
-    }
-    let mut ascii = String::new();
-    for ch in rendered.as_str().unwrap_or("").chars() {
-        if ch.is_ascii() {
-            ascii.push(ch);
-        } else {
-            use std::fmt::Write;
-            for unit in ch.encode_utf16(&mut [0; 2]) {
-                write!(ascii, "\\u{unit:04x}").unwrap();
-            }
-        }
-    }
-    Ok(minijinja::Value::from_safe_string(ascii))
+    let indent = match indent {
+        Some(indent) => Some(indent),
+        None => args.get("indent")?,
+    };
+    let indent = match indent {
+        None => None,
+        Some(value) if value.is_none() || value.is_undefined() => None,
+        Some(value) => Some(match value.as_str() {
+            Some(text) => text.to_owned(),
+            None => " ".repeat(usize::try_from(i64::try_from(value)?.max(0)).unwrap_or(0)),
+        }),
+    };
+    let separators: Option<Vec<String>> = args.get("separators")?;
+    let (item, key) = match separators.as_deref() {
+        None => (
+            if indent.is_some() { "," } else { ", " }.to_owned(),
+            ": ".to_owned(),
+        ),
+        Some([item, key]) => (item.clone(), key.clone()),
+        Some(_) => return Err(json_error("separators must be an (item, key) pair".into())),
+    };
+    let style = JsonStyle {
+        indent,
+        item,
+        key,
+        sort_keys: args.get::<Option<bool>>("sort_keys")?.unwrap_or(false),
+        ensure_ascii: args.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false),
+    };
+    args.assert_all_used()?;
+    let mut out = String::new();
+    python_json(&mut out, value, &style, 0)?;
+    Ok(minijinja::Value::from_safe_string(out))
 }
 
 impl TextCodec {
@@ -171,6 +363,18 @@ impl TextCodec {
             images: crate::vision::ImageProcessor::load(path)?,
             delimiters,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_template(template: String) -> Self {
+        Self {
+            tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+            template,
+            eos_token: Value::Null,
+            bos_token: Value::Null,
+            images: None,
+            delimiters: None,
+        }
     }
 
     pub fn format(&self, prompt: &Prompt) -> Result<String> {
@@ -324,41 +528,63 @@ impl StopFilter {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn tojson_supports_ascii_keyword_without_changing_existing_templates() {
+    fn tojson_matches_transformers_json_dumps() {
         let mut env = Environment::new();
         env.add_filter("tojson", template_tojson);
-        let value = serde_json::json!({"text":"北京😀<&'", "items":[1,true]});
-        for template in [
-            "{{ v|tojson }}",
-            "{{ v|tojson(indent=2) }}",
-            "{{ v|tojson(2) }}",
-        ] {
-            let actual = env.render_str(template, context! { v => &value }).unwrap();
-            let expected = Environment::new()
-                .render_str(template, context! { v => &value })
-                .unwrap();
-            assert_eq!(actual, expected);
-        }
-        let unicode = env
-            .render_str(
-                "{{ v|tojson(ensure_ascii=False) }}",
-                context! { v => &value },
-            )
-            .unwrap();
-        assert!(unicode.contains("北京😀"));
-        let ascii = env
-            .render_str(
-                "{{ v|tojson(indent=2, ensure_ascii=True) }}",
-                context! { v => &value },
-            )
-            .unwrap();
-        assert!(ascii.is_ascii());
-        assert!(ascii.contains("\\ud83d\\ude00"));
-        assert_eq!(serde_json::from_str::<Value>(&ascii).unwrap(), value);
-        assert!(
-            env.render_str("{{ v|tojson(unknown=True) }}", context! { v => &value })
-                .is_err()
+        let render = |template: &str, value: &Value| {
+            env.render_str(template, context! { v => template_value(value).unwrap() })
+        };
+        // Expected strings are Python 3 json.dumps output for the same values.
+        let value =
+            serde_json::json!({"text":"北京😀<&'\u{7f}", "items":[1,true,null,1.5e-7,2.0,1e16]});
+        let items = "[\n    1,\n    true,\n    null,\n    1.5e-07,\n    2.0,\n    1e+16\n  ]";
+        assert_eq!(
+            render("{{ v|tojson }}", &value).unwrap(),
+            "{\"text\": \"北京😀<&'\u{7f}\", \"items\": [1, true, null, 1.5e-07, 2.0, 1e+16]}"
         );
+        for template in ["{{ v|tojson(indent=2) }}", "{{ v|tojson(2) }}"] {
+            assert_eq!(
+                render(template, &value).unwrap(),
+                format!("{{\n  \"text\": \"北京😀<&'\u{7f}\",\n  \"items\": {items}\n}}")
+            );
+        }
+        assert_eq!(
+            render("{{ v|tojson(indent=2, ensure_ascii=True) }}", &value).unwrap(),
+            format!(
+                "{{\n  \"text\": \"\\u5317\\u4eac\\ud83d\\ude00<&'\\u007f\",\n  \"items\": {items}\n}}"
+            )
+        );
+        assert_eq!(
+            render(
+                "{{ v|tojson(indent='\t', sort_keys=True) }}",
+                &serde_json::json!({"b":[], "a":{}})
+            )
+            .unwrap(),
+            "{\n\t\"a\": {},\n\t\"b\": []\n}"
+        );
+        assert_eq!(
+            render(
+                "{{ v|tojson(separators=(',', ':')) }}",
+                &serde_json::json!({"b":1, "a":[1,2]})
+            )
+            .unwrap(),
+            "{\"b\":1,\"a\":[1,2]}"
+        );
+        assert!(render("{{ v|tojson(unknown=True) }}", &value).is_err());
+        for (value, expected) in [
+            (1.25, "1.25"),
+            (1e-6, "1e-06"),
+            (-0.0, "-0.0"),
+            (1e20, "1e+20"),
+            (1e-4, "0.0001"),
+            (1e15, "1000000000000000.0"),
+            (123.0, "123.0"),
+            (-2.5e-300, "-2.5e-300"),
+            (2.9802322387695312e-8, "2.9802322387695312e-08"),
+            (1706789742950125.2, "1706789742950125.2"),
+        ] {
+            assert_eq!(python_float(value), expected);
+        }
     }
 
     #[test]
@@ -401,7 +627,7 @@ mod tests {
         };
         assert_eq!(
             codec.format(&prompt).unwrap(),
-            "124|True|True|True|[0,-3,1.25,123456789012345678901234567890]"
+            "124|True|True|True|[0, -3, 1.25, 123456789012345678901234567890]"
         );
         codec.template = "{{ messages[0].n|tojson }}".into();
         for (raw, expected) in [
@@ -413,7 +639,7 @@ mod tests {
                 "-170141183460469231731687303715884105728",
                 "-170141183460469231731687303715884105728",
             ),
-            ("0.000001", "1e-6"),
+            ("0.000001", "1e-06"),
             ("-0.0", "-0.0"),
             ("1e+20", "1e+20"),
         ] {
@@ -465,11 +691,11 @@ mod tests {
             "{rendered}"
         );
         for literal in [
-            r#""minimum":0"#,
-            r#""maximum":1000"#,
-            r#""multipleOf":2"#,
-            r#""default":123"#,
-            r#""enum":[123,456]"#,
+            r#""minimum": 0"#,
+            r#""maximum": 1000"#,
+            r#""multipleOf": 2"#,
+            r#""default": 123"#,
+            r#""enum": [123, 456]"#,
         ] {
             assert!(rendered.contains(literal), "{rendered}");
         }

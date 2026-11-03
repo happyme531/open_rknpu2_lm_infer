@@ -5,10 +5,20 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 async fn request(parser: ToolCallParser, stream: bool, choice: &str, output: &str) -> String {
+    request_with_schema(parser, stream, choice, output, json!({"type":"integer"})).await
+}
+
+async fn request_with_schema(
+    parser: ToolCallParser,
+    stream: bool,
+    choice: &str,
+    output: &str,
+    schema: Value,
+) -> String {
     let preserve = parser == ToolCallParser::Minicpm5 && choice != "none";
     let body = json!({"model":"mock", "stream":stream, "tool_choice":choice,
         "messages":[{"role":"user","content":format!("{}\n{output}", if preserve { "preserve" } else { "default" })}],
-        "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"additionalProperties":false}}}]});
+        "tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":schema},"required":["x"],"additionalProperties":false}}}]});
     let mut body = body;
     if stream {
         body["stream_options"] = json!({"include_usage":true});
@@ -212,5 +222,100 @@ async fn xml_sse_preserves_values_fallback_reasoning_usage_and_finish() {
         assert_eq!(chunks.last().unwrap()["choices"], json!([]));
         assert!(chunks.last().unwrap()["usage"].is_object());
         assert_eq!(sse.matches("data: [DONE]").count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn qwen3_coder_schema_reaches_batch_and_streaming_parsers() {
+    let output = "before<tool_call>\n<function=f>\n<parameter=x>\n7\n</parameter>\n</function>\n</tool_call>after";
+    let batch: Value =
+        serde_json::from_str(&request(ToolCallParser::ToolCallJson, false, "auto", output).await)
+            .unwrap();
+    let choice = &batch["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert_eq!(choice["message"]["content"], "beforeafter");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            choice["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap(),
+        json!({"x":7})
+    );
+    let sse = request(ToolCallParser::ToolCallJson, true, "auto", output).await;
+    let chunks: Vec<Value> = sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| *line != "[DONE]")
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let calls: Vec<_> = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap(),
+        json!({"x":7})
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c["choices"][0]["finish_reason"] == "tool_calls")
+    );
+    assert!(sse.contains("data: [DONE]"));
+    let disabled: Value =
+        serde_json::from_str(&request(ToolCallParser::ToolCallJson, false, "none", output).await)
+            .unwrap();
+    assert_eq!(disabled["choices"][0]["message"]["content"], output);
+    assert!(
+        disabled["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn qwen3_coder_nullable_strings_reach_batch_and_streaming_parsers() {
+    let output =
+        "<tool_call>\n<function=f>\n<parameter=x>\n123\n</parameter>\n</function>\n</tool_call>";
+    for schema in [
+        json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+        json!({"oneOf":[{"type":"string"},{"type":"null"}]}),
+    ] {
+        for stream in [false, true] {
+            let response = request_with_schema(
+                ToolCallParser::ToolCallJson,
+                stream,
+                "auto",
+                output,
+                schema.clone(),
+            )
+            .await;
+            let function = if stream {
+                response
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find_map(|chunk| {
+                        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+                            .as_object()
+                            .cloned()
+                    })
+                    .unwrap()
+            } else {
+                serde_json::from_str::<Value>(&response).unwrap()["choices"][0]["message"]
+                    ["tool_calls"][0]["function"]
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            };
+            let arguments: Value =
+                serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments, json!({"x":"123"}), "stream: {stream}");
+        }
     }
 }
