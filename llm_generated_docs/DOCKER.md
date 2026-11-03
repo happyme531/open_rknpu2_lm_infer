@@ -2,7 +2,7 @@
 
 Use Docker Engine and the Compose plugin on an ARM64 RK3588 Linux host with the vendor `rknpu2` kernel driver, version 0.9.6 or newer. The container uses the host kernel and NPU; it cannot provide the driver or run RK3588 inference on an x86 machine.
 
-The [Dockerfile](../Dockerfile) installs the published ARM64 release, defaulting to v0.10.0, with Debian 12, `libstdc++6` and `libgomp1`. It includes the release's documentation and license notices. It does not compile the local checkout. No proprietary `librknnrt.so` is required.
+The [Dockerfile](../Dockerfile) installs the published ARM64 release, defaulting to v0.10.0, in a `scratch` image containing the executable, its dynamic loader and shared libraries, documentation, and license notices. Debian 12 is used only in intermediate build stages to obtain the runtime libraries. The final image has no shell or package manager. It does not compile the local checkout. No proprietary `librknnrt.so` is required.
 
 ## Start the API server
 
