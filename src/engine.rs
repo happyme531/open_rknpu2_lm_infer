@@ -95,7 +95,12 @@ impl Engine {
                 let loaded = (|| -> Result<_> {
                     let chunk = options.chunk;
                     let mut options = options;
-                    options.tune_search = false;
+                    // OPEN_RKNPU2_TUNE_SEARCH=1 keeps the autotune search
+                    // enabled at runtime, so shapes the tune subcommand never
+                    // loads (for example the MTP draft's floating projections)
+                    // can populate the persistent cache during a normal run.
+                    options.tune_search = std::env::var_os("OPEN_RKNPU2_TUNE_SEARCH")
+                        .is_some_and(|value| value != "0");
                     let mut model = model::load(options)?;
                     model.prepare(chunk)?;
                     Ok(model)
