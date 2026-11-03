@@ -104,12 +104,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tokio-stream = "0.1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 clap = { version = "4", features = ["derive", "env"] }
 ratatui = "0.29"
 crossterm = "0.28"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-minijinja = { version = "2", features = ["builtins", "json", "loop_controls"] }
+minijinja = { version = "2", features = ["builtins", "json", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 memmap2 = "0.9"
 safetensors = "0.6"

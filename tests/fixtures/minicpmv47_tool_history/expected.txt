@@ -1,0 +1,127 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "read", "description": "Read a file's contents. Use offset & limit for files > 2000 lines; don't re-read <unchanged> files.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to read"}, "offset": {"type": "number", "description": "Line number to start reading from (1-indexed)"}, "limit": {"type": "number", "description": "Maximum number of lines to read"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "bash", "description": "Run a bash command in the working directory; output is truncated.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Bash command to execute"}, "timeout": {"type": "number", "description": "Timeout in seconds (optional)"}}, "required": ["command"]}}}
+{"type": "function", "function": {"name": "edit", "description": "Edit a file by replacing exact text. Each oldText must match uniquely.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to edit"}, "edits": {"type": "array", "description": "Replacements, applied in order", "items": {"type": "object", "properties": {"oldText": {"type": "string", "description": "Exact text to find"}, "newText": {"type": "string", "description": "Replacement text"}}, "required": ["oldText", "newText"]}}}, "required": ["path", "edits"]}}}
+{"type": "function", "function": {"name": "write", "description": "Write content to a file, creating parent directories.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to write"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You work alone. Use the tools.<|im_end|>
+<|im_start|>user
+Begin the task.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+I'll read the crate first.
+
+<tool_call>
+<function=read>
+<parameter=path>
+/work/src/lib.rs
+</parameter>
+<parameter=offset>
+9
+</parameter>
+<parameter=limit>
+143
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+//! Module comment.
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=write>
+<parameter=path>
+/work/src/lib.rs
+</parameter>
+<parameter=content>
+use std::collections::HashMap;
+
+fn pick<'a>(x: &'a str) -> Option<&'a str> {
+    if x.len() > 0 && x != "<>" { Some(x) } else { None }
+}
+// naïve 北京 \ path
+
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+Successfully wrote 6 lines.
+Automatic build: passes.
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Fix the import, then check the build.
+
+<tool_call>
+<function=edit>
+<parameter=path>
+/work/src/lib.rs
+</parameter>
+<parameter=edits>
+[{"oldText": "use std::collections::HashMap;\n", "newText": "use std::collections::{HashMap, HashSet};\n"}, {"oldText": "x.len() > 0 && x != \"<>\"", "newText": "!x.is_empty() && x != \"<>\"\t"}]
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=bash>
+<parameter=command>
+cargo check -q 2>&1 | head -30
+</parameter>
+<parameter=timeout>
+600
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+Applied 2 edits.
+</tool_response>
+<tool_response>
+warning: unused import: `HashSet`
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
