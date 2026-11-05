@@ -119,7 +119,7 @@ Qwen3/Qwen3.5 PPL 于 2026-10-25 重测，使用 WikiText-2 raw test 的前 32 �
 | qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5_moe (仅文本部分) / qwen3_5_moe_text |  |
-| minicpmv4_7 (仅文本部分) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](llm_generated_docs/MINICPMV47_SUPPORT.md)（仅文本） |
+| minicpmv4_7 (仅文本部分) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT)（仅文本） |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 

@@ -119,7 +119,7 @@ Qwen3/Qwen3.5 PPL was remeasured on 2026-10-25 using the first 32 independent 51
 | qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
 | qwen3_5_moe (text component only) / qwen3_5_moe_text |  |
-| minicpmv4_7 (text component only) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](llm_generated_docs/MINICPMV47_SUPPORT.md) (text only) |
+| minicpmv4_7 (text component only) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT) (text only) |
 | llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
 | granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
 
