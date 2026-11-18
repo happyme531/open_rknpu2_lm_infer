@@ -7,6 +7,7 @@ use crate::{
     ops::{activation, norm},
 };
 use anyhow::Result;
+use rayon::prelude::*;
 use std::time::Instant;
 
 impl Mixer {
@@ -151,7 +152,17 @@ impl Mixer {
                     timings.record_attention_verification(rows);
                 }
                 timings.stage(Phase::Cpu, "target attention gate", || {
-                    activation::sigmoid_gate(&mut w.attended[..rows * q], &w.gate[..rows * q])
+                    let output = &mut w.attended[..rows * q];
+                    let gate = &w.gate[..rows * q];
+                    if rows <= 1 || cpu.pool.current_num_threads() == 1 {
+                        return activation::sigmoid_gate(output, gate);
+                    }
+                    cpu.pool.install(|| {
+                        output
+                            .par_chunks_mut(q)
+                            .zip(gate.par_chunks(q))
+                            .try_for_each(|(out, g)| activation::sigmoid_gate(out, g))
+                    })
                 })?;
                 q
             }
