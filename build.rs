@@ -1,4 +1,31 @@
-use std::{env, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+fn openmp_libraries(build: &Path) -> Vec<PathBuf> {
+    let cache_path = build.join("CMakeCache.txt");
+    let cache = fs::read_to_string(&cache_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", cache_path.display()));
+    let value = |key: &str| {
+        cache
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(entry, value)| {
+                let (name, _) = entry.split_once(':')?;
+                (name == key).then_some(value)
+            })
+            .unwrap_or_else(|| panic!("missing {key} in {}", cache_path.display()))
+    };
+    value("OpenMP_CXX_LIB_NAMES")
+        .split(';')
+        .map(|name| {
+            let path = value(&format!("OpenMP_{name}_LIBRARY"));
+            fs::canonicalize(path)
+                .unwrap_or_else(|error| panic!("resolve OpenMP library {path}: {error}"))
+        })
+        .collect()
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RKNPU_PROJECT_NAME");
@@ -17,6 +44,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RK_NPU_MATMUL_ROOT");
     println!("cargo:rerun-if-env-changed=RK_NPU_ENABLE_TRACE");
     println!("cargo:rerun-if-env-changed=RK_NPU_PERFETTO_ROOT");
+    for variable in ["CC", "CXX", "CFLAGS", "CXXFLAGS"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     println!("cargo:rustc-check-cfg=cfg(rknpu_trace)");
     let trace = env::var("RK_NPU_ENABLE_TRACE").is_ok_and(|v| v == "1" || v == "ON");
     let root = env::var_os("RK_NPU_MATMUL_ROOT")
@@ -75,7 +105,27 @@ fn main() {
             output.join("build").display()
         );
     }
-    for library in ["stdc++", "gomp", "pthread", "m", "dl"] {
+    // The static archives do not propagate their CMake link dependencies to
+    // Rust. Use the same OpenMP libraries for their code and Rust's omp_* calls.
+    let openmp = openmp_libraries(&output.join("build"));
+    assert_eq!(
+        openmp,
+        openmp_libraries(&cpu_output.join("build")),
+        "operator library and CPU kernels selected different OpenMP libraries"
+    );
+    for library in openmp {
+        let name = library.file_name().unwrap().to_str().unwrap();
+        println!(
+            "cargo:rustc-link-search=native={}",
+            library.parent().unwrap().display()
+        );
+        if name.ends_with(".a") {
+            println!("cargo:rustc-link-lib=static:-bundle,+verbatim={name}");
+        } else {
+            println!("cargo:rustc-link-lib=dylib:+verbatim={name}");
+        }
+    }
+    for library in ["stdc++", "pthread", "m", "dl"] {
         println!("cargo:rustc-link-lib={library}");
     }
     let include = root.join("include");
