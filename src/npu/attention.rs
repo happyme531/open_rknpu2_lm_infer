@@ -16,7 +16,7 @@ pub struct FullAttention {
     pub(super) owner: Backend,
 }
 
-pub(super) fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
+pub(super) fn pack_half(input: &[f32], output: &mut [u16]) {
     let mut first = 0;
     #[cfg(target_arch = "aarch64")]
     while first + 8 <= input.len() {
@@ -37,13 +37,12 @@ pub(super) fn pack_half(input: &[f32], output: &mut [u16]) -> Result<()> {
     for (&value, encoded) in input[first..].iter().zip(output[first..].iter_mut()) {
         *encoded = f16::from_f32(value).to_bits();
     }
-    ensure!(
+    debug_assert!(
         output[..input.len()]
             .iter()
             .all(|&value| value & 0x7c00 != 0x7c00),
-        "nonfinite/overflowed FP16 GQA input"
+        "nonfinite/overflowed FP16 attention input"
     );
-    Ok(())
 }
 impl FullAttention {
     /// Stateless image attention with FP16 storage at both boundaries.
@@ -160,8 +159,8 @@ impl FullAttention {
             for r in 0..rows {
                 let s = (r * heads + h) * d;
                 let t = (h * rows + r) * d;
-                pack_half(&k[s..s + d], &mut w.k[t..t + d])?;
-                pack_half(&v[s..s + d], &mut w.v[t..t + d])?;
+                pack_half(&k[s..s + d], &mut w.k[t..t + d]);
+                pack_half(&v[s..s + d], &mut w.v[t..t + d]);
             }
         }
         check(
@@ -183,7 +182,7 @@ impl FullAttention {
                 for r in 0..m {
                     let s = ((offset + r) * heads + h) * d;
                     let t = (h * m + r) * d;
-                    pack_half(&q[s..s + d], &mut w.q[t..t + d])?;
+                    pack_half(&q[s..s + d], &mut w.q[t..t + d]);
                 }
             }
             check(
@@ -306,8 +305,8 @@ impl Attention {
             for r in 0..rows {
                 let source = (r * kh + h) * d;
                 let target = (h * rows + r) * d;
-                pack_half(&k[source..source + d], &mut work.k[target..target + d])?;
-                pack_half(&v[source..source + d], &mut work.v[target..target + d])?;
+                pack_half(&k[source..source + d], &mut work.k[target..target + d]);
+                pack_half(&v[source..source + d], &mut work.v[target..target + d]);
             }
         }
         check(
@@ -365,7 +364,7 @@ impl Attention {
                 for r in 0..m {
                     let source = ((offset + r) * qh + h) * d;
                     let target = (h * m + r) * d;
-                    pack_half(&q[source..source + d], &mut work.q[target..target + d])?;
+                    pack_half(&q[source..source + d], &mut work.q[target..target + d]);
                 }
             }
             check(

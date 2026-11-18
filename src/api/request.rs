@@ -274,6 +274,7 @@ pub(super) fn parse_request(
     chat: bool,
     model: &str,
     context: usize,
+    defaults: &SamplingParams,
 ) -> Result<ParsedRequest, ApiError> {
     if !v.is_object() {
         return Err(ApiError::invalid("expected a JSON object", "body"));
@@ -347,11 +348,20 @@ pub(super) fn parse_request(
     })?;
     unsupported(&v, "ignore_eos", |x| x.as_bool() == Some(false))?;
     unsupported(&v, "min_tokens", |x| x.as_u64() == Some(0))?;
-    let defaults = SamplingParams::default();
+    let top_k = if v["top_k"].as_i64() == Some(-1) {
+        0
+    } else {
+        integer(&v, "top_k", defaults.top_k, 0)?
+    };
+    let repeat_key = if v.get("repeat_penalty").is_some_and(|x| !x.is_null()) {
+        "repeat_penalty"
+    } else {
+        "repetition_penalty"
+    };
     let sampling = SamplingParams {
         temperature: number(&v, "temperature", defaults.temperature, 0.0, 2.0)?,
         top_p: number(&v, "top_p", defaults.top_p, 0.0, 1.0)?,
-        top_k: integer(&v, "top_k", defaults.top_k, 0)?,
+        top_k,
         min_p: number(&v, "min_p", defaults.min_p, 0.0, 1.0)?,
         seed: match v.get("seed") {
             None | Some(Value::Null) => None,
@@ -363,7 +373,7 @@ pub(super) fn parse_request(
         },
         repeat_penalty: number(
             &v,
-            "repeat_penalty",
+            repeat_key,
             defaults.repeat_penalty,
             f32::MIN_POSITIVE,
             f32::MAX,

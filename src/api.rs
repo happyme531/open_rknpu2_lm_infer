@@ -205,6 +205,7 @@ async fn respond(
         chat,
         &state.engine.info().id,
         state.engine.info().context,
+        state.engine.sampling_defaults(),
     )?;
     let preopened_thinking = chat
         && state
@@ -638,6 +639,14 @@ fn stream_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn parse_request(
+        v: Value,
+        chat: bool,
+        model: &str,
+        context: usize,
+    ) -> Result<ParsedRequest, ApiError> {
+        super::parse_request(v, chat, model, context, &SamplingParams::default())
+    }
     fn request() -> Value {
         json!({"model":"qwen","messages":[{"role":"user","content":"hi"}]})
     }
@@ -648,16 +657,65 @@ mod tests {
             (false, json!({"model":"qwen","prompt":"hi"})),
         ] {
             let parsed = parse_request(input.clone(), chat, "qwen", 4096).unwrap();
-            assert_eq!(parsed.request.sampling.temperature, 1.);
+            let sampling = parsed.request.sampling;
+            assert_eq!(sampling.temperature, 1.);
+            assert_eq!(sampling.top_k, 0);
+            assert_eq!(sampling.top_p, 1.);
+            assert_eq!(sampling.min_p, 0.);
             assert_eq!(parsed.request.max_tokens, 2048);
             for key in ["max_tokens", "max_completion_tokens"] {
                 let mut explicit = input.clone();
                 explicit[key] = json!(17);
                 explicit["temperature"] = json!(0);
+                explicit["top_k"] = json!(0);
+                explicit["top_p"] = json!(1);
+                explicit["min_p"] = json!(0);
                 let parsed = parse_request(explicit, chat, "qwen", 4096).unwrap();
-                assert_eq!(parsed.request.sampling.temperature, 0.);
+                let sampling = parsed.request.sampling;
+                assert_eq!(sampling.temperature, 0.);
+                assert_eq!(sampling.top_k, 0);
+                assert_eq!(sampling.top_p, 1.);
+                assert_eq!(sampling.min_p, 0.);
                 assert_eq!(parsed.request.max_tokens, 17);
             }
+        }
+    }
+    #[test]
+    fn model_sampling_defaults_are_overridden_field_by_field() {
+        let defaults = SamplingParams {
+            temperature: 0.6,
+            top_k: 20,
+            top_p: 0.95,
+            min_p: 0.05,
+            repeat_penalty: 1.1,
+            ..SamplingParams::default()
+        };
+        for (chat, mut input) in [
+            (true, request()),
+            (false, json!({"model":"qwen","prompt":"hi"})),
+        ] {
+            let sampling = super::parse_request(input.clone(), chat, "qwen", 4096, &defaults)
+                .unwrap()
+                .request
+                .sampling;
+            assert_eq!(sampling.temperature, 0.6);
+            assert_eq!(sampling.top_k, 20);
+            assert_eq!(sampling.top_p, 0.95);
+            assert_eq!(sampling.min_p, 0.05);
+            assert_eq!(sampling.repeat_penalty, 1.1);
+
+            input["temperature"] = json!(0);
+            input["top_k"] = json!(-1);
+            input["top_p"] = Value::Null;
+            input["repetition_penalty"] = json!(1.2);
+            let sampling = super::parse_request(input, chat, "qwen", 4096, &defaults)
+                .unwrap()
+                .request
+                .sampling;
+            assert_eq!(sampling.temperature, 0.);
+            assert_eq!(sampling.top_k, 0);
+            assert_eq!(sampling.top_p, 0.95);
+            assert_eq!(sampling.repeat_penalty, 1.2);
         }
     }
     #[test]

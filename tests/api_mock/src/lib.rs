@@ -18,6 +18,11 @@ mod engine {
         pub context: usize,
     }
     impl Engine {
+        pub fn sampling_defaults(&self) -> &crate::sampling::SamplingParams {
+            static DEFAULTS: std::sync::LazyLock<crate::sampling::SamplingParams> =
+                std::sync::LazyLock::new(crate::sampling::SamplingParams::default);
+            &DEFAULTS
+        }
         pub fn info(&self) -> Info {
             Info {
                 id: "mock".into(),

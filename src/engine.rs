@@ -1,7 +1,7 @@
 use crate::{
     model::{self, LanguageModel, ModelInfo, ModelOptions},
     progress::{DecodeProgress, GenerationProgress, Phase, Reporter},
-    sampling::Sampler,
+    sampling::{Sampler, SamplingParams},
     text::{OutputDecoder, StopFilter, TextCodec},
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -35,6 +35,7 @@ struct Job {
 struct EngineInner {
     sender: Option<mpsc::Sender<Job>>,
     info: ModelInfo,
+    sampling_defaults: SamplingParams,
     codec: Arc<TextCodec>,
     stats: Arc<RwLock<Value>>,
     active: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -71,6 +72,7 @@ impl Engine {
 
     pub fn start_with_cache_prompt(options: ModelOptions, cache_prompt: bool) -> Result<Self> {
         model::ensure_enabled(&options.path)?;
+        let sampling_defaults = model::metadata::sampling_defaults(&options.path)?;
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);
@@ -172,6 +174,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 sender: Some(sender),
                 info,
+                sampling_defaults,
                 codec,
                 stats,
                 active,
@@ -185,6 +188,9 @@ impl Engine {
 
     pub fn info(&self) -> &ModelInfo {
         &self.inner.info
+    }
+    pub(crate) fn sampling_defaults(&self) -> &SamplingParams {
+        &self.inner.sampling_defaults
     }
     pub fn stats(&self) -> Value {
         self.inner
@@ -384,15 +390,16 @@ fn run_generation(
             confidence_stops += usize::from(round.confidence_stopped);
             &round.output
         } else {
-            if let Some(anchor) = pending {
+            let logits = if let Some(anchor) = pending {
                 let logits = model.forward_cancellable(&[anchor], &job.cancel)?;
-                cache.logits.clear();
-                cache.logits.extend_from_slice(logits);
                 cache.append_token(anchor);
                 decode_calls += 1;
                 consumed_tokens += 1;
-            }
-            sampled = [sampler.sample(&cache.logits)?];
+                logits
+            } else {
+                &cache.logits
+            };
+            sampled = [sampler.sample(logits)?];
             &sampled
         };
         let mut emitted = 0;

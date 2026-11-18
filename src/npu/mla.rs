@@ -143,9 +143,9 @@ impl Mla {
         io.query.resize(query.len(), 0);
         io.latent.resize(latent.len(), 0);
         io.rotary.resize(rotary.len(), 0);
-        super::attention::pack_half(query, &mut io.query)?;
-        super::attention::pack_half(latent, &mut io.latent)?;
-        super::attention::pack_half(rotary, &mut io.rotary)?;
+        super::attention::pack_half(query, &mut io.query);
+        super::attention::pack_half(latent, &mut io.latent);
+        super::attention::pack_half(rotary, &mut io.rotary);
         check(
             unsafe {
                 rk_npu_mla_f16_cache_append(
