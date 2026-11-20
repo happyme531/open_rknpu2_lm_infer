@@ -172,7 +172,7 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
                 }
                 let work = backend.work.lock().unwrap();
                 assert_eq!(work.len(), 1);
-                assert!(work.get(&(k, n)).unwrap().gelu.is_some());
+                assert!(work.get(&(k, n, 0)).unwrap().gelu.is_some());
             }
         }
         assert_eq!(device.stats()["tune_calls"], 0);

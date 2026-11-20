@@ -367,6 +367,7 @@ impl Dense {
         let batches = (0..options.prefill_ubatches)
             .map(|_| Batch::new(chunk, geometry, scatter_width))
             .collect();
+        let workspaces = super::workspace::Workspaces::for_generation(!options.tune_search)?;
         let mut model = Self {
             trace,
             options,
@@ -389,7 +390,7 @@ impl Dense {
             reserved_tokens,
             logits_scaling,
             dual_groups: 0,
-            workspaces: Default::default(),
+            workspaces,
             timings: Timings {
                 load: elapsed(start),
                 ..Default::default()
@@ -404,6 +405,27 @@ impl Dense {
         Ok(model)
     }
 
+    fn workspace_targets(
+        &mut self,
+    ) -> (
+        &mut super::workspace::Workspaces,
+        super::workspace::Targets<'_>,
+    ) {
+        (
+            &mut self.workspaces,
+            super::workspace::Targets {
+                primary: &self.backends,
+                secondary: self.secondary.as_ref(),
+                head: self.head.backend(),
+                recurrent: [None, None],
+                routers: None,
+                floating: &[],
+                chunk: self.options.chunk,
+                decode_rows: &[1],
+            },
+        )
+    }
+
     fn trace(&self, layer: i32, stage: &str, values: &[f32]) -> Result<()> {
         self.trace.save(self.position, layer, stage, values)
     }
@@ -413,9 +435,6 @@ impl Dense {
     }
 
     fn group(&mut self, tokens: &[&[u32]], cancelled: Option<&AtomicBool>) -> Result<()> {
-        if tokens.iter().any(|batch| batch.len() > 1) {
-            self.workspaces.reset();
-        }
         let start = Instant::now();
         let mut position = self.position;
         for (batch, tokens) in self.batches.iter_mut().zip(tokens) {
@@ -517,9 +536,108 @@ impl Dense {
         Ok(last_rows)
     }
     fn forward_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<&[f32]> {
-        let last_rows = self.advance_impl(tokens, cancelled, None)?;
-        self.output_head(last_rows)?;
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
+        self.run_input(tokens, cancelled, None, true)?;
         Ok(&self.logits)
+    }
+
+    fn run_input(
+        &mut self,
+        tokens: &[u32],
+        cancelled: Option<&AtomicBool>,
+        progress: Option<&mut dyn FnMut(crate::progress::ModelProgress)>,
+        logits: bool,
+    ) -> Result<()> {
+        let result = self
+            .advance_impl(tokens, cancelled, progress)
+            .and_then(|rows| {
+                if logits {
+                    self.output_head(rows)?;
+                } else {
+                    self.workspaces.finish_head_free(self.position);
+                }
+                Ok(())
+            });
+        if result.is_err() {
+            let (workspaces, targets) = self.workspace_targets();
+            workspaces.abort(targets)?;
+        }
+        result
+    }
+
+    fn prepare_input(
+        &mut self,
+        prompt_tokens: usize,
+        id: Option<super::prefill::PlanId>,
+    ) -> Result<()> {
+        ensure!(
+            prompt_tokens > 0 && prompt_tokens <= self.options.context,
+            "prompt exceeds context capacity"
+        );
+        let start = Instant::now();
+        let previous_tunes: usize = self
+            .backends
+            .iter()
+            .chain(self.head.backend())
+            .map(Backend::tune_operations)
+            .sum();
+        let rows = super::workspace::physical_rows([prompt_tokens], self.options.chunk);
+        let head_rows = super::workspace::head_rows(&rows, &[1], self.options.tune_search);
+        let plan = super::workspace::PrefillPlan {
+            span: self.position..self.position + prompt_tokens,
+            id,
+            rows: &rows,
+            head_rows: &head_rows,
+            paired: super::prefill::raw_uses_secondary(
+                prompt_tokens,
+                self.options.chunk,
+                self.options.prefill_ubatches,
+            ),
+        };
+        let loader = self.loader.clone();
+        let (workspaces, targets) = self.workspace_targets();
+        workspaces.prepare(targets, plan, |targets, _| {
+            if targets
+                .primary
+                .iter()
+                .chain(targets.head)
+                .map(Backend::tune_operations)
+                .sum::<usize>()
+                != previous_tunes
+            {
+                loader.store.release_pages()?;
+            }
+            Ok(())
+        })?;
+        self.timings.prepare += elapsed(start);
+        Ok(())
+    }
+
+    fn run_prepared(
+        &mut self,
+        prepared: crate::model::PreparedPrefill<'_>,
+        cancelled: &AtomicBool,
+        progress: Option<&mut dyn FnMut(crate::progress::ModelProgress)>,
+    ) -> Result<()> {
+        ensure!(
+            prepared.input.images.is_empty(),
+            "this model does not support images"
+        );
+        ensure!(
+            prepared.start == self.position && prepared.start < prepared.input.tokens.len(),
+            "prepared input position mismatch"
+        );
+        self.workspaces.begin_prepared(
+            prepared.start..prepared.input.tokens.len(),
+            prepared.plan_id,
+        )?;
+        self.run_input(
+            &prepared.input.tokens[prepared.start..],
+            Some(cancelled),
+            progress,
+            true,
+        )
     }
 }
 
@@ -566,58 +684,35 @@ impl LanguageModel for Dense {
         Ok(true)
     }
     fn prepare(&mut self, prompt_tokens: usize) -> Result<()> {
+        self.prepare_input(prompt_tokens, None)
+    }
+    fn prepare_prepared<'a>(
+        &mut self,
+        input: &'a crate::input::PreparedInput,
+        start: usize,
+    ) -> Result<crate::model::PreparedPrefill<'a>> {
         ensure!(
-            prompt_tokens > 0 && prompt_tokens <= self.options.context,
-            "prompt exceeds context capacity"
+            input.images.is_empty(),
+            "this model does not support images"
         );
-        let start = Instant::now();
-        let previous_tunes: usize = self
-            .backends
-            .iter()
-            .chain(self.head.backend())
-            .map(Backend::tune_operations)
-            .sum();
-        let mut rows = super::workspace::physical_rows([prompt_tokens], self.options.chunk);
-        let head_rows = super::workspace::head_rows(&rows, &[1], self.options.tune_search);
-        self.workspaces.prepare(&mut rows, &[1]);
-        for backend in &self.backends {
-            backend.retain_workspaces(&rows)?;
-            for &rows in &rows {
-                crate::progress::prefill_shape(rows != 1 && rows != self.options.chunk, || {
-                    backend.prepare(rows)
-                })?;
-            }
-        }
-        if let Some(secondary) = &self.secondary {
-            if prompt_tokens >= 2 * self.options.chunk {
-                secondary.prepare(self.options.chunk)?;
-            } else {
-                for backend in secondary.backends() {
-                    backend.retain_workspaces(&[])?;
-                }
-            }
-        }
-        if let Some(head) = self.head.backend() {
-            head.retain_workspaces(&head_rows)?;
-            for rows in head_rows {
-                head.prepare(rows)?;
-            }
-        }
-        self.timings.prepare += elapsed(start);
-        if self
-            .backends
-            .iter()
-            .chain(self.head.backend())
-            .map(Backend::tune_operations)
-            .sum::<usize>()
-            != previous_tunes
-        {
-            self.loader.store.release_pages()?;
-        }
-        Ok(())
+        ensure!(
+            start == self.position && start < input.tokens.len(),
+            "invalid prepared prompt"
+        );
+        let plan_id = Some(super::prefill::PlanId::new());
+        self.prepare_input(input.tokens.len() - start, plan_id)?;
+        Ok(crate::model::PreparedPrefill {
+            input,
+            start,
+            steps: Vec::new(),
+            checkpoint: None,
+            plan_id,
+        })
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
-        self.advance_impl(tokens, None, None).map(|_| ())
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
+        self.run_input(tokens, None, None, false)
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         self.forward_impl(tokens, None)
@@ -625,22 +720,25 @@ impl LanguageModel for Dense {
     fn forward_cancellable(&mut self, tokens: &[u32], cancelled: &AtomicBool) -> Result<&[f32]> {
         self.forward_impl(tokens, Some(cancelled))
     }
+    fn forward_prepared(
+        &mut self,
+        prepared: crate::model::PreparedPrefill<'_>,
+        cancelled: &AtomicBool,
+    ) -> Result<&[f32]> {
+        self.run_prepared(prepared, cancelled, None)?;
+        Ok(&self.logits)
+    }
     fn forward_prepared_with_progress(
         &mut self,
         prepared: crate::model::PreparedPrefill<'_>,
         cancelled: &AtomicBool,
         progress: &mut dyn FnMut(crate::progress::ModelProgress),
     ) -> Result<&[f32]> {
-        ensure!(
-            prepared.input.images.is_empty(),
-            "this model does not support images"
-        );
-        let tokens = &prepared.input.tokens[prepared.start..];
-        let rows = self.advance_impl(tokens, Some(cancelled), Some(&mut *progress))?;
-        self.output_head(rows)?;
+        let total = prepared.input.tokens.len().saturating_sub(prepared.start);
+        self.run_prepared(prepared, cancelled, Some(&mut *progress))?;
         progress(crate::progress::ModelProgress::Prefill {
-            completed: tokens.len(),
-            total: tokens.len(),
+            completed: total,
+            total,
         });
         Ok(&self.logits)
     }
@@ -662,6 +760,8 @@ impl LanguageModel for Dense {
                 .all(|&t| (t as usize) < self.info.vocab_size),
             "scoring token outside model vocabulary"
         );
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
         self.reserve(self.position + tokens.len())?;
         let mut result = Vec::with_capacity(tokens.len());
         for (tokens, targets) in tokens
@@ -740,6 +840,8 @@ impl LanguageModel for Dense {
                 .map(|b| format!("open-rknpu2-w{b}a8"))
                 .unwrap_or_else(|| "cpu-floating".into())
         );
+        result["prefill_workspace_cached_domains"] =
+            json!(super::workspace::cached_domains(&self.backends));
         result["prefill_ubatches"] = json!(self.options.prefill_ubatches);
         result["dual_prefill_groups"] = json!(self.dual_groups);
         result["stage_timing_scope"] =

@@ -164,6 +164,7 @@ pub trait LanguageModel {
             start,
             steps: Vec::new(),
             checkpoint: None,
+            plan_id: None,
         })
     }
     /// Consume prompt/history tokens without evaluating final output norm or

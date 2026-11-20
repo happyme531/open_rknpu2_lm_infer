@@ -69,9 +69,6 @@ impl Qwen35 {
         let start = Instant::now();
         let (tokens, prepared) = inputs[0];
         let rows = tokens.len();
-        if !verify && rows > 1 {
-            self.workspaces.reset();
-        }
         let position = self.position;
         let rope = self.phases.measure(Phase::Cpu, || {
             embed(

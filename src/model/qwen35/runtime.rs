@@ -9,8 +9,10 @@ use crate::ops::norm;
 use crate::{
     model::{
         LanguageModel, ModelInfo, ModelOptions, PreparedPrefill,
-        checkpoint::{QuantLoader, Tensor},
+        checkpoint::{QuantLoader, Tensor, TensorStore},
         cpu::Cpu,
+        dflash::DFlash,
+        workspace::{PrefillPlan, Targets, Workspaces},
     },
     npu::Backend,
 };
@@ -54,64 +56,43 @@ pub struct Qwen35 {
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
     pub(super) secondary_features: Option<super::features::Features>,
-    pub(super) dflash: Option<crate::model::dflash::DFlash>,
-    pub(super) workspaces: crate::model::workspace::Workspaces,
+    pub(super) dflash: Option<DFlash>,
+    pub(super) workspaces: Workspaces,
     pub(super) prefix_cache: super::cache::PrefixCache,
 }
 
 impl Qwen35 {
-    fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
+    fn prepare_rows(
+        &mut self,
+        span: std::ops::Range<usize>,
+        id: Option<crate::model::prefill::PlanId>,
+        rows: impl IntoIterator<Item = usize>,
+        paired: bool,
+    ) -> Result<()> {
         let prefill_rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
-        let mut rows = prefill_rows.clone();
         let decode_rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
         let head_rows = crate::model::workspace::head_rows(
             &prefill_rows,
             &decode_rows,
             self.options.tune_search,
         );
-        self.workspaces.prepare(&mut rows, &decode_rows);
-        for backend in &self.backends {
-            backend.retain_workspaces(&rows)?;
-            for rows in &rows {
-                crate::progress::prefill_shape(*rows > 1 && *rows != self.options.chunk, || {
-                    backend.prepare(*rows)
-                })?;
+        let plan = PrefillPlan {
+            span,
+            id,
+            rows: &prefill_rows,
+            head_rows: &head_rows,
+            paired,
+        };
+        let draft_window = self.options.speculation.window();
+        let (workspaces, targets, draft, store) = self.workspace_targets(&decode_rows);
+        workspaces.prepare(targets, plan, |_, rows| {
+            if let Some(draft) = draft {
+                draft.prepare(rows, draft_window)?;
             }
-        }
-        // Generation projects only the prompt's final row. Explicit tuning
-        // also prepares the requested scoring and verification head batches.
-        if let Some(backend) = self.head.backend() {
-            backend.retain_workspaces(&head_rows)?;
-            for rows in head_rows {
-                backend.prepare(rows)?;
-            }
-        }
-        self.work.recurrent.prepare(&prefill_rows)?;
-        if let Some(lane) = &self.secondary {
-            if prefill_rows.contains(&self.options.chunk) {
-                lane.prepare(self.options.chunk)?;
-                self.secondary_work
-                    .as_mut()
-                    .unwrap()
-                    .recurrent
-                    .prepare(&[self.options.chunk])?;
-            } else {
-                for backend in lane.backends() {
-                    backend.retain_workspaces(&[])?;
-                }
-                self.secondary_work
-                    .as_mut()
-                    .unwrap()
-                    .recurrent
-                    .retain_workspaces(&[]);
-            }
-        }
-        if let Some(draft) = &self.dflash {
-            draft.prepare(&rows, self.options.speculation.window())?;
-        }
-        self.loader.store.release_pages()?;
-        Ok(())
+            store.release_pages()
+        })
     }
+
     pub fn load(options: ModelOptions) -> Result<Self> {
         ensure!(
             (1..=2).contains(&options.prefill_ubatches),
@@ -173,16 +154,15 @@ impl Qwen35 {
         cancelled: Option<&AtomicBool>,
         logits: bool,
     ) -> Result<()> {
-        if tokens.len() > 1 {
-            self.workspaces.reset();
-        }
         self.check_input(tokens)?;
         ensure!(
             self.round.is_none(),
             "Qwen3.5 verification transaction is active"
         );
-        self.reserve(self.position + tokens.len())?;
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
         let result = (|| {
+            self.reserve(self.position + tokens.len())?;
             let mut rows = 0;
             for (first, second) in crate::model::prefill::batches(
                 tokens,
@@ -207,14 +187,12 @@ impl Qwen35 {
             );
             if logits {
                 self.output_head(rows)?;
+            } else {
+                self.workspaces.finish_head_free(self.position);
             }
             Ok(())
         })();
-        // A failed/cancelled hybrid chunk may have modified earlier layers.
-        if result.is_err() {
-            self.reset()?;
-        }
-        result
+        self.complete_input(result)
     }
 
     fn score(&mut self, tokens: &[u32], targets: &[u32]) -> Result<Vec<f64>> {
@@ -228,6 +206,8 @@ impl Qwen35 {
                 && targets.iter().all(|v| (*v as usize) < self.info.vocab_size),
             "invalid Qwen3.5 scoring targets"
         );
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
         self.reserve(self.position + tokens.len())?;
         let mut values = Vec::with_capacity(tokens.len());
         for (tokens, targets) in tokens
@@ -267,20 +247,48 @@ impl Qwen35 {
             return Ok(());
         }
         let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
-        if self.workspaces.enter_decode(
-            self.backends
-                .iter()
-                .chain(self.head.backend())
-                .chain(self.secondary.iter().flat_map(|lane| lane.backends())),
-            &rows,
-        )? {
-            // GDN verification and one-row AR execute on CPU.
-            self.work.recurrent.retain_workspaces(&[1]);
-            if let Some(work) = &mut self.secondary_work {
-                work.recurrent.retain_workspaces(&[]);
-            }
+        let (workspaces, targets, ..) = self.workspace_targets(&rows);
+        workspaces.finish_prefill(targets)
+    }
+
+    fn workspace_targets<'a>(
+        &'a mut self,
+        rows: &'a [usize],
+    ) -> (
+        &'a mut Workspaces,
+        Targets<'a>,
+        Option<&'a DFlash>,
+        &'a TensorStore,
+    ) {
+        (
+            &mut self.workspaces,
+            Targets {
+                primary: &self.backends,
+                secondary: self.secondary.as_ref(),
+                head: self.head.backend(),
+                recurrent: [
+                    Some(&mut self.work.recurrent),
+                    self.secondary_work.as_mut().map(|work| &mut work.recurrent),
+                ],
+                routers: None,
+                floating: &[],
+                chunk: self.options.chunk,
+                decode_rows: rows,
+            },
+            self.dflash.as_ref(),
+            &self.loader.store,
+        )
+    }
+
+    pub(super) fn complete_input<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            let rows: Vec<_> = (1..=self.speculation_window() + 1).collect();
+            let (workspaces, targets, ..) = self.workspace_targets(&rows);
+            workspaces.abort(targets)?;
+            // A failed or cancelled hybrid chunk may have changed earlier layers.
+            self.reset()?;
         }
-        Ok(())
+        result
     }
 }
 
@@ -370,7 +378,18 @@ impl LanguageModel for Qwen35 {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "Qwen3.5 prompt exceeds context"
         );
-        self.prepare_rows(vec![prompt_tokens])
+        let paired = self.paging.is_none()
+            && crate::model::prefill::raw_uses_secondary(
+                prompt_tokens,
+                self.prompt_chunk_rows(),
+                self.options.prefill_ubatches,
+            );
+        self.prepare_rows(
+            self.position..self.position + prompt_tokens,
+            None,
+            [prompt_tokens],
+            paired,
+        )
     }
     fn prepare_prepared<'a>(
         &mut self,
@@ -393,9 +412,21 @@ impl LanguageModel for Qwen35 {
             start,
             steps,
             checkpoint: self.prefix_cache.last_position(),
+            plan_id: Some(crate::model::prefill::PlanId::new()),
         };
-        let rows = prepared.steps.iter().map(|s| s.range.len()).collect();
-        self.prepare_rows(rows)?;
+        let paired = self.paging.is_none()
+            && crate::model::prefill::groups(
+                &prepared.steps,
+                self.options.chunk,
+                self.options.prefill_ubatches,
+            )
+            .any(|group| group.len() == 2);
+        self.prepare_rows(
+            start..input.tokens.len(),
+            prepared.plan_id,
+            prepared.steps.iter().map(|s| s.range.len()),
+            paired,
+        )?;
         Ok(prepared)
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {

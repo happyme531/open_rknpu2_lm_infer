@@ -9,6 +9,7 @@ pub struct GatedDelta {
     work: BTreeMap<usize, Handle<rk_npu_gdn_workspace>>,
     device: Backend,
     main_rows: usize,
+    parked: bool,
     workspace_creations: usize,
     calls: usize,
     tokens: usize,
@@ -32,6 +33,7 @@ impl GatedDelta {
             work: BTreeMap::new(),
             device,
             main_rows,
+            parked: false,
             workspace_creations: 0,
             calls: 0,
             tokens: 0,
@@ -50,6 +52,9 @@ impl GatedDelta {
         self.compensated
     }
     pub fn prepare(&mut self, rows: usize) -> Result<()> {
+        if rows == self.main_rows {
+            self.activate_main();
+        }
         if rows <= Self::CPU_MAX_ROWS || self.work.contains_key(&rows) {
             return Ok(());
         }
@@ -59,12 +64,31 @@ impl GatedDelta {
         }
         self.create_workspace(rows)
     }
-    pub fn prepare_all(&mut self, rows: &[usize]) -> Result<()> {
+    pub(crate) fn select_workspaces(&mut self, rows: &[usize]) -> Result<()> {
         ensure!(
             rows.iter().all(|&m| m <= 2048),
             "NPU GDN window exceeds 2048 tokens"
         );
+        if rows.contains(&self.main_rows) {
+            self.activate_main();
+        }
         self.retain_workspaces(rows);
+        Ok(())
+    }
+    fn activate_main(&mut self) {
+        if self.parked {
+            let b = self.device.0.lock().unwrap();
+            if let Some((rows, work)) = b.domain.idle.lock().unwrap()[b.lane].gdn.take() {
+                self.work.insert(rows, work);
+            }
+            self.parked = false;
+        }
+    }
+    pub fn prepare_all(&mut self, rows: &[usize]) -> Result<()> {
+        self.select_workspaces(rows)?;
+        self.prepare_selected(rows)
+    }
+    pub(crate) fn prepare_selected(&mut self, rows: &[usize]) -> Result<()> {
         for &m in rows {
             if m > Self::CPU_MAX_ROWS && !self.work.contains_key(&m) {
                 self.create_workspace(m)?;
@@ -74,6 +98,21 @@ impl GatedDelta {
     }
     pub fn retain_workspaces(&mut self, rows: &[usize]) {
         self.work.retain(|m, _| rows.contains(m));
+    }
+    pub(crate) fn finish_prefill(&mut self, keep_main: bool) {
+        let b = self.device.0.lock().unwrap();
+        let mut idle = b.domain.idle.lock().unwrap();
+        let parked = &mut idle[b.lane].gdn;
+        if keep_main {
+            if let Some(work) = self.work.remove(&self.main_rows) {
+                *parked = Some((self.main_rows, work));
+            }
+            self.parked = parked.is_some();
+        } else {
+            *parked = None;
+            self.parked = false;
+        }
+        self.work.clear();
     }
     fn create_workspace(&mut self, rows: usize) -> Result<()> {
         let device = self.device.0.lock().unwrap();
@@ -176,6 +215,14 @@ impl GatedDelta {
         self.cpu_work_us.fill(0.);
     }
     pub fn stats(&self) -> Value {
+        let mut rows: Vec<_> = self.work.keys().copied().collect();
+        if self.parked {
+            let b = self.device.0.lock().unwrap();
+            if let Some((m, _)) = &b.domain.idle.lock().unwrap()[b.lane].gdn {
+                rows.push(*m);
+            };
+        }
+        rows.sort_unstable();
         json!({"gdn_npu_precision":"tf32","gdn_npu_calls":self.calls,"gdn_npu_tokens":self.tokens,
             "gdn_npu_workspace_creations":self.workspace_creations,
             "gdn_npu_ms":self.elapsed_us/1000.,"gdn_npu_hardware_ms":self.hardware_us/1000.,
@@ -183,8 +230,17 @@ impl GatedDelta {
             "gdn_npu_coefficients_ms":self.cpu_work_us[1]/1000.,
             "gdn_npu_solve_ms":self.cpu_work_us[2]/1000.,
             "gdn_npu_collect_ms":self.cpu_work_us[3]/1000.,
-            "gdn_npu_chunks":self.work.keys().map(|&m| json!({"rows":m,
+            "gdn_npu_chunks":rows.iter().map(|&m| json!({"rows":m,
                 "chunk":m.next_power_of_two().clamp(16,64)})).collect::<Vec<_>>(),
-            "gdn_npu_workspace_rows":self.work.keys().copied().collect::<Vec<_>>()})
+            "gdn_npu_workspace_rows":rows})
+    }
+}
+
+impl Drop for GatedDelta {
+    fn drop(&mut self) {
+        if self.parked {
+            let b = self.device.0.lock().unwrap();
+            b.domain.idle.lock().unwrap()[b.lane].gdn = None;
+        }
     }
 }

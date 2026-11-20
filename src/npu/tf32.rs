@@ -2,11 +2,11 @@
 use super::*;
 use std::{cell::RefCell, rc::Rc};
 
-struct Work {
+pub(super) struct Work {
     workspace: Handle<rk_npu_mm_workspace>,
     _plan: Handle<rk_npu_mm_plan>,
 }
-type Workspaces = BTreeMap<(usize, usize, usize), Work>;
+pub(super) type Workspaces = BTreeMap<(usize, usize, usize), Work>;
 #[derive(Clone)]
 pub struct Tf32Backend {
     work: Rc<RefCell<Workspaces>>,
@@ -88,6 +88,27 @@ impl Tf32Backend {
         self.work
             .borrow_mut()
             .retain(|&(_, _, m), _| rows.contains(&m));
+    }
+    pub(crate) fn select_prefill_workspaces(&self, rows: &[usize]) {
+        self.retain_workspaces(rows);
+        let b = self.device.0.lock().unwrap();
+        let mut idle = b.domain.idle.lock().unwrap();
+        self.work.borrow_mut().extend(
+            idle[b.lane]
+                .tf32
+                .extract_if(.., |&(_, _, m), _| rows.contains(&m)),
+        );
+    }
+    pub(crate) fn finish_prefill(&self, rows: &[usize], prefill: Option<usize>) {
+        if let Some(prefill) = prefill.filter(|m| !rows.contains(m)) {
+            let b = self.device.0.lock().unwrap();
+            b.domain.idle.lock().unwrap()[b.lane].tf32.extend(
+                self.work
+                    .borrow_mut()
+                    .extract_if(.., |&(_, _, m), _| m == prefill),
+            );
+        }
+        self.retain_workspaces(rows);
     }
     /// Compact row-major checkpoint weight [N,K]; bias is handled by the caller.
     pub fn load(&self, weight: &[f32], k: usize, n: usize) -> Result<Tf32Linear> {

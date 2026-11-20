@@ -79,6 +79,13 @@ impl OutputHead {
         }
     }
 
+    #[cfg(any(
+        feature = "model-qwen3",
+        feature = "model-llama",
+        feature = "model-granite",
+        feature = "model-qwen35",
+        feature = "model-minicpmv47"
+    ))]
     pub fn prepare(&self, rows: usize) -> Result<()> {
         if let Some(backend) = self.backend() {
             backend.prepare(rows)?;

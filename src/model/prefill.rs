@@ -1,5 +1,8 @@
 use crate::input::PreparedInput;
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub(crate) struct PrefillStep {
     pub range: Range<usize>,
@@ -28,11 +31,15 @@ pub(crate) fn batches(
     let mut chunks = tokens.chunks(chunk).peekable();
     std::iter::from_fn(move || {
         let first = chunks.next()?;
-        let pair = lanes == 2
-            && first.len() == chunk
-            && chunks.peek().is_some_and(|next| next.len() == chunk);
+        let pair = chunks
+            .peek()
+            .is_some_and(|next| raw_uses_secondary(first.len() + next.len(), chunk, lanes));
         Some((first, if pair { chunks.next() } else { None }))
     })
+}
+
+pub(crate) fn raw_uses_secondary(tokens: usize, chunk: usize, lanes: usize) -> bool {
+    lanes == 2 && tokens >= 2 * chunk
 }
 
 /// Pair complete adjacent batches, draining before every checkpoint boundary.
@@ -82,6 +89,17 @@ pub struct PreparedPrefill<'a> {
     pub(crate) start: usize,
     pub(crate) steps: Vec<PrefillStep>,
     pub(crate) checkpoint: Option<usize>,
+    pub(crate) plan_id: Option<PlanId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanId(u64);
+
+impl PlanId {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ fn prepared_workspaces(model: &Ling3Tiny, rows: usize) -> Vec<[(usize, usize); 4
         .layers
         .iter()
         .filter_map(|l| l.mixer.prepared_workspaces())
+        .map(|projections| projections.map(|work| work.expect("prepared MLA projection")))
         .collect();
     assert!(!workspaces.is_empty());
     assert!(workspaces.iter().flatten().all(|&(m, _)| m == rows));
@@ -126,12 +127,17 @@ fn ling_prefix_restore_matches_replay_and_preserves_kda_convolution_and_mla() ->
     let prepared = model.prepare_prepared(&input, 596)?;
     assert_eq!(prepared.steps.len(), 1);
     assert_eq!(prepared.steps[0].range.len(), 4);
-    let replay_workspaces = prepared_workspaces(&model, 4);
+    prepared_workspaces(&model, 4);
     exact(model.forward_prepared(prepared, &cancel)?, &expected);
-    assert_eq!(
-        prepared_workspaces(&model, 4),
-        replay_workspaces,
-        "four-row replay should reuse its prepared workspaces"
+    assert!(
+        model
+            .layers
+            .iter()
+            .filter_map(|l| l.mixer.prepared_workspaces())
+            .flatten()
+            .flatten()
+            .all(|(rows, _)| rows == 1),
+        "four-row replay scratch should be released at decode"
     );
     assert!(
         state(&model) == expected_state,
@@ -210,6 +216,78 @@ fn ling_prefix_restore_matches_replay_and_preserves_kda_convolution_and_mla() ->
     assert!(model.truncate(0)?);
     eprintln!(
         "Ling SSM prefix PASS: exact prompt/decode/branch logits, KDA+conv, resident MLA allocation, capacity/reuse/miss/reset/cancellation/disabled"
+    );
+    retained_moe_workspaces(&mut model, &plain.tokens[..257], &cancel)?;
+    Ok(())
+}
+
+fn retained_moe_workspaces(
+    model: &mut Ling3Tiny,
+    tokens: &[u32],
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let retain = match std::env::var("RK_NPU_PREFILL_CACHE_DOMAIN_MIB").as_deref() {
+        Ok("1792") | Err(std::env::VarError::NotPresent) => true,
+        Ok("0") => false,
+        _ => return Ok(()),
+    };
+    let before = |model: &Ling3Tiny| {
+        model
+            .backends
+            .iter()
+            .map(Backend::stats)
+            .collect::<Vec<_>>()
+    };
+    model.reserve(640)?;
+    model.prepare(tokens.len())?;
+    let expected = model.forward(tokens)?.to_vec();
+    model.forward(&[42])?;
+    let after = before(model);
+    for field in [
+        "idle_prefill_tf32_workspaces",
+        "idle_prefill_fp16_workspaces",
+    ] {
+        assert_eq!(
+            after.iter().any(|d| d[field].as_u64().unwrap() > 0),
+            retain,
+            "{field}"
+        );
+    }
+    model.reset()?;
+    model.prepare(tokens.len())?;
+    let prepared = before(model);
+    let mut reused = 0;
+    for (a, b) in after.iter().zip(&prepared) {
+        let cached_router = a["idle_prefill_tf32_workspaces"].as_u64().unwrap() > 0;
+        let cached_fp16 = a["idle_prefill_fp16_workspaces"].as_u64().unwrap() > 0;
+        // A 257-token prompt requires only M=128 and M=1 for all projections.
+        if cached_router && cached_fp16 {
+            assert_eq!(a["domain_memory"]["creates"], b["domain_memory"]["creates"]);
+            reused += 1;
+        }
+    }
+    assert_eq!(reused > 0, retain);
+    model.prefill(tokens)?;
+    let continuation = model.forward(&[42])?.to_vec();
+    let head_free = before(model);
+    assert_eq!(
+        head_free
+            .iter()
+            .any(|d| d["idle_prefill_tf32_workspaces"].as_u64().unwrap() > 0),
+        retain
+    );
+    model.reset()?;
+    model.prepare(tokens.len())?;
+    exact(model.forward(tokens)?, &expected);
+    exact(model.forward(&[42])?, &continuation);
+    assert!(!cancel.load(Ordering::Relaxed));
+    eprintln!(
+        "Ling MoE scratch PASS: cache={retain} warm_domains={reused} storage={}",
+        if model.paging.is_some() {
+            "stream"
+        } else {
+            "resident"
+        }
     );
     Ok(())
 }

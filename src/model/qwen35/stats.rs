@@ -77,6 +77,8 @@ impl Qwen35 {
             .as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
+        result["prefill_workspace_cached_domains"] =
+            json!(crate::model::workspace::cached_domains(&self.backends));
         result["prefill_ubatches"] = json!(self.options.prefill_ubatches);
         result["dual_prefill_groups"] = json!(self.dual_groups);
         result["stage_timing_scope"] =

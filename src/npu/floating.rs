@@ -8,21 +8,24 @@ mod gelu;
 #[path = "floating_tests.rs"]
 mod tests;
 
-struct FloatWork {
+pub(super) struct FloatWork {
     untuned: bool,
     gelu: Option<Handle<rk_npu_mm_gelu_workspace>>,
     workspace: Handle<rk_npu_mm_tuned_workspace>,
     strategy: rk_npu_mm_strategy,
 }
+type WorkKey = (usize, usize, usize);
+pub(super) type Workspaces = BTreeMap<WorkKey, FloatWork>;
 #[derive(Clone)]
 pub struct FloatBackend {
-    // Drop work before the device context/domain. Retain only the current
-    // logical M per K/N to bound workspace memory for variable image grids.
-    work: Arc<Mutex<BTreeMap<(usize, usize), FloatWork>>>,
+    // Each geometry keeps one changing row shape and, for participating
+    // decoders, a separate full prefill shape.
+    work: Arc<Mutex<Workspaces>>,
     device: Backend,
     dtype: rk_npu_mm_dtype,
     host_type: rk_npu_mm_host_type,
     source: TuningSource,
+    prefill_chunk: Option<usize>,
 }
 pub struct FloatLinear {
     weight: Handle<rk_npu_mm_tuned_weights>,
@@ -76,6 +79,48 @@ impl FloatBackend {
         backend.source = TuningSource::Dflash;
         backend
     }
+    #[cfg(feature = "model-ling3tiny")]
+    pub(crate) fn with_prefill_workspace(mut self, rows: usize) -> Self {
+        self.prefill_chunk = Some(rows);
+        self
+    }
+    fn work_key(&self, k: usize, n: usize, rows: usize) -> WorkKey {
+        (
+            k,
+            n,
+            if self.prefill_chunk == Some(rows) {
+                rows
+            } else {
+                0
+            },
+        )
+    }
+    fn prepared<'a>(&self, works: &'a Workspaces, k: usize, n: usize) -> Option<&'a FloatWork> {
+        works
+            .get(&(k, n, 0))
+            .or_else(|| works.get(&(k, n, self.prefill_chunk?)))
+    }
+    pub(crate) fn select_prefill_workspaces(&self, rows: &[usize]) {
+        let mut work = self.work.lock().unwrap();
+        work.retain(|_, w| rows.contains(&(w.strategy.M as usize)));
+        let b = self.device.0.lock().unwrap();
+        let mut idle = b.domain.idle.lock().unwrap();
+        work.extend(
+            idle[b.lane]
+                .floating
+                .extract_if(.., |_, w| rows.contains(&(w.strategy.M as usize))),
+        );
+    }
+    pub(crate) fn finish_prefill(&self, rows: &[usize], prefill: Option<usize>) {
+        let mut work = self.work.lock().unwrap();
+        if let Some(prefill) = prefill.filter(|m| !rows.contains(m)) {
+            let b = self.device.0.lock().unwrap();
+            b.domain.idle.lock().unwrap()[b.lane]
+                .floating
+                .extend(work.extract_if(.., |&(_, _, m), _| m == prefill));
+        }
+        work.retain(|_, w| rows.contains(&(w.strategy.M as usize)));
+    }
     #[allow(
         dead_code,
         reason = "The shared floating backend is available without a Qwen decoder."
@@ -105,6 +150,7 @@ impl FloatBackend {
             dtype,
             host_type: RK_NPU_MM_HOST_F32,
             source: TuningSource::Vision,
+            prefill_chunk: None,
         }
     }
     /// Search is controlled by the explicit tune_search option. Ordinary
@@ -120,12 +166,13 @@ impl FloatBackend {
         weight: *const rk_npu_mm_tuned_weights,
     ) -> Result<()> {
         let mut works = self.work.lock().unwrap();
-        if works.get(&(k, n)).is_some_and(|w| {
+        let key = self.work_key(k, n, rows);
+        if works.get(&key).is_some_and(|w| {
             w.strategy.M as usize == rows
                 && (weight.is_null()
                     || unsafe { rk_npu_mm_tuned_weights_match(weight, &w.strategy) } == 0)
         }) {
-            if works[&(k, n)].untuned && !crate::progress::notice_recorded() {
+            if works[&key].untuned && !crate::progress::notice_recorded() {
                 self.report_untuned(rows, k, n);
             }
             return Ok(());
@@ -220,7 +267,7 @@ impl FloatBackend {
             "floating workspace",
         )?;
         works.insert(
-            (k, n),
+            key,
             FloatWork {
                 untuned: !found,
                 gelu: None,
@@ -240,8 +287,8 @@ impl FloatBackend {
     /// The currently prepared strategy, including measured complete-call cost.
     pub fn profile(&self, k: usize, n: usize) -> Result<Value> {
         let works = self.work.lock().unwrap();
-        let s = &works
-            .get(&(k, n))
+        let s = &self
+            .prepared(&works, k, n)
             .context("floating shape is not prepared")?
             .strategy;
         Ok(json!({
@@ -321,11 +368,9 @@ impl FloatLinear {
     #[cfg(test)]
     #[allow(dead_code, reason = "Shared workspace inspection for model tests.")]
     pub(crate) fn prepared_workspace(&self) -> Option<(usize, usize)> {
+        let work = self.owner.work.lock().unwrap();
         self.owner
-            .work
-            .lock()
-            .unwrap()
-            .get(&(self.k, self.n))
+            .prepared(&work, self.k, self.n)
             .map(|w| (w.strategy.M as usize, w.workspace.raw as usize))
     }
     pub fn prepare(&self, rows: usize) -> Result<()> {
@@ -383,7 +428,9 @@ impl FloatLinear {
         );
         self.prepare(rows)?;
         let mut works = self.owner.work.lock().unwrap();
-        let w = works.get_mut(&(self.k, self.n)).unwrap();
+        let w = works
+            .get_mut(&self.owner.work_key(self.k, self.n, rows))
+            .unwrap();
         if w.gelu.is_none() {
             let device = self.owner.device.0.lock().unwrap();
             let mut cfg = rk_npu_mm_gelu_config::default();
@@ -430,7 +477,9 @@ impl FloatLinear {
         );
         self.prepare(rows)?;
         let works = self.owner.work.lock().unwrap();
-        let w = works.get(&(self.k, self.n)).unwrap();
+        let w = works
+            .get(&self.owner.work_key(self.k, self.n, rows))
+            .unwrap();
         check(
             unsafe {
                 rk_npu_mm_tuned_run_weights(

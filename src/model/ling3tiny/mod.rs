@@ -8,8 +8,9 @@ use crate::{
         experts::paged::Paging,
         output_head::OutputHead,
         trace::Trace,
+        workspace::{PrefillPlan, RouterTargets, Targets, Workspaces},
     },
-    npu::{Backend, Tf32Backend},
+    npu::{Backend, FloatBackend, Tf32Backend},
     ops::norm,
 };
 use anyhow::{Result, ensure};
@@ -41,6 +42,7 @@ pub struct Ling3Tiny {
     cpu: Cpu,
     backends: Vec<Backend>,
     router_backends: Vec<Tf32Backend>,
+    floating_backends: Vec<FloatBackend>,
     layers: Vec<Layer>,
     paging: Option<Paging>,
     embedding: Tensor,
@@ -55,7 +57,7 @@ pub struct Ling3Tiny {
     load_ms: f64,
     forward_ms: f64,
     head_ms: f64,
-    workspaces: crate::model::workspace::Workspaces,
+    workspaces: Workspaces,
 }
 impl Ling3Tiny {
     pub fn load(options: ModelOptions) -> Result<Self> {
@@ -74,21 +76,28 @@ impl Ling3Tiny {
         );
         Ok(())
     }
-    fn consume(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>) -> Result<()> {
+    fn consume(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>, logits: bool) -> Result<()> {
         self.check_input(tokens)?;
-        for batch in tokens.chunks(self.options.chunk) {
-            let result = self.chunk(batch, cancel);
-            if let Err(error) = result {
-                self.reset()?;
-                return Err(error);
+        self.workspaces
+            .begin_input(self.position, tokens.len(), &self.backends);
+        let result = (|| {
+            for batch in tokens.chunks(self.options.chunk) {
+                self.chunk(batch, cancel)?;
             }
-        }
-        Ok(())
+            ensure!(
+                !cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)),
+                "generation cancelled"
+            );
+            if logits {
+                self.output()?;
+            } else {
+                self.workspaces.finish_head_free(self.position);
+            }
+            Ok(())
+        })();
+        self.complete_input(result)
     }
     fn chunk(&mut self, tokens: &[u32], cancel: Option<&AtomicBool>) -> Result<()> {
-        if tokens.len() > 1 {
-            self.workspaces.reset();
-        }
         let start = Instant::now();
         let rows = tokens.len();
         let c = &self.config;
@@ -174,44 +183,67 @@ impl Ling3Tiny {
         self.forward_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(())
     }
-    fn prepare_rows(&mut self, rows: Vec<usize>) -> Result<()> {
+    fn prepare_rows(
+        &mut self,
+        span: std::ops::Range<usize>,
+        id: Option<super::prefill::PlanId>,
+        rows: Vec<usize>,
+    ) -> Result<()> {
         let floating_rows = rows[0].min(self.options.chunk);
-        let mut rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
+        let rows = crate::model::workspace::physical_rows(rows, self.options.chunk);
         let head_rows = crate::model::workspace::head_rows(&rows, &[1], self.options.tune_search);
-        self.workspaces.prepare(&mut rows, &[1]);
-        for backend in &self.backends {
-            backend.retain_workspaces(&rows)?;
-            for &n in &rows {
-                backend.prepare(n)?;
-            }
-        }
-        for backend in &self.router_backends {
-            backend.retain_workspaces(&rows);
-            for &n in &rows {
-                backend.prepare(self.config.hidden, self.config.experts, n)?;
-            }
-        }
+        let (workspaces, targets, layers) = self.workspace_targets();
         // FP16 retains one row shape per geometry. Prepare the first actual
         // batch; later batches and decode switch lazily when consumed.
-        for layer in &self.layers {
-            layer.mixer.prepare(floating_rows)?;
-        }
-        if let Some(head) = self.head.backend() {
-            head.retain_workspaces(&head_rows)?;
-        }
-        for rows in head_rows {
-            self.head.prepare(rows)?;
-        }
-        Ok(())
+        workspaces.prepare(
+            targets,
+            PrefillPlan {
+                span,
+                id,
+                rows: &rows,
+                head_rows: &head_rows,
+                paired: false,
+            },
+            |_, _| {
+                for layer in layers {
+                    layer.mixer.prepare(floating_rows)?;
+                }
+                Ok(())
+            },
+        )
     }
-    fn output(&mut self) -> Result<&[f32]> {
-        if self
-            .workspaces
-            .enter_decode(self.backends.iter().chain(self.head.backend()), &[1])?
-        {
-            for backend in &self.router_backends {
-                backend.retain_workspaces(&[1]);
-            }
+    fn workspace_targets(&mut self) -> (&mut Workspaces, Targets<'_>, &[Layer]) {
+        (
+            &mut self.workspaces,
+            Targets {
+                primary: &self.backends,
+                secondary: None,
+                head: self.head.backend(),
+                recurrent: [None, None],
+                routers: Some(RouterTargets {
+                    backends: &self.router_backends,
+                    hidden: self.config.hidden,
+                    experts: self.config.experts,
+                }),
+                floating: &self.floating_backends,
+                chunk: self.options.chunk,
+                decode_rows: &[1],
+            },
+            &self.layers,
+        )
+    }
+    fn complete_input(&mut self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            let (workspaces, targets, _) = self.workspace_targets();
+            workspaces.abort(targets)?;
+            self.reset()?;
+        }
+        result
+    }
+    fn output(&mut self) -> Result<()> {
+        if !self.workspaces.is_decoding() {
+            let (workspaces, targets, _) = self.workspace_targets();
+            workspaces.finish_prefill(targets)?;
         }
         let _head = trace::Span::new(c"ling.output_head", -1, 1, self.position);
         let start = Instant::now();
@@ -232,7 +264,7 @@ impl Ling3Tiny {
         self.trace.save(self.position, -1, "logits", &self.logits)?;
         let elapsed = start.elapsed().as_secs_f64() * 1000.;
         self.head_ms += elapsed;
-        Ok(&self.logits)
+        Ok(())
     }
 }
 impl LanguageModel for Ling3Tiny {
@@ -276,7 +308,11 @@ impl LanguageModel for Ling3Tiny {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "invalid Ling prompt length"
         );
-        self.prepare_rows(vec![prompt_tokens])
+        self.prepare_rows(
+            self.position..self.position + prompt_tokens,
+            None,
+            vec![prompt_tokens],
+        )
     }
     fn prepare_prepared<'a>(
         &mut self,
@@ -294,15 +330,15 @@ impl LanguageModel for Ling3Tiny {
         Ok(&self.logits)
     }
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
-        self.consume(tokens, None)
+        self.consume(tokens, None, false)
     }
     fn forward(&mut self, tokens: &[u32]) -> Result<&[f32]> {
-        self.consume(tokens, None)?;
-        self.output()
+        self.consume(tokens, None, true)?;
+        Ok(&self.logits)
     }
     fn forward_cancellable(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<&[f32]> {
-        self.consume(tokens, Some(cancel))?;
-        self.output()
+        self.consume(tokens, Some(cancel), true)?;
+        Ok(&self.logits)
     }
     fn truncate(&mut self, position: usize) -> Result<bool> {
         ensure!(
@@ -327,6 +363,8 @@ impl LanguageModel for Ling3Tiny {
     }
     fn stats(&self) -> serde_json::Value {
         let mut result = crate::model::metrics::backend_stats(&self.backends, self.head.backend());
+        result["prefill_workspace_cached_domains"] =
+            serde_json::json!(crate::model::workspace::cached_domains(&self.backends));
         let mixers: Vec<_> = self
             .layers
             .iter()

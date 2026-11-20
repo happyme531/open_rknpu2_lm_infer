@@ -145,7 +145,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
     ensure!(embedding.floating(), "Ling embedding must be floating");
     let mut backends = Vec::new();
     let mut router_backends = Vec::new();
-    let mut floating = None;
+    let mut floating_backends = Vec::new();
     let mut layers = Vec::new();
     for index in 0..config.layers {
         // Keep four layers' weights and maximum compressed KV below the
@@ -153,12 +153,15 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         if index % 4 == 0 {
             ensure!(backends.len() < 12, "Ling exceeds available weight domains");
             backends.push(Backend::new(&options, 15 - backends.len() as u32)?);
-            floating = Some(FloatBackend::for_decoder(backends.last().unwrap().clone()));
+            floating_backends.push(
+                FloatBackend::for_decoder(backends.last().unwrap().clone())
+                    .with_prefill_workspace(options.chunk),
+            );
             router_backends.push(Tf32Backend::new(backends.last().unwrap().clone()));
         }
         let l = Loader {
             backend: backends.last().unwrap(),
-            floating: floating.as_ref().unwrap(),
+            floating: floating_backends.last().unwrap(),
             router: router_backends.last().unwrap(),
             weights: &weights,
             cpu: &cpu,
@@ -222,6 +225,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
     let trace = crate::model::trace::Trace::from_environment()?;
     let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
     let work = super::buffers::Buffers::new(&config);
+    let workspaces = super::Workspaces::for_generation(!options.tune_search)?;
     if options.compress_w8a8 {
         crate::npu::release_compression_scratch(backends.iter().chain(head.backend()));
     }
@@ -233,6 +237,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         cpu,
         backends,
         router_backends,
+        floating_backends,
         layers,
         paging,
         embedding,
@@ -247,7 +252,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
         load_ms: start.elapsed().as_secs_f64() * 1000.,
         forward_ms: 0.,
         head_ms: 0.,
-        workspaces: Default::default(),
+        workspaces,
     })
 }
 

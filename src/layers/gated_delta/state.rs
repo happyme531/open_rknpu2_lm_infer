@@ -135,6 +135,26 @@ impl Scratch {
     }
 }
 
+impl Scratch {
+    pub(crate) fn select_workspaces(&mut self, rows: &[usize]) -> Result<()> {
+        if let Some(prefill) = &mut self.prefill {
+            prefill.select_workspaces(rows)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_selected(&mut self, rows: &[usize]) -> Result<()> {
+        if let Some(prefill) = &mut self.prefill {
+            prefill.prepare_selected(rows)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn finish_prefill(&mut self, keep_main: bool) {
+        if let Some(prefill) = &mut self.prefill {
+            prefill.finish_prefill(keep_main);
+        }
+    }
+}
+
 pub struct LayerState {
     dim: GdnDimensions,
     kernel: usize,

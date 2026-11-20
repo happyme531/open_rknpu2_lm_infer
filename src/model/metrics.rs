@@ -32,6 +32,7 @@ pub(crate) fn backend_stats<'a>(
         "workspace_payload_bytes",
         "tuning_material_bytes",
         "workspace_count",
+        "linear_padding_bytes",
         "tune_cache_hits",
         "tune_cache_misses",
         "tune_calls",

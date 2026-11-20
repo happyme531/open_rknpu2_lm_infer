@@ -4,7 +4,8 @@ use half::f16;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, c_void},
+    ops::Deref,
     ptr,
     sync::{
         Arc, Mutex,
@@ -213,9 +214,84 @@ struct Work {
     w4: Option<Handle<rk_npu_w4a8_workspace>>,
     w4_swiglu: Option<Handle<rk_npu_w4a8_workspace>>,
     w8: Option<Handle<rk_npu_matmul_workspace>>,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct IdlePrefill {
+    linear: BTreeMap<WorkKey, Work>,
+    gdn: Option<(usize, Handle<rk_npu_gdn_workspace>)>,
+    tf32: tf32::Workspaces,
+    floating: floating::Workspaces,
+}
+
+struct Domain {
+    handle: Handle<rk_npu_iommu_domain>,
+    idle: Mutex<Vec<IdlePrefill>>,
+}
+
+impl Domain {
+    fn new(handle: Handle<rk_npu_iommu_domain>) -> Arc<Self> {
+        let domain = Arc::new(Self {
+            handle,
+            idle: Mutex::new(vec![IdlePrefill::default()]),
+        });
+        // The Arc is stable, and all allocators for this native domain hold
+        // a Backend (or are owned by one). The callback never locks a lane.
+        unsafe {
+            rk_npu_iommu_domain_set_reclaim(
+                domain.raw,
+                Some(Self::reclaim_idle),
+                Arc::as_ptr(&domain).cast_mut().cast(),
+            );
+        }
+        domain
+    }
+
+    unsafe extern "C" fn reclaim_idle(cookie: *mut c_void) {
+        let domain = unsafe { &*cookie.cast::<Self>() };
+        domain.discard_idle();
+    }
+
+    fn discard_idle(&self) {
+        for lane in self.idle.lock().unwrap().iter_mut() {
+            *lane = IdlePrefill::default();
+        }
+    }
+
+    fn add_lane(&self) -> usize {
+        let mut idle = self.idle.lock().unwrap();
+        let lane = idle.len();
+        idle.push(IdlePrefill::default());
+        lane
+    }
+}
+
+impl Deref for Domain {
+    type Target = Handle<rk_npu_iommu_domain>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl Drop for Domain {
+    fn drop(&mut self) {
+        unsafe { rk_npu_iommu_domain_set_reclaim(self.raw, None, ptr::null_mut()) };
+        self.discard_idle();
+    }
+}
+
+#[derive(Default)]
+struct LinearPadding {
     input: Vec<f32>,
     output: Vec<f32>,
-    bytes: u64,
+}
+
+impl LinearPadding {
+    fn bytes(&self) -> u64 {
+        (self.input.capacity() + self.output.capacity()) as u64 * 4
+    }
 }
 struct AttentionWork {
     workspace: Handle<rk_npu_attention_f16_workspace>,
@@ -277,6 +353,7 @@ struct Material {
 }
 struct BackendInner {
     work: BTreeMap<WorkKey, Work>,
+    padding: LinearPadding,
     moe_work: BTreeMap<moe::Key, moe::Work>,
     attention: Option<AttentionWork>,
     material: BTreeMap<Key, Material>,
@@ -295,8 +372,15 @@ struct BackendInner {
     loaded_w8: usize,
     compression_scratch: Arc<AtomicBool>,
     weight_bytes: u64,
-    domain: Arc<Handle<rk_npu_iommu_domain>>,
+    lane: usize,
+    domain: Arc<Domain>,
     context: Arc<Handle<rk_npu_ctx>>,
+}
+
+impl Drop for BackendInner {
+    fn drop(&mut self) {
+        self.domain.idle.lock().unwrap()[self.lane] = IdlePrefill::default();
+    }
 }
 
 /// A domain owns shared workspaces; layer weights keep it alive through `Arc`.
@@ -420,6 +504,7 @@ impl Backend {
         }
         Ok(Self(Arc::new(Mutex::new(BackendInner {
             work: BTreeMap::new(),
+            padding: LinearPadding::default(),
             moe_work: BTreeMap::new(),
             attention: None,
             material: BTreeMap::new(),
@@ -438,7 +523,8 @@ impl Backend {
             loaded_w8: 0,
             compression_scratch: Arc::new(AtomicBool::new(false)),
             weight_bytes: 0,
-            domain: Arc::new(domain),
+            lane: 0,
+            domain: Domain::new(domain),
             context: Arc::new(context),
         }))))
     }
@@ -543,7 +629,7 @@ impl Backend {
                 },
             );
         }
-        b.get_work(key, 1)?;
+        b.with_work(key, 1, |_| Ok(()))?;
         let material = b.material.get_mut(&key).unwrap();
         if material.reload.is_some() {
             material.matrix.codes = Vec::new();
@@ -693,18 +779,78 @@ impl Backend {
                     key.3
                 );
             }
-            b.get_work(key, m)?;
+            b.with_work(key, m, |_| Ok(()))?;
         }
         Ok(())
     }
     pub fn retain_workspaces(&self, rows: &[usize]) -> Result<()> {
         let keep: Vec<_> = rows.iter().map(|&r| bucket(r)).collect::<Result<_>>()?;
-        self.0
+        let mut b = self.0.lock().unwrap();
+        b.work.retain(|(_, m), _| keep.contains(m));
+        Ok(())
+    }
+
+    /// Select all required buckets before any lane can allocate and reclaim
+    /// this domain's idle work.
+    #[allow(
+        dead_code,
+        reason = "Only models retaining prefill select cached buckets."
+    )]
+    pub(crate) fn select_prefill_workspaces(&self, rows: &[usize]) -> Result<()> {
+        let keep: Vec<_> = rows.iter().map(|&r| bucket(r)).collect::<Result<_>>()?;
+        let mut b = self.0.lock().unwrap();
+        b.work.retain(|(_, m), _| keep.contains(m));
+        let domain = b.domain.clone();
+        let mut idle = domain.idle.lock().unwrap();
+        let lane = b.lane;
+        b.work.extend(
+            idle[lane]
+                .linear
+                .extract_if(.., |(_, m), _| keep.contains(m)),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn park_prefill_workspace(&self, keep_rows: &[usize], chunk: usize) -> Result<()> {
+        let keep: Vec<_> = keep_rows
+            .iter()
+            .map(|&r| bucket(r))
+            .collect::<Result<_>>()?;
+        let m = bucket(chunk)?;
+        let mut b = self.0.lock().unwrap();
+        if !keep.contains(&m) {
+            let domain = b.domain.clone();
+            let mut idle = domain.idle.lock().unwrap();
+            let lane = b.lane;
+            idle[lane]
+                .linear
+                .extend(b.work.extract_if(.., |(_, rows), _| *rows == m));
+        }
+        b.work.retain(|(_, rows), _| keep.contains(rows));
+        Ok(())
+    }
+
+    pub(crate) fn domain_live_bytes(&self) -> u64 {
+        self.0.lock().unwrap().domain_memory().live_bytes
+    }
+    pub(crate) fn idle_prefill_domain(&self) -> Option<u32> {
+        let b = self.0.lock().unwrap();
+        b.domain
+            .idle
             .lock()
             .unwrap()
-            .work
-            .retain(|(_, m), _| keep.contains(m));
-        Ok(())
+            .iter()
+            .any(|lane| {
+                !lane.linear.is_empty()
+                    || lane.gdn.is_some()
+                    || !lane.tf32.is_empty()
+                    || !lane.floating.is_empty()
+            })
+            .then_some(b.domain_id)
+    }
+
+    pub(crate) fn discard_idle_prefill(&self) {
+        self.0.lock().unwrap().domain.discard_idle();
     }
     pub fn weight_bytes(&self) -> u64 {
         self.0.lock().unwrap().weight_bytes
@@ -715,12 +861,13 @@ impl Backend {
     }
     pub fn stats(&self) -> Value {
         let b = self.0.lock().unwrap();
-        let workspace: u64 = b
-            .work
-            .values()
-            .map(|w| w.bytes + (w.input.capacity() + w.output.capacity()) as u64 * 4)
-            .sum::<u64>()
+        let idle = b.domain.idle.lock().unwrap();
+        let idle_linear = &idle[b.lane].linear;
+        let work = || b.work.values().chain(idle_linear.values());
+        let workspace: u64 = work().map(|w| w.bytes).sum::<u64>()
+            + b.padding.bytes()
             + b.moe_work.values().map(|w| w.bytes).sum::<u64>();
+        let memory = b.domain_memory();
         let material: usize = b
             .material
             .values()
@@ -730,11 +877,19 @@ impl Backend {
             (w.q.capacity() + w.k.capacity() + w.v.capacity()) * 2 + w.output.capacity() * 4
         });
         json!({"backend": "open-rknpu2", "loaded_w4": b.loaded_w4, "loaded_w8": b.loaded_w8,
+            "idle_prefill_tf32_workspaces": idle[b.lane].tf32.len(),
+            "idle_prefill_fp16_workspaces": idle[b.lane].floating.len(),
             "compress_w8a8": b.options.compress_w8a8,
             "weight_payload_bytes_estimated": b.options.compress_w8a8 && b.loaded_w8 > 0,
             "weight_payload_bytes": b.weight_bytes, "workspace_payload_bytes": workspace,
-            "tuning_material_bytes": material, "workspace_count": b.work.len(),
-            "swiglu_workspace_count": b.work.values().filter(|w| w.w4_swiglu.is_some()).count(),
+            "linear_padding_bytes": b.padding.bytes(),
+            // Both execution lanes see the same context-level totals.
+            "domain_memory": {
+                "live_bytes": memory.live_bytes, "peak_bytes": memory.peak_bytes,
+                "creates": memory.creates, "destroys": memory.destroys,
+            },
+            "tuning_material_bytes": material, "workspace_count": b.work.len() + idle_linear.len(),
+            "swiglu_workspace_count": work().filter(|w| w.w4_swiglu.is_some()).count(),
             "attention_cpu_staging_bytes": staging, "tune_cache_hits": b.cache_hits,
             "tune_cache_misses": b.cache_misses, "npu_core_mask": b.options.npu_mask,
             "tune_calls": b.tune_calls, "strategy_fallbacks": b.fallbacks.len(),
@@ -751,6 +906,13 @@ impl Backend {
 }
 
 impl BackendInner {
+    fn domain_memory(&self) -> rk_npu_domain_memory_stats {
+        let mut stats = rk_npu_domain_memory_stats::default();
+        let rc = unsafe { rk_npu_iommu_domain_memory_stats(self.domain.raw, &mut stats) };
+        debug_assert_eq!(rc, 0);
+        stats
+    }
+
     fn cache_path(&self, key: Key, m: usize) -> Result<Option<CString>> {
         if self.options.tune_cache.as_os_str().is_empty() {
             return Ok(None);
@@ -1032,91 +1194,53 @@ impl BackendInner {
         self.w4_strategies.insert((key, m), fastest);
         Ok(fastest)
     }
-    fn get_work(&mut self, key: Key, m: usize) -> Result<&mut Work> {
+    fn with_work<T>(
+        &mut self,
+        key: Key,
+        m: usize,
+        use_work: impl FnOnce(&mut Work) -> Result<T>,
+    ) -> Result<T> {
         let wk = (key, m);
-        if !self.work.contains_key(&wk) {
-            let (bits, k, n, _) = key;
-            let mut work = Work {
-                w4: None,
-                w4_swiglu: None,
-                w8: None,
-                input: vec![0.0; m * k],
-                output: vec![0.0; m * n],
-                bytes: 0,
-            };
-            if bits == 4 {
-                let strategy = self.w4_strategy(key, m)?;
-                let mut info = rk_npu_w4a8_memory_info_ex::default();
-                check(
-                    unsafe {
-                        rk_npu_w4a8_memory_query_ex(
-                            &strategy.base.config,
-                            &strategy.execution,
-                            &mut info,
-                        )
-                    },
-                    "W4 memory query",
-                )?;
-                work.bytes = info.workspace_bytes;
-                work.w4 = Some(Handle::new(
-                    unsafe {
-                        rk_npu_w4a8_workspace_create_ex(
-                            self.domain.raw,
-                            &strategy.base.config,
-                            &strategy.execution,
-                        )
-                    },
-                    rk_npu_w4a8_workspace_free,
-                    "W4 workspace",
-                )?);
-            } else {
-                let strategy = self.w8_strategy(key, m)?;
-                let mut info = rk_npu_matmul_workspace_requirements::default();
-                check(
-                    unsafe { rk_npu_matmul_workspace_memory_query(&strategy, &mut info) },
-                    "W8 memory query",
-                )?;
-                work.bytes = info.bytes;
-                work.w8 = Some(Handle::new(
-                    unsafe { rk_npu_matmul_workspace_create(self.domain.raw, &strategy) },
-                    rk_npu_matmul_workspace_free,
-                    "W8 workspace",
-                )?);
+        let run = |work: &mut Work, options: &ModelOptions, fallbacks: &BTreeSet<WorkKey>| {
+            if fallbacks.contains(&wk) {
+                crate::progress::untuned(
+                    options,
+                    if key.0 == 4 { "W4" } else { "W8" },
+                    m,
+                    key.1,
+                    key.2,
+                    crate::progress::TuningSource::Target,
+                );
             }
-            self.work.insert(wk, work);
+            use_work(work)
+        };
+        if let Some(work) = self.work.get_mut(&wk) {
+            return run(work, &self.options, &self.fallbacks);
         }
-        if self.fallbacks.contains(&wk) {
-            crate::progress::untuned(
-                &self.options,
-                if key.0 == 4 { "W4" } else { "W8" },
-                m,
-                key.1,
-                key.2,
-                crate::progress::TuningSource::Target,
-            );
-        }
-        Ok(self.work.get_mut(&wk).unwrap())
+        let idle = self.domain.idle.lock().unwrap()[self.lane]
+            .linear
+            .remove(&wk);
+        let work = match idle {
+            Some(work) => work,
+            None => self.create_work(key, m)?,
+        };
+        run(
+            self.work.entry(wk).or_insert(work),
+            &self.options,
+            &self.fallbacks,
+        )
     }
 
-    fn get_swiglu_work(&mut self, key: Key, m: usize) -> Result<&mut Work> {
-        let mut strategy = self.w4_strategy(key, m)?;
-        let threads = if m == 1 {
-            1
-        } else {
-            self.options.threads as i32
+    fn create_work(&mut self, key: Key, m: usize) -> Result<Work> {
+        let (bits, _, _, _) = key;
+        let mut work = Work {
+            w4: None,
+            w4_swiglu: None,
+            w8: None,
+            bytes: 0,
         };
-        if strategy.base.config.cpu_threads == threads
-            && strategy.execution.reduce_backend == RK_NPU_W4A8_REDUCE_CPU
-        {
-            return self.get_work(key, m);
-        }
-        // Ordinary GEMM tuning excludes the activation. Keep its workspace
-        // unchanged; only the fused call uses the measured SwiGLU CPU policy.
-        strategy.base.config.cpu_threads = threads;
-        strategy.execution.reduce_backend = RK_NPU_W4A8_REDUCE_CPU;
-        let domain = self.domain.raw;
-        let work = self.get_work(key, m)?;
-        if work.w4_swiglu.is_none() {
+        if bits == 4 {
+            let strategy = self.w4_strategy(key, m)?;
             let mut info = rk_npu_w4a8_memory_info_ex::default();
             check(
                 unsafe {
@@ -1126,22 +1250,87 @@ impl BackendInner {
                         &mut info,
                     )
                 },
-                "W4 SwiGLU memory query",
+                "W4 memory query",
             )?;
-            work.w4_swiglu = Some(Handle::new(
+            work.bytes = info.workspace_bytes;
+            work.w4 = Some(Handle::new(
                 unsafe {
                     rk_npu_w4a8_workspace_create_ex(
-                        domain,
+                        self.domain.raw,
                         &strategy.base.config,
                         &strategy.execution,
                     )
                 },
                 rk_npu_w4a8_workspace_free,
-                "W4 SwiGLU workspace",
+                "W4 workspace",
             )?);
-            work.bytes += info.workspace_bytes;
+        } else {
+            let strategy = self.w8_strategy(key, m)?;
+            let mut info = rk_npu_matmul_workspace_requirements::default();
+            check(
+                unsafe { rk_npu_matmul_workspace_memory_query(&strategy, &mut info) },
+                "W8 memory query",
+            )?;
+            work.bytes = info.bytes;
+            work.w8 = Some(Handle::new(
+                unsafe { rk_npu_matmul_workspace_create(self.domain.raw, &strategy) },
+                rk_npu_matmul_workspace_free,
+                "W8 workspace",
+            )?);
         }
         Ok(work)
+    }
+
+    fn with_swiglu_work<T>(
+        &mut self,
+        key: Key,
+        m: usize,
+        use_work: impl FnOnce(&mut Work) -> Result<T>,
+    ) -> Result<T> {
+        let mut strategy = self.w4_strategy(key, m)?;
+        let threads = if m == 1 {
+            1
+        } else {
+            self.options.threads as i32
+        };
+        if strategy.base.config.cpu_threads == threads
+            && strategy.execution.reduce_backend == RK_NPU_W4A8_REDUCE_CPU
+        {
+            return self.with_work(key, m, use_work);
+        }
+        // Ordinary GEMM tuning excludes the activation. Keep its workspace
+        // unchanged; only the fused call uses the measured SwiGLU CPU policy.
+        strategy.base.config.cpu_threads = threads;
+        strategy.execution.reduce_backend = RK_NPU_W4A8_REDUCE_CPU;
+        let domain = self.domain.raw;
+        self.with_work(key, m, |work| {
+            if work.w4_swiglu.is_none() {
+                let mut info = rk_npu_w4a8_memory_info_ex::default();
+                check(
+                    unsafe {
+                        rk_npu_w4a8_memory_query_ex(
+                            &strategy.base.config,
+                            &strategy.execution,
+                            &mut info,
+                        )
+                    },
+                    "W4 SwiGLU memory query",
+                )?;
+                work.w4_swiglu = Some(Handle::new(
+                    unsafe {
+                        rk_npu_w4a8_workspace_create_ex(
+                            domain,
+                            &strategy.base.config,
+                            &strategy.execution,
+                        )
+                    },
+                    rk_npu_w4a8_workspace_free,
+                    "W4 SwiGLU workspace",
+                )?);
+                work.bytes += info.workspace_bytes;
+            }
+            use_work(work)
+        })
     }
 }
 
@@ -1175,25 +1364,42 @@ impl Linear {
         );
         let owner = self.owner.execution();
         let mut b = owner.0.lock().unwrap();
-        let work = if swiglu {
-            b.get_swiglu_work(self.key, m)?
-        } else {
-            b.get_work(self.key, m)?
+        let handles = |work: &mut Work| {
+            let w4 = work
+                .w4_swiglu
+                .as_ref()
+                .filter(|_| swiglu)
+                .or(work.w4.as_ref());
+            Ok((
+                w4.map(|handle| handle.raw),
+                work.w8.as_ref().map(|handle| handle.raw),
+            ))
         };
+        let (w4, w8) = if swiglu {
+            b.with_swiglu_work(self.key, m, handles)?
+        } else {
+            b.with_work(self.key, m, handles)?
+        };
+        // The backend lock keeps both the native plans and padding storage
+        // alive through the synchronous call and output copy.
+        let padding = &mut b.padding;
         let (a, c) = if m != rows {
-            work.input[..rows * self.k()].copy_from_slice(&input[..rows * self.k()]);
-            work.input[rows * self.k()..].fill(0.0);
-            (work.input.as_ptr(), work.output.as_mut_ptr())
+            let real_input = rows * self.k();
+            let padded_input = m * self.k();
+            if padding.input.len() < padded_input {
+                padding.input.resize(padded_input, 0.0);
+            }
+            if padding.output.len() < m * width {
+                padding.output.resize(m * width, 0.0);
+            }
+            padding.input[..real_input].copy_from_slice(&input[..real_input]);
+            padding.input[real_input..padded_input].fill(0.0);
+            (padding.input.as_ptr(), padding.output.as_mut_ptr())
         } else {
             (input.as_ptr(), output.as_mut_ptr())
         };
         if let Some(weights) = &self.w4 {
-            let ordinary = work.w4.as_ref().unwrap();
-            let raw = if swiglu {
-                work.w4_swiglu.as_ref().unwrap_or(ordinary).raw
-            } else {
-                ordinary.raw
-            };
+            let raw = w4.unwrap();
             let rc = unsafe {
                 if swiglu {
                     rk_npu_w4a8_run_swiglu_f32(raw, weights.raw, a, c, ptr::null_mut())
@@ -1205,18 +1411,13 @@ impl Linear {
         } else {
             check(
                 unsafe {
-                    rk_npu_f32i8f32_run_dynamic(
-                        work.w8.as_ref().unwrap().raw,
-                        self.w8.as_ref().unwrap().raw,
-                        a,
-                        c,
-                    )
+                    rk_npu_f32i8f32_run_dynamic(w8.unwrap(), self.w8.as_ref().unwrap().raw, a, c)
                 },
                 "W8 run",
             )?;
         }
         if m != rows {
-            output[..rows * width].copy_from_slice(&work.output[..rows * width]);
+            output[..rows * width].copy_from_slice(&padding.output[..rows * width]);
         }
         if let Some(observed) = &self.compressed_layout_generation {
             let generation = unsafe {
@@ -1440,6 +1641,10 @@ mod tests {
                 let mut output = vec![0.0; rows * 256];
                 linear.run(&input, &mut output, rows)?;
                 compare(&output, &reference[..rows * 256], 2e-5);
+                if rows == 1 && bits == 4 {
+                    assert_eq!(backend.stats()["linear_padding_bytes"], 0);
+                }
+
                 if bits == 4 {
                     let mut middle = vec![0.0; rows * 128];
                     assert!(linear.run_swiglu(&input, &mut middle, rows)?);

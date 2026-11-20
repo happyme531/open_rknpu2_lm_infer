@@ -64,6 +64,12 @@ path = "tests/tools/gdn_small_bench.rs"
 test = false
 
 [[example]]
+name = "workspace_reclaim"
+required-features = ["model-qwen3", "model-qwen35"]
+path = "tests/tools/workspace_reclaim.rs"
+test = false
+
+[[example]]
 name = "qwen35_check"
 required-features = ["model-qwen35"]
 path = "tests/tools/qwen35_check.rs"

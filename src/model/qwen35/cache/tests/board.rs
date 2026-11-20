@@ -34,15 +34,7 @@ fn exact(actual: &[f32], expected: &[f32]) {
     assert_eq!(differing, 0, "max_abs={maximum}");
 }
 
-#[test]
-#[ignore = "requires RK3588 and RKNPU_MTP_MODEL"]
-fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
-    let _lock = BoardLock::acquire()?;
-    let kind = match std::env::var("RKNPU_PREFIX_SPEC").as_deref() {
-        Ok("mtp") => SpeculativeType::DraftMtp,
-        Ok("dflash") => SpeculativeType::DraftDflash,
-        _ => SpeculativeType::None,
-    };
+fn board_options(kind: SpeculativeType) -> Result<ModelOptions> {
     let mut options = ModelOptions {
         path: PathBuf::from(std::env::var("RKNPU_MTP_MODEL")?),
         context: 1024,
@@ -80,6 +72,19 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         options.experts.storage = crate::model::experts::Storage::Stream;
     }
     crate::npu::configure_cpu(&mut options)?;
+    Ok(options)
+}
+
+#[test]
+#[ignore = "requires RK3588 and RKNPU_MTP_MODEL"]
+fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
+    let _lock = BoardLock::acquire()?;
+    let kind = match std::env::var("RKNPU_PREFIX_SPEC").as_deref() {
+        Ok("mtp") => SpeculativeType::DraftMtp,
+        Ok("dflash") => SpeculativeType::DraftDflash,
+        _ => SpeculativeType::None,
+    };
+    let options = board_options(kind)?;
     let codec = TextCodec::load(&options.path)?;
     let mut model = Qwen35::load(options)?;
     if kind == SpeculativeType::DraftMtp {
@@ -207,26 +212,149 @@ fn planned_tail_workspaces_survive_prefill(model: &mut Qwen35, cancel: &AtomicBo
         let after = model.stats();
         assert!(after["gdn_npu_calls"].as_u64().unwrap() > 0);
         assert_eq!(after["gdn_npu_workspace_creations"], creations);
-        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
-        eprintln!(
-            "planned GDN workspaces PASS rows={expected:?} prefill_creations=0 released_on_decode=true"
-        );
+        eprintln!("planned GDN workspaces PASS rows={expected:?} prefill_creations=0");
     }
-    // Short standalone prompts prepare only their actual rows, then release
-    // their NPU GDN scratch when projecting the last row for generation.
-    for rows in [20, 74] {
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires RK3588 and RKNPU_MTP_MODEL pointing to Qwen3.5-4B C7"]
+fn prefill_cache_retention_and_secondary_pairing() -> Result<()> {
+    let _lock = BoardLock::acquire()?;
+    let mut options = board_options(SpeculativeType::None)?;
+    options.prefill_ubatches = 2;
+    let expect_retention = match std::env::var("RK_NPU_PREFILL_CACHE_DOMAIN_MIB").as_deref() {
+        Ok("0") => false,
+        Ok("1792") | Err(std::env::VarError::NotPresent) => true,
+        _ => anyhow::bail!("test requires cache budget 0 or 1792 MiB"),
+    };
+    let mut model = Qwen35::load(options)?;
+    let cancel = AtomicBool::new(false);
+    let secondary_rows = |model: &Qwen35| {
+        model
+            .secondary_work
+            .as_ref()
+            .unwrap()
+            .recurrent
+            .backend_stats()["gdn_npu_workspace_rows"]
+            .clone()
+    };
+    let check_secondary_empty = |model: &Qwen35| {
+        assert_eq!(secondary_rows(model), serde_json::json!([]));
+        for backend in model.secondary.as_ref().unwrap().backends() {
+            assert_eq!(backend.stats()["workspace_count"], 0);
+        }
+    };
+
+    model.reserve(384)?;
+    model.prepare(129)?;
+    check_secondary_empty(&model);
+    model.forward(&[1; 129])?;
+    assert_eq!(model.dual_groups, 0);
+
+    model.reset()?;
+    let mut input = crate::input::PreparedInput::text(vec![1; 260]);
+    input.user_starts = vec![128];
+    let prepared = model.prepare_prepared(&input, 0)?;
+    assert_eq!(prepared.steps[1].range, 128..256);
+    assert!(prepared.steps[1].checkpoint);
+    check_secondary_empty(&model);
+    model.forward_prepared(prepared, &cancel)?;
+    assert_eq!(model.dual_groups, 0);
+
+    let creates = |model: &Qwen35| -> u64 {
+        model
+            .backends
+            .iter()
+            .map(|backend| {
+                backend.stats()["domain_memory"]["creates"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .sum()
+    };
+    let expected_rows = if expect_retention {
+        serde_json::json!([128])
+    } else {
+        serde_json::json!([])
+    };
+    let mut expected_logits = Vec::new();
+    for request in 0..2 {
         model.reset()?;
-        model.prepare(rows)?;
-        let before = model.stats();
-        assert_eq!(before["gdn_npu_workspace_rows"], serde_json::json!([rows]));
-        model.forward(&vec![1; rows])?;
-        let after = model.stats();
+        let before = creates(&model);
+        model.prepare(256)?;
+        let allocations = creates(&model) - before;
+        let expected_gdn_creates = match (expect_retention, request) {
+            (true, 0) => 1,
+            (true, _) => 0,
+            (false, _) => 2,
+        };
         assert_eq!(
-            after["gdn_npu_workspace_creations"],
-            before["gdn_npu_workspace_creations"]
+            model.stats()["gdn_npu_workspace_creations"],
+            expected_gdn_creates
         );
-        assert_eq!(after["gdn_npu_workspace_rows"], serde_json::json!([]));
+        assert_eq!(allocations == 0, expect_retention && request == 1);
+        let logits = model.forward(&[1; 256])?;
+        if request == 0 {
+            expected_logits = logits.to_vec();
+        } else {
+            exact(logits, &expected_logits);
+        }
+        assert_eq!(model.dual_groups, 1);
+        assert_eq!(model.stats()["gdn_npu_workspace_rows"], expected_rows);
+        assert_eq!(secondary_rows(&model), expected_rows);
+        eprintln!(
+            "prefill retention={expect_retention} request={request} prepare_creates={allocations} gdn_creates={expected_gdn_creates}"
+        );
     }
+    let appended = model.forward(&[1; 128])?.to_vec();
+    assert_eq!(model.position(), 384);
+    assert_eq!(
+        model.stats()["prefill_workspace_cached_domains"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        model.stats()["gdn_npu_workspace_rows"],
+        serde_json::json!([])
+    );
+    assert_eq!(secondary_rows(&model), serde_json::json!([]));
+    model.reset()?;
+    model.prepare(384)?;
+    exact(model.forward(&[1; 384])?, &appended);
+
+    model.reset()?;
+    model.prepare(256)?;
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(model.forward_cancellable(&[1; 256], &cancel).is_err());
+    assert_eq!(model.position(), 0);
+    assert_eq!(
+        model.stats()["prefill_workspace_cached_domains"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        model.stats()["gdn_npu_workspace_rows"],
+        serde_json::json!([])
+    );
+    eprintln!("unprepared append and cancelled prefill PASS");
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let paired = crate::input::PreparedInput::text(vec![1; 388]);
+    let mut checkpointed = paired.clone();
+    checkpointed.user_starts = vec![128];
+    let obsolete = model.prepare_prepared(&paired, 0)?;
+    let current = model.prepare_prepared(&checkpointed, 0)?;
+    let groups = |plan: &crate::model::PreparedPrefill<'_>| {
+        crate::model::prefill::groups(&plan.steps, 128, 2).any(|group| group.len() == 2)
+    };
+    assert!(groups(&obsolete) && !groups(&current));
+    let before = creates(&model);
+    let error = model.forward_prepared(obsolete, &cancel).unwrap_err();
+    assert!(error.to_string().contains("replaced or invalidated"));
+    assert_eq!(model.position(), 0);
+    assert_eq!(creates(&model), before);
+    model.forward_prepared(current, &cancel)?;
+    assert_eq!(model.position(), 388);
+    assert_eq!(model.dual_groups, 0);
+    eprintln!("same-span distinct prepared plans PASS");
     Ok(())
 }
 

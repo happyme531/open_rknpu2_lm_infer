@@ -402,6 +402,13 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
     );
     let prefix_cache = super::cache::PrefixCache::new(options.checkpoints);
     let reserved = options.context.div_ceil(32) * 32;
+    let workspaces = crate::model::workspace::Workspaces::for_generation(
+        !options.tune_search
+            && matches!(
+                options.speculation.kind,
+                crate::model::SpeculativeType::None | crate::model::SpeculativeType::DraftMtp
+            ),
+    )?;
     Ok(Qwen35 {
         options,
         info,
@@ -434,7 +441,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         features: Default::default(),
         secondary_features,
         dflash: None,
-        workspaces: Default::default(),
+        workspaces,
         prefix_cache,
     })
 }

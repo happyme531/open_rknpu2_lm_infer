@@ -42,7 +42,6 @@ impl ExecutionLane {
     pub fn prepare(&self, rows: usize) -> Result<()> {
         for binding in self.bindings.values() {
             binding.execution.copy_strategies_from(&binding.source);
-            binding.execution.retain_workspaces(&[rows])?;
             binding.execution.prepare(rows)?;
         }
         Ok(())
@@ -99,6 +98,7 @@ impl Backend {
         options.tune_search = false;
         Ok(Self(Arc::new(Mutex::new(BackendInner {
             work: BTreeMap::new(),
+            padding: LinearPadding::default(),
             moe_work: BTreeMap::new(),
             attention,
             material,
@@ -117,6 +117,7 @@ impl Backend {
             loaded_w8: 0,
             compression_scratch: source.compression_scratch.clone(),
             weight_bytes: 0,
+            lane: source.domain.add_lane(),
             domain: source.domain.clone(),
             context: source.context.clone(),
         }))))

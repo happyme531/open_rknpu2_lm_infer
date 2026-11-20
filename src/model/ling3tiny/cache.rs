@@ -89,8 +89,13 @@ impl Ling3Tiny {
             start,
             steps: self.prefix_cache.plan(input, start, self.options.chunk),
             checkpoint: self.prefix_cache.last_position(),
+            plan_id: Some(crate::model::prefill::PlanId::new()),
         };
-        self.prepare_rows(prepared.steps.iter().map(|s| s.range.len()).collect())?;
+        self.prepare_rows(
+            start..input.tokens.len(),
+            prepared.plan_id,
+            prepared.steps.iter().map(|s| s.range.len()).collect(),
+        )?;
         Ok(prepared)
     }
 
@@ -104,6 +109,7 @@ impl Ling3Tiny {
             start,
             steps,
             checkpoint,
+            plan_id,
         } = prepared;
         ensure!(
             start == self.position
@@ -116,8 +122,10 @@ impl Ling3Tiny {
             "Ling prepared prefill no longer matches the prefix cache"
         );
         self.check_input(&input.tokens[start..])?;
-        self.reserve(input.tokens.len())?;
+        self.workspaces
+            .begin_prepared(start..input.tokens.len(), plan_id)?;
         let result = (|| -> Result<()> {
+            self.reserve(input.tokens.len())?;
             self.prefix_cache.begin_request();
             for step in steps {
                 ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
@@ -130,10 +138,7 @@ impl Ling3Tiny {
             self.output()?;
             Ok(())
         })();
-        if result.is_err() {
-            self.reset()?;
-        }
-        result
+        self.complete_input(result)
     }
 }
 

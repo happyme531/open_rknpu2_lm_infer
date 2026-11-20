@@ -23,6 +23,7 @@ impl Qwen35 {
             start,
             steps,
             checkpoint,
+            plan_id,
         } = prepared;
         input.validate()?;
         ensure!(
@@ -44,8 +45,10 @@ impl Qwen35 {
                     .is_some_and(|s| s.range.end == input.tokens.len()),
             "prepared prefill no longer matches the prefix cache"
         );
-        self.reserve(input.tokens.len())?;
+        self.workspaces
+            .begin_prepared(start..input.tokens.len(), plan_id)?;
         let result = (|| {
+            self.reserve(input.tokens.len())?;
             let mut features = Vec::new();
             let images = input.images.iter().filter(|s| s.end() > start).count();
             for (index, span) in input.images.iter().filter(|s| s.end() > start).enumerate() {
@@ -132,9 +135,6 @@ impl Qwen35 {
             }
             Ok(())
         })();
-        if result.is_err() {
-            self.reset()?;
-        }
-        result
+        self.complete_input(result)
     }
 }

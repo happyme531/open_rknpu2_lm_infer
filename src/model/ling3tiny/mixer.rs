@@ -123,12 +123,11 @@ impl Mixer {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) fn prepared_workspaces(&self) -> Option<[(usize, usize); 4]> {
+    pub(super) fn prepared_workspaces(&self) -> Option<[Option<(usize, usize)>; 4]> {
         match self {
-            Self::Mla(m) => Some(
-                [&m.q_a, &m.q_b, &m.kv_a, &m.gate]
-                    .map(|p| p.prepared_workspace().expect("prepared MLA projection")),
-            ),
+            Self::Mla(m) => {
+                Some([&m.q_a, &m.q_b, &m.kv_a, &m.gate].map(|p| p.prepared_workspace()))
+            }
             Self::Kda(_) => None,
         }
     }
