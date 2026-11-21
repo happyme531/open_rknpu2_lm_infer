@@ -11,6 +11,7 @@ pub fn open(
     directory: &Path,
     geometry: Geometry,
     options: &ModelOptions,
+    full_k: bool,
     sources: impl Fn() -> Result<Vec<SourceStamp>>,
     mut load: impl FnMut(usize, usize) -> Result<(QuantMatrix, QuantMatrix)>,
 ) -> Result<Arc<Store>> {
@@ -19,8 +20,19 @@ pub fn open(
         return Ok(Arc::new(store.with_direct(options.experts.direct)?));
     }
     let _lock = store::lock(directory)?;
-    if let Ok(store) = Store::open(directory, &geometry, &stamps, false) {
-        return Ok(Arc::new(store.with_direct(options.experts.direct)?));
+    match Store::open(directory, &geometry, &stamps, false) {
+        Ok(store) => return Ok(Arc::new(store.with_direct(options.experts.direct)?)),
+        Err(error) => {
+            if !error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                eprintln!(
+                    "Rebuilding expert cache in {}: {error:#}",
+                    directory.display()
+                );
+            }
+        }
     }
     let mut writer = None;
     for layer in 0..geometry.layers {
@@ -32,7 +44,7 @@ pub fn open(
             gate.push(g);
             down.push(d);
         }
-        let bank = backend.load_moe(&gate, &down, 1)?;
+        let bank = backend.pack_moe_for_export(&gate, &down, full_k)?;
         drop((gate, down));
         if writer.is_none() {
             writer = Some(Writer::create(

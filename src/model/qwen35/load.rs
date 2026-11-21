@@ -80,6 +80,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                     down_bits: 4,
                 },
                 &options,
+                false,
                 || loader.source_stamps(),
                 |layer, expert| {
                     let result = cpu.pool.install(|| {

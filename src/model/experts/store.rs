@@ -59,6 +59,12 @@ impl Store {
         file.read_exact(&mut json)?;
         let header: Header = serde_json::from_slice(&json)?;
         ensure!(
+            header.geometry.native_version == geometry.native_version,
+            "expert cache format v{} requires rebuilding for v{}",
+            header.geometry.native_version,
+            geometry.native_version
+        );
+        ensure!(
             &header.geometry == geometry && header.sources == sources && geometry.down_bits == 4,
             "expert cache does not match checkpoint/recipe"
         );
@@ -438,6 +444,14 @@ mod tests {
         writer.write(0, 1, &vec![29; 7936])?;
         writer.finish()?;
         let store = Store::open(dir.path(), &geometry, &[], false)?;
+        let mut newer = geometry.clone();
+        newer.native_version += 1;
+        let error = Store::open(dir.path(), &newer, &[], false).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("format v1 requires rebuilding for v2")
+        );
         assert_eq!(store.read(0, 1)?.as_bytes(), vec![29; 7936]);
         assert_eq!(store.read(0, 0)?.as_bytes(), vec![17; 7936]);
         let batch = store.read_batch(0, 0, 2)?;

@@ -105,6 +105,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
                     down_bits: 4,
                 },
                 &options,
+                true,
                 || weights.source_stamps(),
                 |layer, expert| {
                     let result = cpu.pool.install(|| {

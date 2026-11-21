@@ -68,7 +68,7 @@ impl ImportBank {
 
 impl Backend {
     pub fn load_moe(&self, gate: &[QuantMatrix], down: &[QuantMatrix], top: usize) -> Result<Moe> {
-        self.load_moe_impl(gate, down, top, None)
+        self.load_moe_impl(gate, down, top, None, false)
     }
 
     pub fn load_moe_with_shared(
@@ -78,7 +78,16 @@ impl Backend {
         top: usize,
         shared: (&QuantMatrix, &QuantMatrix),
     ) -> Result<Moe> {
-        self.load_moe_impl(gate, down, top, Some(shared))
+        self.load_moe_impl(gate, down, top, Some(shared), false)
+    }
+
+    pub(crate) fn pack_moe_for_export(
+        &self,
+        gate: &[QuantMatrix],
+        down: &[QuantMatrix],
+        full_k: bool,
+    ) -> Result<Moe> {
+        self.load_moe_impl(gate, down, 1, None, full_k)
     }
 
     fn load_moe_impl(
@@ -87,6 +96,7 @@ impl Backend {
         down: &[QuantMatrix],
         top: usize,
         shared: Option<(&QuantMatrix, &QuantMatrix)>,
+        full_k: bool,
     ) -> Result<Moe> {
         ensure!(
             !gate.is_empty() && gate.len() == down.len(),
@@ -121,6 +131,8 @@ impl Backend {
         self.moe_bank((h, f, e, top, shared.is_some()), |domain, config| unsafe {
             if shared.is_some() {
                 rk_npu_moe_w4_weights_create(domain, config, experts.as_ptr())
+            } else if full_k {
+                rk_npu_moe_quant_weights_create_full_k(domain, config, experts.as_ptr())
             } else {
                 rk_npu_moe_quant_weights_create(domain, config, experts.as_ptr())
             }
