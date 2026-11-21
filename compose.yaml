@@ -1,6 +1,6 @@
 services:
   llm:
-    image: ghcr.io/happyme531/open_rknpu2_lm_infer:${RKNPU_VERSION:-0.11.0}
+    image: ghcr.io/happyme531/open_rknpu2_lm_infer:${RKNPU_VERSION:-0.12.0}
     platform: linux/arm64
     devices:
       - "${RKNPU_DEVICE:-/dev/dri/renderD129}:/dev/dri/renderD129"

@@ -2,7 +2,7 @@
 
 Use Docker Engine and the Compose plugin on an ARM64 RK3588 Linux host with the vendor `rknpu2` kernel driver, version 0.9.6 or newer. The container uses the host kernel and NPU; it cannot provide the driver or run RK3588 inference on an x86 machine.
 
-The prebuilt image is `ghcr.io/happyme531/open_rknpu2_lm_infer:0.11.0`. It contains the published ARM64 release in a `scratch` image with its dynamic loader, shared libraries, documentation, and license notices. The final image has no shell or package manager. No proprietary `librknnrt.so` is required.
+The prebuilt image is `ghcr.io/happyme531/open_rknpu2_lm_infer:0.12.0`. It contains the published ARM64 release in a `scratch` image with its dynamic loader, shared libraries, documentation, and license notices. The final image has no shell or package manager. No proprietary `librknnrt.so` is required.
 
 ## Start the API server
 
@@ -52,10 +52,10 @@ The Compose render-node mapping requires v0.11.0 or newer.
 For a local image build, the [Dockerfile](../Dockerfile) downloads the selected GitHub Release rather than compiling the checkout. Debian 12 is used only in intermediate build stages to obtain runtime libraries. A published release must provide the standard `open_rknpu2_lm_infer-vVERSION-linux-aarch64.tar.gz` asset. Build and check it without model weights or an NPU:
 
 ```sh
-docker build --platform linux/arm64 --build-arg VERSION=0.11.0 \
-  -t ghcr.io/happyme531/open_rknpu2_lm_infer:0.11.0 .
-docker run --rm --platform linux/arm64 ghcr.io/happyme531/open_rknpu2_lm_infer:0.11.0 --version
-docker run --rm --platform linux/arm64 ghcr.io/happyme531/open_rknpu2_lm_infer:0.11.0 models
+docker build --platform linux/arm64 --build-arg VERSION=0.12.0 \
+  -t ghcr.io/happyme531/open_rknpu2_lm_infer:0.12.0 .
+docker run --rm --platform linux/arm64 ghcr.io/happyme531/open_rknpu2_lm_infer:0.12.0 --version
+docker run --rm --platform linux/arm64 ghcr.io/happyme531/open_rknpu2_lm_infer:0.12.0 models
 ```
 
 An x86 build host needs ARM64 emulation for the runtime package installation and CLI checks. These checks establish image construction and executable startup; model loading, NPU ioctl permissions and inference still require an RK3588 host.

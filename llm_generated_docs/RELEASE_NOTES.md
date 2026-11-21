@@ -1,7 +1,7 @@
-# v0.11.0
+# v0.12.0
 
-- 修复调优缓存默认路径：优先使用 systemd 的 `CACHE_DIRECTORY`，缺少用户缓存目录时使用模型目录下的持久缓存；启动时显示缓存路径、命中和回退统计。
-- 显式调优时覆盖请求的输出头 batch，包括推测解码验证使用的批次；普通生成仍只准备所需的输出头形状。
-- 优化 top-p 和 min-p 截断采样，保留宽分布和边界不明确时的完整排序回退，并保持固定种子采样序列和随机数状态。
-- 改进 Qwen3-Coder 工具调用解析，以及聊天模板中 JSON 历史和数字格式与 Transformers 的兼容性。
-- 更新 NPU 算子库：改进 RKNPU DRM 设备发现和验证，修复 Attention 命令缓冲区分页及刷新问题，以及 Clang OpenMP 下的 query offset 捕获问题。
+- 跨请求复用预填充整块工作区，减少重复申请 NPU 内存。分配遇到内存压力时可回收当前 domain 的空闲工作区。可用 `RK_NPU_PREFILL_CACHE_DOMAIN_MIB` 调整保留预算，设为 `0` 可关闭跨请求保留。
+- 优化因果 GQA 预填充、Qwen3.5 的注意力输出门控和 GDN 预填充。Qwen3.5 MoE 中满足布局条件的专家使用 full-K，旧专家缓存会在首次使用时重建。
+- 优化自回归 logits 的采样路径。HTTP API 读取模型的 `generation_config.json` 作为采样默认值，请求参数可逐字段覆盖。
+- 修复 Rust 构建与原生 CMake 所选 OpenMP 运行库的链接不一致。
+- 发布 ARM64 Docker 镜像至 GHCR，提供 Compose 模板和 NPU render node 映射。镜像标签为 `0.12.0` 和 `latest`。
