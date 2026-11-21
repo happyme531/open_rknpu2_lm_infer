@@ -22,9 +22,9 @@ pub fn open(
     match Store::open(directory, &geometry, &stamps, false) {
         Ok(store) => return Ok(Arc::new(store.with_direct(options.experts.direct)?)),
         Err(error) => {
-            if !error
+            if error
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .is_none_or(|error| error.kind() != std::io::ErrorKind::NotFound)
             {
                 eprintln!(
                     "Rebuilding expert cache in {}: {error:#}",
