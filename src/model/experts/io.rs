@@ -601,6 +601,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 1,
             hidden: 64,
@@ -637,6 +638,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 1,
             hidden: 64,
@@ -672,6 +674,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 2,
             experts: 96,
             hidden: 64,
@@ -711,6 +714,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 96,
             hidden: 64,
@@ -829,6 +833,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 6,
             hidden: 64,
@@ -894,6 +899,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 2,
             experts: 4,
             hidden: 64,

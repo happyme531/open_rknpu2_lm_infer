@@ -124,7 +124,7 @@ impl Routed {
                 gate.push(g);
                 down.push(d);
             }
-            let experts = backend.load_moe(&gate, &down, m.top_k)?;
+            let experts = backend.load_moe_full_k(&gate, &down, m.top_k)?;
             drop((gate, down));
             loader.store.release_pages()?;
             Bank::Resident(experts)

@@ -150,6 +150,7 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
         };
         let geometry = Geometry {
             native_version: crate::npu::Moe::blob_version(),
+            packing_revision: super::load::EXPERT_PACKING_REVISION,
             layers: model.layers.len(),
             experts: m.experts,
             hidden: model.config.hidden_size,

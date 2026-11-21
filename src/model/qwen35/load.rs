@@ -19,6 +19,9 @@ use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::{sync::Arc, time::Instant};
 
+// Revision zero v3 caches contain only K512-sliced Qwen gate/up weights.
+pub(super) const EXPERT_PACKING_REVISION: u32 = 1;
+
 fn vector(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
     let tensor = loader.store.get(name)?;
     tensor.require_shape(&[width], name)?;
@@ -73,6 +76,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                 directory,
                 crate::model::experts::store::Geometry {
                     native_version: crate::npu::Moe::blob_version(),
+                    packing_revision: EXPERT_PACKING_REVISION,
                     layers: config.layers.len(),
                     experts: m.experts,
                     hidden: config.hidden_size,
@@ -80,7 +84,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                     down_bits: 4,
                 },
                 &options,
-                false,
                 || loader.source_stamps(),
                 |layer, expert| {
                     let result = cpu.pool.install(|| {

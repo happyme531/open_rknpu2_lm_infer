@@ -98,6 +98,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
                 directory,
                 experts::store::Geometry {
                     native_version: crate::npu::Moe::blob_version(),
+                    packing_revision: 0,
                     layers: config.layers - config.dense_layers,
                     experts: config.experts,
                     hidden: config.hidden,
@@ -105,7 +106,6 @@ pub(super) fn load(options: ModelOptions) -> Result<Ling3Tiny> {
                     down_bits: 4,
                 },
                 &options,
-                true,
                 || weights.source_stamps(),
                 |layer, expert| {
                     let result = cpu.pool.install(|| {

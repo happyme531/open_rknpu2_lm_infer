@@ -81,13 +81,13 @@ impl Backend {
         self.load_moe_impl(gate, down, top, Some(shared), false)
     }
 
-    pub(crate) fn pack_moe_for_export(
+    pub(crate) fn load_moe_full_k(
         &self,
         gate: &[QuantMatrix],
         down: &[QuantMatrix],
-        full_k: bool,
+        top: usize,
     ) -> Result<Moe> {
-        self.load_moe_impl(gate, down, 1, None, full_k)
+        self.load_moe_impl(gate, down, top, None, true)
     }
 
     fn load_moe_impl(

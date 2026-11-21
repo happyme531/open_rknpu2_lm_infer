@@ -18,11 +18,17 @@ const MAGIC: &[u8; 8] = b"RKMOE01\0";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Geometry {
     pub native_version: u32,
+    // Version the producer's packing policy independently of the native record ABI.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub packing_revision: u32,
     pub layers: usize,
     pub experts: usize,
     pub hidden: usize,
     pub intermediate: usize,
     pub down_bits: u32,
+}
+fn is_zero(revision: &u32) -> bool {
+    *revision == 0
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Header {
@@ -63,6 +69,12 @@ impl Store {
             "expert cache format v{} requires rebuilding for v{}",
             header.geometry.native_version,
             geometry.native_version
+        );
+        ensure!(
+            header.geometry.packing_revision == geometry.packing_revision,
+            "expert cache packing revision {} requires rebuilding for {}",
+            header.geometry.packing_revision,
+            geometry.packing_revision
         );
         ensure!(
             &header.geometry == geometry && header.sources == sources && geometry.down_bits == 4,
@@ -289,6 +301,7 @@ mod buffer_tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 3,
             hidden: 64,
@@ -433,6 +446,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 2,
             hidden: 64,
@@ -451,6 +465,16 @@ mod tests {
             error
                 .to_string()
                 .contains("format v1 requires rebuilding for v2")
+        );
+        let mut repacked = geometry.clone();
+        repacked.packing_revision = 1;
+        let error = Store::open(dir.path(), &repacked, &[], false)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("packing revision 0 requires rebuilding for 1")
         );
         assert_eq!(store.read(0, 1)?.as_bytes(), vec![29; 7936]);
         assert_eq!(store.read(0, 0)?.as_bytes(), vec![17; 7936]);

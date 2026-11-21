@@ -11,7 +11,6 @@ pub fn open(
     directory: &Path,
     geometry: Geometry,
     options: &ModelOptions,
-    full_k: bool,
     sources: impl Fn() -> Result<Vec<SourceStamp>>,
     mut load: impl FnMut(usize, usize) -> Result<(QuantMatrix, QuantMatrix)>,
 ) -> Result<Arc<Store>> {
@@ -44,7 +43,7 @@ pub fn open(
             gate.push(g);
             down.push(d);
         }
-        let bank = backend.pack_moe_for_export(&gate, &down, full_k)?;
+        let bank = backend.load_moe_full_k(&gate, &down, 1)?;
         drop((gate, down));
         if writer.is_none() {
             writer = Some(Writer::create(

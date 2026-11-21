@@ -637,6 +637,7 @@ mod tests {
         );
         let geometry = Geometry {
             native_version: 1,
+            packing_revision: 0,
             layers: 1,
             experts: 1,
             hidden: 64,
