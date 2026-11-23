@@ -116,12 +116,12 @@ Qwen3/Qwen3.5 PPL 于 2026-10-25 重测，使用 WikiText-2 raw test 的前 32 �
 
 | 架构(model_type) | checkpoint / 状态 |
 |---|---|
-| qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
-| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
+| qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588) |
+| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588) |
 | qwen3_5_moe (仅文本部分) / qwen3_5_moe_text |  |
-| minicpmv4_7 (仅文本部分) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT)（仅文本） |
-| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
-| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
+| minicpmv4_7 (仅文本部分) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588)（仅文本） |
+| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot-RK3588) |
+| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ-RK3588](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ-RK3588) |
 
 程序支持线性层使用w4a8或w8a8(可以混合使用)per-channel per-token对称量化的 compressed-tensors 格式的模型。因此你也可以根据以上示例模型，尝试加载其他大小的模型，试验不同的混合量化配置和量化算法。
 
@@ -140,11 +140,11 @@ sudo apt install curl jq python3-pip libgomp1 libstdc++6
 
 curl -fL "$(curl -fsSL https://api.github.com/repos/happyme531/open_rknpu2_lm_infer/releases/latest | jq -r '.assets[] | select(.name | endswith("-linux-aarch64.tar.gz")) | .browser_download_url')" | tar -xz --strip-components=1
 pip3 install 'huggingface_hub[cli]>=0.34,<1'
-hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 # 将大核CPU频率固定为最高。可选，但如果不操作会大幅影响推理速度。可能需要root权限。
 # echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 # echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
-./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot chat
+./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 chat
 ```
 
 将最后的 `chat` 换成 `serve --port 8080` 即可启动 OpenAI 兼容的 LLM API 服务。
@@ -152,7 +152,7 @@ hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W
 在 RK3588 主机上使用 Docker 部署时，克隆本仓库并使用内置的 Compose 模板：
 
 ```sh
-export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 docker compose up -d
 ```
 
@@ -165,7 +165,7 @@ docker compose up -d
 将 `MODEL` 指向包含视觉与 MTP 权重的 Qwen3.5-4B 模型目录。以下使用图文基准中的 K1 配置：
 
 ```sh
-./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p '请详细描述这张照片。'
+./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p '请详细描述这张照片。'
 ```
 
 图像按原图分辨率输入模型，除非超出了模型允许的上限。可以动态输入不同分辨率的图片，不过如果对应的视觉token数量没有调优，视觉编码器速度可能会较慢。
@@ -178,11 +178,11 @@ docker compose up -d
 # 将大核CPU频率固定为最高。强烈建议执行。
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
-./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 # 调优推测解码相关的batch，提升推测解码的速度
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,8,128
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 --batches 1,2,4,8,128
 # 使用指定输入分辨率调优视觉编码器
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 --vision --image photo.jpg
 ```
 
 首次调优可能需要数分钟，会显示进度和最佳候选耗时；之后重复运行会复用有效缓存。
@@ -199,7 +199,7 @@ Qwen3.5 MoE、MiniCPM-V 4.7 等模型支持两种专家存储模式：
 例如，使用兼容的 MiniCPM-V 4.7 量化 checkpoint：
 
 ```sh
-MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588
 EXPERT_STORE=/path/to/expert-store # 强烈建议使用m.2 pcie3.0 x4接口连接的高速硬盘
 ./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream \
   --expert-store "$EXPERT_STORE" --expert-cache-percent 8 \
@@ -229,7 +229,7 @@ Prompt 前缀复用独立于磁盘专家库和 NPU 专家缓存。服务默认�
 例如，用包含 MTP 权重的 Qwen3.5-4B 运行：
 
 ```sh
-./bin/open_rknpu2_lm_infer -m models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot \
+./bin/open_rknpu2_lm_infer -m models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
   --spec-type draft-mtp --spec-draft-n-max 1 \
   run --conversation --temp 0 -n 128 --stats -p '请介绍一下自己。'
 ```
@@ -248,7 +248,7 @@ hf download z-lab/Qwen3.5-4B-DFlash --revision 9a1996ccf887b79ab3af4fcbf8c1d1f4b
 
 ```sh
 hf download openbmb/MiniCPM-V-4.7-35B-A3B-DSpark --local-dir models/MiniCPM-V-4.7-35B-A3B-DSpark
-MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588
 EXPERT_STORE=/path/to/expert-store
 ./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream --expert-store "$EXPERT_STORE" \
   --spec-type draft-dspark --spec-draft-model models/MiniCPM-V-4.7-35B-A3B-DSpark \
@@ -308,7 +308,7 @@ cargo build --release --locked
 指定模型目录后即可使用：
 
 ```sh
-export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 
 # 单次流式生成
 target/release/open_rknpu2_lm_infer run '你好，请介绍一下自己。' --conversation -n 128

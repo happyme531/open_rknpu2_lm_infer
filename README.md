@@ -116,12 +116,12 @@ Qwen3/Qwen3.5 PPL was remeasured on 2026-10-25 using the first 32 independent 51
 
 | Architecture (`model_type`) | Checkpoint / status |
 |---|---|
-| qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot) |
-| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot) |
+| qwen3 | [Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588) |
+| qwen3_5 / qwen3_5_text | [Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588) |
 | qwen3_5_moe (text component only) / qwen3_5_moe_text |  |
-| minicpmv4_7 (text component only) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT) (text only) |
-| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot) |
-| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ) |
+| minicpmv4_7 (text component only) | [MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588](https://huggingface.co/happyme531/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588) (text only) |
+| llama | [MiniCPM5-2B-W4A8-Mixed-QQQ-Rot-RK3588](https://huggingface.co/happyme531/MiniCPM5-2B-W4A8-Mixed-QQQ-Rot-RK3588) |
+| granite | [Granite-4.2-3B-W4A8-Mixed-QQQ-SQ-RK3588](https://huggingface.co/happyme531/Granite-4.2-3B-W4A8-Mixed-QQQ-SQ-RK3588) |
 
 The engine supports models in the compressed-tensors format with W4A8 or W8A8 linear layers, including mixed configurations, using symmetric per-channel weight and per-token activation quantization. Use the models above as examples to try other model sizes, mixed quantization configurations, and quantization algorithms.
 
@@ -143,11 +143,11 @@ sudo apt install curl jq python3-pip libgomp1 libstdc++6
 
 curl -fL "$(curl -fsSL https://api.github.com/repos/happyme531/open_rknpu2_lm_infer/releases/latest | jq -r '.assets[] | select(.name | endswith("-linux-aarch64.tar.gz")) | .browser_download_url')" | tar -xz --strip-components=1
 pip3 install 'huggingface_hub[cli]>=0.34,<1'
-hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+hf download happyme531/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 --local-dir models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 # Set the big CPU cores to their maximum frequency. Optional, but skipping this can significantly reduce inference speed. Root privileges may be required.
 # echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 # echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
-./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot chat
+./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 chat
 ```
 
 Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-compatible LLM API server.
@@ -155,7 +155,7 @@ Replace `chat` in the last command with `serve --port 8080` to start an OpenAI-c
 For Docker deployment on the RK3588 host, clone this repository and use the included Compose template:
 
 ```sh
-export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_MODEL_DIR=/absolute/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 docker compose up -d
 ```
 
@@ -168,7 +168,7 @@ The template maps the NPU DRM device, preserves tuning data and exposes the API 
 Use a Qwen3.5-4B model directory containing both vision and MTP weights. The following command uses the K1 configuration from the image-text benchmark:
 
 ```sh
-./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p 'Describe this photo in detail.'
+./bin/open_rknpu2_lm_infer --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 run --spec-type draft-mtp --spec-draft-n-max 1 --image photo.jpg --temp 0 -n 128 --stats -p 'Describe this photo in detail.'
 ```
 
 Images are passed to the model at their original resolution unless they exceed the model's limits. Different resolutions are supported dynamically, but vision encoding may be slower if the corresponding number of vision tokens has not been tuned.
@@ -181,11 +181,11 @@ The default inference strategies do not deliver optimal performance. You can man
 # Set the big CPU cores to their maximum frequency. Strongly recommended.
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor
 echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
-./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 # Tune batches used by speculative decoding to improve its speed
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --batches 1,2,4,8,128
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 --batches 1,2,4,8,128
 # Tune the vision encoder for a specific input resolution
-#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot --vision --image photo.jpg
+#./bin/open_rknpu2_lm_infer tune --model models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 --vision --image photo.jpg
 ```
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
@@ -202,7 +202,7 @@ Models such as Qwen3.5 MoE and MiniCPM-V 4.7 support two expert storage modes:
 For example, with a compatible quantized MiniCPM-V 4.7 checkpoint:
 
 ```sh
-MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588
 EXPERT_STORE=/path/to/expert-store # A fast drive connected via M.2 PCIe 3.0 x4 is strongly recommended
 ./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream \
   --expert-store "$EXPERT_STORE" --expert-cache-percent 8 \
@@ -232,7 +232,7 @@ Speculative decoding is disabled by default. Select a compatible target model an
 For example, with a Qwen3.5-4B checkpoint containing MTP weights:
 
 ```sh
-./bin/open_rknpu2_lm_infer -m models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot \
+./bin/open_rknpu2_lm_infer -m models/Qwen3.5-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
   --spec-type draft-mtp --spec-draft-n-max 1 \
   run --conversation --temp 0 -n 128 --stats -p 'Please introduce yourself.'
 ```
@@ -251,7 +251,7 @@ For DSpark, reuse the MiniCPM quantized target model and expert store from above
 
 ```sh
 hf download openbmb/MiniCPM-V-4.7-35B-A3B-DSpark --local-dir models/MiniCPM-V-4.7-35B-A3B-DSpark
-MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT
+MODEL=/path/to/MiniCPM-V-4.7-35B-A3B-QQQ-W4A8-Mixed-CT-RK3588
 EXPERT_STORE=/path/to/expert-store
 ./bin/open_rknpu2_lm_infer -m "$MODEL" --expert-storage stream --expert-store "$EXPERT_STORE" \
   --spec-type draft-dspark --spec-draft-model models/MiniCPM-V-4.7-35B-A3B-DSpark \
@@ -311,7 +311,7 @@ To add Ling alongside the default model families, build with `cargo build --rele
 Set the model directory, then run:
 
 ```sh
-export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot
+export RKNPU_MODEL=/path/to/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588
 
 # Single streaming generation
 target/release/open_rknpu2_lm_infer run 'Hello, please introduce yourself.' --conversation -n 128
