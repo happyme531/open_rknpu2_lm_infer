@@ -35,9 +35,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_flags=(--latest)
+          if [[ "${GITHUB_REF_NAME%%+*}" == *-* ]]; then
+            release_flags=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
             --verify-tag --title "$GITHUB_REF_NAME" \
-            --notes-file llm_generated_docs/RELEASE_NOTES.md --latest
+            --notes-file llm_generated_docs/RELEASE_NOTES.md "${release_flags[@]}"
   container:
     name: Publish container
     needs: publish

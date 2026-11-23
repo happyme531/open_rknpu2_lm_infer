@@ -4,6 +4,8 @@ CI 在 GitHub ARM64 runner 的 Debian 11 容器中构建，使用 rust-toolchain
 
 Release CI 由 v 开头的 tag 触发，复用同一套检查和构建。tag 必须与 Cargo.toml 的版本一致；全部检查完成后发布 GitHub Release。
 
+带预发布后缀的版本（例如 `v0.13.0-rc.1`）发布为 GitHub prerelease，并使用对应的版本镜像标签。`latest` 指向最新稳定版。
+
     git tag -s v0.1.0 -m 'Release v0.1.0'
     git push origin v0.1.0
 

@@ -1,7 +1,6 @@
-# v0.12.0
+# v0.13.0-rc.1
 
-- 跨请求复用预填充整块工作区，减少重复申请 NPU 内存。分配遇到内存压力时可回收当前 domain 的空闲工作区。可用 `RK_NPU_PREFILL_CACHE_DOMAIN_MIB` 调整保留预算，设为 `0` 可关闭跨请求保留。
-- 优化因果 GQA 预填充、Qwen3.5 的注意力输出门控和 GDN 预填充。Qwen3.5 MoE 中满足布局条件的专家使用 full-K，旧专家缓存会在首次使用时重建。
-- 优化自回归 logits 的采样路径。HTTP API 读取模型的 `generation_config.json` 作为采样默认值，请求参数可逐字段覆盖。
-- 修复 Rust 构建与原生 CMake 所选 OpenMP 运行库的链接不一致。
-- 发布 ARM64 Docker 镜像至 GHCR，提供 Compose 模板和 NPU render node 映射。镜像标签为 `0.12.0` 和 `latest`。
+- OpenAI 兼容服务新增固定槽位连续批处理。`serve --parallel N` 可将多路文本请求的 decode 和分块 prefill 合并到同一个模型步。支持 Qwen3、Llama、Granite 和 Qwen3.5 系列的文本请求。
+- 每个槽位独立持有 KV、GDN 和采样状态，按 `--ctx-size` 预留 KV 容量。慢连接的输出背压按请求处理，调用端可控制请求额度。批处理要求 `--prefill-ubatches 1 --spec-type none`，前缀复用、投机解码和多模态请使用单请求模式。
+- 服务按墙钟窗口分别显示 prefill 和 decode 吞吐、缓存命中和运行槽位。启用投机解码时显示草稿提议、接受数和接受率。
+- RK3588 上验证了 Qwen3-4B 和 Qwen3.5-4B C7 的 2 槽、4 槽 logits、槽位回收，以及 C7 的真实 SSE 并发和单请求 MTP 计数。
