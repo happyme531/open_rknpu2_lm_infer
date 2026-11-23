@@ -1,5 +1,6 @@
 use crate::engine::{
     Engine, GenerationEvent, GenerationHandle, GenerationRequest, GenerationResult, Prompt,
+    QuietWindow,
 };
 use crate::sampling::SamplingParams;
 #[path = "api/request.rs"]
@@ -79,16 +80,85 @@ pub async fn serve_with_parser(
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     eprintln!("OpenAI API listening on http://{}", listener.local_addr()?);
     let shutdown_engine = engine.clone();
-    axum::serve(
+    let report_engine = engine.clone();
+    let server = axum::serve(
         listener,
         router_with_parser(engine, api_key, tool_call_parser),
     )
     .with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_engine.shutdown();
-    })
-    .await?;
+    });
+    tokio::select! {
+        result = server => result?,
+        () = log_throughput(&report_engine) => {}
+    }
     Ok(())
+}
+
+async fn log_throughput(engine: &Engine) {
+    let mut measured_at = tokio::time::Instant::now();
+    let mut previous = engine.serving_snapshot();
+    let mut was_busy = false;
+    loop {
+        tokio::time::sleep_until(measured_at + Duration::from_secs(1)).await;
+        let current = engine.serving_snapshot();
+        let now = tokio::time::Instant::now();
+        let seconds = (now - measured_at).as_secs_f64();
+        let window = current.window(previous, was_busy);
+        let tokens = window.tokens;
+        let running = current.active;
+        let slots = current.parallel;
+        let queued = current.waiting;
+        if window.prefill {
+            eprintln!(
+                "Prefill batch [{seconds:.2}s window]\n  New tokens: {} | Cached: {}\n  Input throughput: {:.1} tok/s\n  Running: {running}/{slots} | Queued: {queued}",
+                tokens.prefill,
+                tokens.cached,
+                tokens.prefill as f64 / seconds,
+            );
+        }
+        if window.decode {
+            eprintln!(
+                "Decode batch [{seconds:.2}s window]\n  Decode tokens: {} | {:.1} tok/s\n  Running: {running}/{slots} | Queued: {queued}",
+                tokens.decode,
+                tokens.decode as f64 / seconds,
+            );
+        }
+        if tokens.spec_rounds > 0 {
+            let rate = if tokens.proposed == 0 {
+                "n/a".to_owned()
+            } else {
+                format!(
+                    "{:.1}%",
+                    100.0 * tokens.accepted as f64 / tokens.proposed as f64
+                )
+            };
+            eprintln!(
+                "Speculative decode [{}]\n  Rounds: {} | Proposed drafts: {}\n  Accepted drafts: {} | Accept rate: {rate}\n  Accepted drafts/round: {:.2}",
+                current.speculation,
+                tokens.spec_rounds,
+                tokens.proposed,
+                tokens.accepted,
+                tokens.accepted as f64 / tokens.spec_rounds as f64,
+            );
+        }
+        if let Some(quiet) = window.quiet {
+            let status = match quiet {
+                QuietWindow::Idle => "Scheduler idle",
+                QuietWindow::Waiting => "Scheduler waiting",
+                QuietWindow::OutputBlocked => "Scheduler output blocked",
+                QuietWindow::NoCompletedWork => "No completed model work",
+            };
+            eprintln!(
+                "{status} [{seconds:.2}s window] | Running: {running}/{slots} | Queued: {queued} | Output blocked: {}",
+                current.blocked,
+            );
+        }
+        previous = current;
+        measured_at = now;
+        was_busy = window.busy;
+    }
 }
 
 #[derive(Debug)]
@@ -136,8 +206,14 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     }
     Ok(())
 }
-async fn health(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"status":"ok","model":state.engine.info().id}))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let (available, body) = state.engine.health();
+    let status = if available {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
 }
 async fn models(
     State(state): State<AppState>,
@@ -182,9 +258,10 @@ fn response_id(chat: bool) -> String {
     )
 }
 fn generation_error(error: anyhow::Error) -> ApiError {
-    let busy = error.downcast_ref::<crate::engine::EngineBusy>().is_some();
+    let unavailable =
+        error.is::<crate::engine::EngineBusy>() || error.is::<crate::engine::EngineUnavailable>();
     let text = error.to_string();
-    let status = if busy {
+    let status = if unavailable {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_REQUEST

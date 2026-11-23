@@ -65,8 +65,7 @@ impl Predictor {
                 )?,
                 down: Linear::floating(&backend, store, &format!("{p}.mlp.down_proj"), h, f)?,
             },
-            mixer: Mixer::Attention {
-                cache,
+            mixer: MixerWeights::Attention {
                 q_norm: vector(store, &format!("{p}.self_attn.q_norm"), c.head_dim)?,
                 k_norm: vector(store, &format!("{p}.self_attn.k_norm"), c.head_dim)?,
             },
@@ -74,6 +73,7 @@ impl Predictor {
         Ok(Self {
             backend: device,
             layer,
+            seq: LayerSeqState::Attention(cache),
             fc: Linear::floating(&backend, store, "mtp.fc", h, 2 * h)?,
             hidden_norm: vector(store, "mtp.pre_fc_norm_hidden", h)?,
             embedding_norm: vector(store, "mtp.pre_fc_norm_embedding", h)?,

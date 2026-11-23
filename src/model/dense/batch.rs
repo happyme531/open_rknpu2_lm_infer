@@ -1,7 +1,8 @@
 use super::{Layer, Timings, elapsed};
 use crate::model::{checkpoint::Tensor, cpu::Cpu, trace::Trace};
+use crate::npu::Attention;
 use anyhow::Result;
-use std::time::Instant;
+use std::{ops::Range, time::Instant};
 
 #[derive(Clone, Copy)]
 pub(super) struct Geometry {
@@ -75,10 +76,22 @@ impl Batch {
     ) {
         self.rows = tokens.len();
         self.position = position;
-        for (r, token) in tokens.iter().enumerate() {
-            tensor.row(*token as usize, &mut self.hidden[r * g.h..(r + 1) * g.h]);
+        self.embed_at(0, tokens, tensor, cpu, g);
+    }
+
+    pub fn embed_at(
+        &mut self,
+        offset: usize,
+        tokens: &[u32],
+        tensor: &Tensor,
+        cpu: &Cpu,
+        g: Geometry,
+    ) {
+        let dest = &mut self.hidden[offset * g.h..(offset + tokens.len()) * g.h];
+        for (&token, row) in tokens.iter().zip(dest.chunks_exact_mut(g.h)) {
+            tensor.row(token as usize, row);
         }
-        cpu.scale(&mut self.hidden[..self.rows * g.h], g.embedding_multiplier);
+        cpu.scale(dest, g.embedding_multiplier);
     }
     fn trace(&self, trace: &Trace, index: i32, stage: &str, values: &[f32]) -> Result<()> {
         trace.save(self.position, index, stage, values)
@@ -93,12 +106,30 @@ pub(super) struct LayerPass<'a> {
     pub geometry: Geometry,
 }
 impl LayerPass<'_> {
-    pub fn run(
+    pub fn single(
+        &self,
+        layer: &Layer,
+        cache: &Attention,
+        index: i32,
+        b: &mut Batch,
+        timings: &mut Timings,
+    ) -> Result<()> {
+        self.run(
+            layer,
+            index,
+            b,
+            timings,
+            std::iter::once((0..b.rows, b.position, cache)),
+        )
+    }
+
+    pub fn run<'a>(
         &self,
         layer: &Layer,
         index: i32,
         b: &mut Batch,
         timings: &mut Timings,
+        spans: impl Iterator<Item = (Range<usize>, usize, &'a Attention)>,
     ) -> Result<()> {
         let g = self.geometry;
         let rows = b.rows;
@@ -133,40 +164,49 @@ impl LayerPass<'_> {
             b.value[r * kv_width..(r + 1) * kv_width]
                 .copy_from_slice(&source[q_width + kv_width..]);
         }
-        self.cpu.rope(
-            &mut b.query[..rows * q_width],
-            g.qh,
-            d,
-            &layer.q_norm,
-            g.epsilon,
-            self.cosine,
-            self.sine,
-            b.position,
-        );
-        self.cpu.rope(
-            &mut b.key[..rows * kv_width],
-            g.kh,
-            d,
-            &layer.k_norm,
-            g.epsilon,
-            self.cosine,
-            self.sine,
-            b.position,
-        );
         timings.cpu += elapsed(start);
-        b.trace(self.trace, index, "query", &b.query[..rows * q_width])?;
-        b.trace(self.trace, index, "key", &b.key[..rows * kv_width])?;
-        b.trace(self.trace, index, "value", &b.value[..rows * kv_width])?;
-        start = Instant::now();
-        layer.attention.run(
-            &b.query[..rows * q_width],
-            &b.key[..rows * kv_width],
-            &b.value[..rows * kv_width],
-            &mut b.attended[..rows * q_width],
-            rows,
-            b.position,
-        )?;
-        timings.attention += elapsed(start);
+        for (range, position, cache) in spans {
+            let query = range.start * q_width..range.end * q_width;
+            let kv = range.start * kv_width..range.end * kv_width;
+            let start = Instant::now();
+            self.cpu.rope(
+                &mut b.query[query.clone()],
+                g.qh,
+                d,
+                &layer.q_norm,
+                g.epsilon,
+                self.cosine,
+                self.sine,
+                position,
+            );
+            self.cpu.rope(
+                &mut b.key[kv.clone()],
+                g.kh,
+                d,
+                &layer.k_norm,
+                g.epsilon,
+                self.cosine,
+                self.sine,
+                position,
+            );
+            timings.cpu += elapsed(start);
+            self.trace
+                .save(position, index, "query", &b.query[query.clone()])?;
+            self.trace
+                .save(position, index, "key", &b.key[kv.clone()])?;
+            self.trace
+                .save(position, index, "value", &b.value[kv.clone()])?;
+            let start = Instant::now();
+            cache.run(
+                &b.query[query.clone()],
+                &b.key[kv.clone()],
+                &b.value[kv],
+                &mut b.attended[query],
+                range.len(),
+                position,
+            )?;
+            timings.attention += elapsed(start);
+        }
         b.trace(self.trace, index, "attn", &b.attended[..rows * q_width])?;
         start = Instant::now();
         layer.o.run(

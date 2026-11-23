@@ -40,24 +40,34 @@ impl Qwen35 {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
         self.release_prefill_workspaces()?;
         let start = Instant::now();
-        let h = self.config.hidden_size;
+        let h = self.weights.config.hidden_size;
         norm::rms_norm(
             &self.work.hidden[(rows - 1) * h..rows * h],
-            &self.final_norm,
-            self.config.epsilon,
+            &self.weights.final_norm,
+            self.weights.config.epsilon,
             true,
             &mut self.work.normalized[..h],
         )?;
-        self.trace
-            .save(self.position, -1, "head_input", &self.work.normalized[..h])?;
+        self.weights.trace.save(
+            self.sequences.single().position,
+            -1,
+            "head_input",
+            &self.work.normalized[..h],
+        )?;
         self.logits.resize(self.info.vocab_size, 0.0);
-        self.head
-            .run(&self.cpu, &self.work.normalized[..h], &mut self.logits, 1)?;
+        self.weights.head.run(
+            &self.weights.cpu,
+            &self.work.normalized[..h],
+            &mut self.logits,
+            1,
+        )?;
         self.head_ms += start.elapsed().as_secs_f64() * 1000.0;
         debug_assert!(
             self.logits.iter().all(|v| v.is_finite()),
             "nonfinite Qwen3.5 logits"
         );
-        self.trace.save(self.position, -1, "logits", &self.logits)
+        self.weights
+            .trace
+            .save(self.sequences.single().position, -1, "logits", &self.logits)
     }
 }

@@ -1,14 +1,15 @@
 use super::{
     config::{Config, LayerType},
-    decoder::{Buffers, FeedForward, Layer, Mixer},
+    decoder::{Buffers, FeedForward, Layer, LayerSeqState, MixerWeights as DecoderMixer},
     head,
-    runtime::Qwen35,
+    runtime::{Qwen35, SeqState, Weights},
 };
 use crate::layers::gated_delta::{LayerState, MixerWeights};
 use crate::model::trace::Trace;
 use crate::{
     model::{
         ModelInfo, ModelOptions,
+        batch::{self, BatchConfig, SeqPool},
         checkpoint::QuantLoader,
         cpu::Cpu,
         projection::{Linear, Projection},
@@ -28,7 +29,7 @@ fn vector(loader: &QuantLoader, name: &str, width: usize) -> Result<Vec<f32>> {
     tensor.floats()
 }
 
-pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
+pub(super) fn load(options: ModelOptions, batch_config: Option<BatchConfig>) -> Result<Qwen35> {
     let start = Instant::now();
     let raw: Value = serde_json::from_slice(&std::fs::read(options.path.join("config.json"))?)?;
     crate::model::registry::require(&raw)?;
@@ -138,9 +139,21 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         config.head_dim,
         scale,
     )? as usize;
-    let mut backends = vec![Backend::new(&options, 15)?];
+    let mut device_options = options.clone();
+    if let Some(batch) = batch_config
+        && config.moe.is_some()
+    {
+        // Grouped expert GEMMs consume the combined rows. Individual mixer
+        // spans are still bounded by the configured prompt ubatch.
+        device_options.chunk = device_options.chunk.max(batch.max_rows);
+    }
+    let mut backends = vec![Backend::new(&device_options, 15)?];
     let mut reserved_bytes = 0;
     let mut pending = Vec::with_capacity(config.layers.len());
+    let slots = batch_config.map_or(1, |config| config.slots);
+    let mut mixers: Vec<Vec<LayerSeqState>> = (0..slots)
+        .map(|_| Vec::with_capacity(config.layers.len()))
+        .collect();
     for (i, kind) in config.layers.iter().enumerate() {
         let p = format!("{prefix}.layers.{i}");
         let h = config.hidden_size;
@@ -207,7 +220,13 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
             estimate += experts * h * f * 3 / 2 + experts * h * 4 + m.shared_intermediate * h * 3;
         }
         let kv = if *kind == LayerType::FullAttention {
-            kv_bytes
+            if batch_config.is_some() {
+                (kv_bytes
+                    + batch::kv_tail_budget(&options, config.num_key_value_heads, config.head_dim))
+                    * slots
+            } else {
+                kv_bytes
+            }
         } else {
             0
         };
@@ -222,14 +241,14 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         };
         ensure!(
             estimate + kv < budget,
-            "Qwen3.5 layer exceeds IOMMU domain budget"
+            "Qwen3.5 layer {i} exceeds IOMMU domain budget: weights={estimate}, KV={kv}, budget={budget}"
         );
         if reserved_bytes + estimate + kv > budget {
             ensure!(
                 backends.len() < 15,
-                "Qwen3.5 exceeds available weight domains"
+                "no IOMMU domain for Qwen3.5 layer {i}: weights={estimate}, KV={kv}, budget={budget}"
             );
-            backends.push(Backend::new(&options, 15 - backends.len() as u32)?);
+            backends.push(Backend::new(&device_options, 15 - backends.len() as u32)?);
             ensure!(
                 paging.is_none() || backends.len() < 13,
                 "no IOMMU domain for cold expert staging"
@@ -262,27 +281,39 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                     )?,
                     config.epsilon,
                 )?;
-                Mixer::Recurrent {
-                    weights,
-                    state: Box::new(LayerState::new(
+                for seq in &mut mixers {
+                    let verify = if batch_config.is_some() {
+                        1
+                    } else {
+                        8.max(options.speculation.window() + 1)
+                    };
+                    seq.push(LayerSeqState::Recurrent(Box::new(LayerState::new(
                         config.gdn,
                         config.conv_kernel,
-                        8.max(options.speculation.window() + 1),
-                    )?),
+                        verify,
+                    )?)));
                 }
+                DecoderMixer::Recurrent(weights)
             }
             LayerType::FullAttention => {
                 // Reserve all large KV ranges before loading any projection
                 // weights/plans into these domains.
-                let cache = backend.attention(
+                let (qh, kh, d) = (
                     config.num_attention_heads,
                     config.num_key_value_heads,
                     config.head_dim,
-                    scale,
-                )?;
-                cache.reserve(options.context)?;
-                Mixer::Attention {
-                    cache,
+                );
+                for (slot, seq) in mixers.iter_mut().enumerate() {
+                    let cache = if batch_config.is_some() {
+                        batch::reserve_cache(backend, slot, i, qh, kh, d, scale)?
+                    } else {
+                        let cache = backend.attention(qh, kh, d, scale)?;
+                        cache.reserve(options.context)?;
+                        cache
+                    };
+                    seq.push(LayerSeqState::Attention(cache));
+                }
+                DecoderMixer::Attention {
                     q_norm: vector(
                         &loader,
                         &format!("{p}.self_attn.q_norm.weight"),
@@ -357,7 +388,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         &embedding,
         config.tie_word_embeddings,
     )?;
-    let mut work = Buffers::new(&config, options.chunk);
+    let mut work = Buffers::new(&config, batch_config.map_or(options.chunk, |c| c.max_rows));
     if config.moe.is_none() && crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
         work.recurrent =
             crate::layers::gated_delta::Scratch::with_npu(backends.last().unwrap().clone());
@@ -368,7 +399,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         None
     };
     let secondary_work = secondary.as_ref().map(|lane| {
-        let mut work = Buffers::new(&config, options.chunk);
+        let mut work = Buffers::new(&config, batch_config.map_or(options.chunk, |c| c.max_rows));
         if crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
             work.recurrent = crate::layers::gated_delta::Scratch::with_npu(
                 lane.backend(backends.last().unwrap()),
@@ -413,33 +444,44 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
                 crate::model::SpeculativeType::None | crate::model::SpeculativeType::DraftMtp
             ),
     )?;
+    let states = mixers
+        .into_iter()
+        .map(|mixers| SeqState {
+            mixers: mixers.into(),
+            position: 0,
+            next_rope_position: 0,
+            reserved,
+        })
+        .collect();
+    let sequences = SeqPool::new(states, options.context, batch_config);
+    let logits = Vec::with_capacity(batch_config.map_or(0, |c| c.slots * info.vocab_size));
     Ok(Qwen35 {
         options,
         info,
-        config,
         loader,
-        cpu,
         backends,
-        layers: layers.into(),
-        paging,
-        embedding,
-        final_norm,
-        head,
+        weights: Weights {
+            config,
+            cpu,
+            layers: layers.into(),
+            paging,
+            embedding,
+            final_norm,
+            head,
+            trace,
+        },
         work,
         secondary,
         secondary_work,
         dual_groups: 0,
-        position: 0,
-        reserved,
-        logits: Vec::new(),
-        trace,
+        sequences,
+        logits,
         load_ms,
         forward_ms: 0.0,
         head_ms: 0.0,
         phases,
         mtp_available,
         vision: None,
-        next_rope_position: 0,
         round: None,
         mtp: None,
         features: Default::default(),

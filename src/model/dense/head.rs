@@ -4,38 +4,44 @@ use std::time::Instant;
 
 impl Dense {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
-        if !self.workspaces.is_decoding() {
+        if !self.work.workspaces.is_decoding() {
             let (workspaces, targets) = self.workspace_targets();
             workspaces.finish_prefill(targets)?;
         }
         let start = Instant::now();
-        let batch = &mut self.batches[0];
-        self.cpu.norm(
-            &batch.hidden[(rows - 1) * self.geometry.h..rows * self.geometry.h],
-            &mut batch.normalized[..self.geometry.h],
-            &self.final_norm,
-            self.geometry.epsilon,
+        let batch = &mut self.work.batches[0];
+        self.work.cpu.norm(
+            &batch.hidden[(rows - 1) * self.weights.geometry.h..rows * self.weights.geometry.h],
+            &mut batch.normalized[..self.weights.geometry.h],
+            &self.weights.final_norm,
+            self.weights.geometry.epsilon,
         );
-        self.trace(
+        self.weights.trace.save(
+            self.sequences.single().position,
             -1,
             "head_input",
-            &self.batches[0].normalized[..self.geometry.h],
+            &self.work.batches[0].normalized[..self.weights.geometry.h],
         )?;
-        self.head.run(
-            &self.cpu,
-            &self.batches[0].normalized[..self.geometry.h],
-            &mut self.logits,
+        self.weights.head.run(
+            &self.work.cpu,
+            &self.work.batches[0].normalized[..self.weights.geometry.h],
+            &mut self.work.logits,
             1,
         )?;
-        if self.logits_scaling != 1.0 {
-            for value in &mut self.logits {
-                *value /= self.logits_scaling;
+        if self.weights.logits_scaling != 1.0 {
+            for value in &mut self.work.logits {
+                *value /= self.weights.logits_scaling;
             }
         }
-        self.timings.head += elapsed(start);
-        self.trace(-1, "logits", &self.logits)?;
+        self.work.timings.head += elapsed(start);
+        self.weights.trace.save(
+            self.sequences.single().position,
+            -1,
+            "logits",
+            &self.work.logits,
+        )?;
         debug_assert!(
-            self.logits.iter().all(|f| f.is_finite()),
+            self.work.logits.iter().all(|f| f.is_finite()),
             "nonfinite logits"
         );
         Ok(())

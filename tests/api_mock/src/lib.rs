@@ -30,6 +30,16 @@ mod engine {
             }
         }
         pub fn shutdown(&self) {}
+        pub(crate) fn serving_snapshot(&self) -> ServingSnapshot {
+            ServingSnapshot::default()
+        }
+        pub fn health(&self) -> (bool, serde_json::Value) {
+            (
+                true,
+                serde_json::json!({"status": "ok", "model": self.info().id, "parallel": 1,
+                "active": 0, "waiting": 0, "blocked": 0}),
+            )
+        }
         pub fn prompt_opens_thinking(&self, _: &Prompt) -> anyhow::Result<bool> {
             Ok(false)
         }

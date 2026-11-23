@@ -1,10 +1,10 @@
 //! Latest-value inference status, independent of the generated text stream.
-use crate::model::ModelOptions;
+use crate::{engine::ServingTokens, model::ModelOptions};
 use std::{
     cell::Cell,
     collections::VecDeque,
     sync::{
-        OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -164,6 +164,8 @@ pub(crate) struct Reporter {
     phase_start: Instant,
     published: Instant,
     recent: VecDeque<(Instant, usize, f64)>,
+    token_counts: Option<Arc<Mutex<ServingTokens>>>,
+    prefilled: usize,
 }
 impl Default for Reporter {
     fn default() -> Self {
@@ -181,7 +183,13 @@ impl Reporter {
             phase_start: Instant::now(),
             published: Instant::now(),
             recent: VecDeque::new(),
+            token_counts: None,
+            prefilled: 0,
         }
+    }
+    pub fn with_token_counts(mut self, counts: Arc<Mutex<ServingTokens>>) -> Self {
+        self.token_counts = Some(counts);
+        self
     }
     pub fn phase(&mut self, phase: Phase) {
         self.state.phase = phase;
@@ -197,6 +205,7 @@ impl Reporter {
             ..Default::default()
         };
         self.recent.clear();
+        self.prefilled = 0;
         self.phase(Phase::Preparing);
     }
     pub fn model(&mut self, update: ModelProgress) {
@@ -204,6 +213,16 @@ impl Reporter {
             ModelProgress::Vision { completed, total } => (Phase::Vision, completed, total),
             ModelProgress::Prefill { completed, total } => (Phase::Prefill, completed, total),
         };
+        if phase == Phase::Prefill && completed > self.prefilled {
+            if let Some(counts) = &self.token_counts {
+                let mut counts = counts.lock().unwrap();
+                if self.prefilled == 0 {
+                    counts.cached += self.state.cached_tokens as u64;
+                }
+                counts.prefill += (completed - self.prefilled) as u64;
+            }
+            self.prefilled = completed;
+        }
         let changed = self.state.phase != phase;
         if changed {
             self.phase_start = Instant::now();
@@ -229,6 +248,14 @@ impl Reporter {
             value.tokens_per_second = rate(value.consumed - tokens, value.model_ms - ms);
         }
         value.average_tokens_per_second = rate(value.consumed, value.model_ms);
+        if let Some(counts) = &self.token_counts {
+            let mut counts = counts.lock().unwrap();
+            let previous = &self.state.decode;
+            counts.decode += (value.consumed - previous.consumed) as u64;
+            counts.spec_rounds += (value.rounds - previous.rounds) as u64;
+            counts.proposed += (value.proposed - previous.proposed) as u64;
+            counts.accepted += (value.accepted - previous.accepted) as u64;
+        }
         self.recent.push_back((now, value.consumed, value.model_ms));
         self.state.decode = value;
         self.state.elapsed_ms = self.phase_start.elapsed().as_secs_f64() * 1000.;
@@ -444,11 +471,16 @@ mod tests {
     #[test]
     fn progress_does_not_need_a_consumer_and_final_rates_match_complete_calls() {
         let (tx, rx) = watch::channel(GenerationProgress::default());
-        let mut reporter = Reporter::new(tx, "draft-mtp");
+        let counts = Arc::new(Mutex::new(ServingTokens::default()));
+        let mut reporter = Reporter::new(tx, "draft-mtp").with_token_counts(counts.clone());
         reporter.begin(100);
         reporter.state.cached_tokens = 40;
         reporter.model(ModelProgress::Prefill {
             completed: 0,
+            total: 60,
+        });
+        reporter.model(ModelProgress::Prefill {
+            completed: 32,
             total: 60,
         });
         reporter.model(ModelProgress::Prefill {
@@ -474,6 +506,12 @@ mod tests {
         reporter.phase(Phase::Finished);
         assert_eq!(rx.borrow().decode.average_tokens_per_second, Some(10.));
         assert!(rx.borrow().lines()[1].contains("50.0%"));
+        let first = *counts.lock().unwrap();
+        assert_eq!((first.prefill, first.cached, first.decode), (60, 40, 4));
+        assert_eq!(
+            (first.spec_rounds, first.proposed, first.accepted),
+            (2, 6, 3)
+        );
         reporter.begin(20);
         assert_eq!(
             (
@@ -481,6 +519,23 @@ mod tests {
                 reporter.state.cached_tokens
             ),
             (0, 0)
+        );
+        reporter.model(ModelProgress::Prefill {
+            completed: 20,
+            total: 20,
+        });
+        reporter.decoding();
+        reporter.decode(DecodeProgress {
+            generated: 2,
+            consumed: 1,
+            ..Default::default()
+        });
+        let totals = *counts.lock().unwrap();
+        let second = totals.since(first);
+        assert_eq!((second.prefill, second.cached, second.decode), (20, 0, 1));
+        assert_eq!(
+            (second.spec_rounds, second.proposed, second.accepted),
+            (0, 0, 0)
         );
     }
     #[test]

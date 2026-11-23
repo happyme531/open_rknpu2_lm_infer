@@ -3,10 +3,12 @@ use crate::{model::ModelOptions, validation::BoardLock};
 use std::path::PathBuf;
 
 fn snapshot(m: &Qwen35) -> Vec<f32> {
-    m.layers
+    m.sequences
+        .single()
+        .mixers
         .iter()
-        .flat_map(|l| match &l.mixer {
-            Mixer::Recurrent { state, .. } => state
+        .flat_map(|l| match &*l {
+            LayerSeqState::Recurrent(state) => state
                 .canonical()
                 .iter()
                 .chain(state.convolution())
@@ -80,11 +82,11 @@ fn complete_target_commit_abort_and_next_output() -> Result<()> {
     let tokens = [21, 3, 7, 100, 2, 25, 20, 6];
     if let Some(root) = std::env::var_os("RKNPU_MTP_TRACE") {
         let root = PathBuf::from(root);
-        m.trace = crate::model::trace::Trace::in_directory(root.join("serial"))?;
+        m.weights.trace = crate::model::trace::Trace::in_directory(root.join("serial"))?;
         m.forward(&prompt)?;
         let expected = m.forward(&tokens[..1])?.to_vec();
         m.reset()?;
-        m.trace = crate::model::trace::Trace::in_directory(root.join("verify"))?;
+        m.weights.trace = crate::model::trace::Trace::in_directory(root.join("verify"))?;
         m.forward(&prompt)?;
         let actual = m.verify_tokens(&tokens, &cancel)?.to_vec();
         near(&expected, &actual[..m.info.vocab_size]);

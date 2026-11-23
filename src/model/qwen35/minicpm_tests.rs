@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 fn logits(model: &mut Qwen35, prefix: &[u32], batch: usize, trace: &str) -> Result<Vec<f32>> {
     if let Ok(directory) = std::env::var("MINICPM_TEST_TRACE") {
-        model.trace =
+        model.weights.trace =
             crate::model::trace::Trace::in_directory(PathBuf::from(directory).join(trace))?
                 .at_position(if batch == 1 { prefix.len() - 1 } else { 0 });
     }
@@ -134,7 +134,7 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
     println!("GDN comparison: {report}");
     if let Ok(directory) = std::env::var("MINICPM_TEST_TRACE") {
         report["trace_differences"] =
-            trace_differences(std::path::Path::new(&directory), model.layers.len())?;
+            trace_differences(std::path::Path::new(&directory), model.weights.layers.len())?;
     }
     if let Ok(path) = std::env::var("MINICPM_TEST_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
@@ -142,8 +142,13 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
     if let Ok(directory) = std::env::var("MINICPM_TEST_STORE") {
         let directory = PathBuf::from(directory);
         let _writer_lock = store::lock(&directory)?;
-        let m = model.config.moe.as_ref().context("expected MoE model")?;
-        let layer = model.layers.iter().next().unwrap();
+        let m = model
+            .weights
+            .config
+            .moe
+            .as_ref()
+            .context("expected MoE model")?;
+        let layer = model.weights.layers.iter().next().unwrap();
         let first = match &layer.ffn {
             FeedForward::Routed(m) => m,
             _ => anyhow::bail!("expected routed layer"),
@@ -151,10 +156,10 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
         let geometry = Geometry {
             native_version: crate::npu::Moe::blob_version(),
             packing_revision: super::load::EXPERT_PACKING_REVISION,
-            layers: model.layers.len(),
+            layers: model.weights.layers.len(),
             experts: m.experts,
-            hidden: model.config.hidden_size,
-            intermediate: model.config.intermediate_size,
+            hidden: model.weights.config.hidden_size,
+            intermediate: model.weights.config.intermediate_size,
             down_bits: 4,
         };
         ensure!(
@@ -168,7 +173,7 @@ fn minicpm_gdn_batch_reference_and_expert_export() -> Result<()> {
                 stamps.clone(),
                 first.export(0)?.len(),
             )?;
-            for (layer, entry) in model.layers.iter().enumerate() {
+            for (layer, entry) in model.weights.layers.iter().enumerate() {
                 let FeedForward::Routed(routed) = &entry.ffn else {
                     anyhow::bail!("expected routed layer")
                 };

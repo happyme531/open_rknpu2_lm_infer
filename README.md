@@ -21,6 +21,7 @@
 - 🎯 **Better accuracy than the vendor SDK**: Advanced quantization algorithms reduce WikiText-2 perplexity by 2.17% for Qwen3-4B and 2.28% for MiniCPM5-2B compared with rknn-llm W8A8.
 - 🔓 **Fully open source**: Built on our high-performance, open-source RKNPU2 operator library, [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/). The entire inference pipeline runs without proprietary vendor libraries, so you can study it, optimize it, and add support for new models.
 - 📦 **Mixed W4/W8 quantization**: A mix of 4-bit and 8-bit weights with dynamic 8-bit activations uses less memory than the vendor's W8A8 quantization. Weights are loaded on demand through mmap; Qwen3-4B reaches a peak RSS of approximately 3.9 GiB with a 4K context.
+- 🔀 **Multi-request concurrency**: Continuous batching and chunked prefill let the server combine work from concurrent text requests in one model step.
 - 🧠 **MoE with lower memory use**: Compatible MoE models can keep experts resident or stream packed expert weights from disk, with per-layer NPU caching and prefetching.
 - ⚡ **Speculative decoding**: Generate candidate tokens with Qwen3.5 MTP or a matching DFlash/DSpark draft model, then verify them with the target model.
 - 🧩 **Ready to use**: A single binary provides a CLI, a terminal chat TUI, and an OpenAI-compatible API, with support for streaming, thinking, function calling, and prefix caching.
@@ -218,6 +219,24 @@ Streaming mode requires `--expert-store`. The first startup prepares packed NPU 
 Prompt prefix reuse is independent of the disk expert store and NPU expert cache. The server enables prefix caching by default. Disable it server-wide with `serve --no-cache-prompt`, or for an individual OpenAI-compatible request with `extra_body={"cache_prompt": False}`. The number of reused tokens is returned in `usage.prompt_tokens_details.cached_tokens`.
 
 For models with SSM layers, `--ctx-checkpoints` sets the maximum number of state checkpoints (default: 32), and `--checkpoint-min-step` sets their minimum spacing (default: 8192 tokens). `--ctx-checkpoints 0` disables these state checkpoints while leaving the server's prompt cache enabled.
+
+### Continuous Batching
+
+In the OpenAI-compatible API server, use `serve --parallel N` (or `-np N`, with `N > 1`) to enable fixed-slot continuous batching. Prefill and decode tokens from multiple concurrent requests are merged into the same NPU forward step to improve multi-client throughput:
+
+```sh
+./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
+  --ctx-size 4096 --parallel 4 serve --port 8080
+```
+
+You can combine the same options with `--tune-cache` to pre-tune the reachable batch buckets for that configuration:
+
+```sh
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
+  --ctx-size 4096 --parallel 4
+```
+
+Continuous batching supports text requests for `qwen3`, `llama`, `granite`, `qwen3_5`, and `qwen3_5_moe` models. It requires `--prefill-ubatches 1` and `--spec-type none` and reserves `--ctx-size` tokens of KV capacity per slot. Use single-request mode for prompt prefix reuse. Concurrent callers can enforce their own request limits.
 
 ### Speculative Decoding
 

@@ -92,7 +92,7 @@ impl Qwen35 {
             "draft checkpoint architecture does not match spec-type"
         );
         ensure!(
-            draft.config.hidden_size == self.config.hidden_size
+            draft.config.hidden_size == self.weights.config.hidden_size
                 && draft.config.vocab_size == self.info.vocab_size,
             "DFlash target hidden size or vocabulary mismatch"
         );
@@ -134,15 +134,17 @@ impl Qwen35 {
         let mut tokens = vec![mask; drafts + offset];
         tokens[0] = anchor;
         let embeddings = self.token_embeddings(&tokens)?;
-        self.phases.context(self.position, drafts, -1, false);
+        self.phases
+            .context(self.sequences.single().position, drafts, -1, false);
         let network_start = Instant::now();
-        let hidden =
-            self.dflash
-                .as_mut()
-                .unwrap()
-                .draft(&[], &embeddings, self.position, cancel)?;
+        let hidden = self.dflash.as_mut().unwrap().draft(
+            &[],
+            &embeddings,
+            self.sequences.single().position,
+            cancel,
+        )?;
         self.phases.span("draft network", network_start);
-        let h = self.config.hidden_size;
+        let h = self.weights.config.hidden_size;
         let head_start = Instant::now();
         let logits = self.project_hidden(&hidden[offset * h..], drafts)?;
         self.phases.span("draft shared head", head_start);
@@ -153,10 +155,17 @@ impl Qwen35 {
             self.position() == 0 && self.round.is_none(),
             "configure target features before prefill"
         );
-        self.features
-            .configure(layers, self.config.hidden_size, self.layers.len())?;
+        self.features.configure(
+            layers,
+            self.weights.config.hidden_size,
+            self.weights.layers.len(),
+        )?;
         if let Some(features) = &mut self.secondary_features {
-            features.configure(layers, self.config.hidden_size, self.layers.len())?;
+            features.configure(
+                layers,
+                self.weights.config.hidden_size,
+                self.weights.layers.len(),
+            )?;
         }
         Ok(())
     }
@@ -170,10 +179,10 @@ impl Qwen35 {
             tokens.iter().all(|&t| (t as usize) < self.info.vocab_size),
             "draft token outside target vocabulary"
         );
-        let h = self.config.hidden_size;
+        let h = self.weights.config.hidden_size;
         let mut values = vec![0.; tokens.len() * h];
         for (&token, row) in tokens.iter().zip(values.chunks_mut(h)) {
-            self.embedding.row(token as usize, row);
+            self.weights.embedding.row(token as usize, row);
         }
         Ok(values)
     }
@@ -186,7 +195,9 @@ impl Qwen35 {
         );
         let start = Instant::now();
         let mut logits = vec![0.; rows * self.info.vocab_size];
-        self.head.run(&self.cpu, hidden, &mut logits, rows)?;
+        self.weights
+            .head
+            .run(&self.weights.cpu, hidden, &mut logits, rows)?;
         self.head_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(logits)
     }

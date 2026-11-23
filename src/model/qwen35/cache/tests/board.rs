@@ -9,10 +9,12 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 
 fn state(model: &Qwen35) -> Vec<f32> {
     model
-        .layers
+        .sequences
+        .single()
+        .mixers
         .iter()
-        .flat_map(|l| match &l.mixer {
-            Mixer::Recurrent { state, .. } => state
+        .flat_map(|l| match &*l {
+            LayerSeqState::Recurrent(state) => state
                 .canonical()
                 .iter()
                 .chain(state.convolution())
@@ -101,7 +103,7 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     );
     let cancel = AtomicBool::new(false);
     let prepared = model.prepare_prepared(&input, 0)?;
-    if model.paging.is_some() && model.mtp.is_none() {
+    if model.weights.paging.is_some() && model.mtp.is_none() {
         assert!(
             prepared
                 .steps
@@ -122,7 +124,7 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         input.tokens.len()
     );
     let expected_state = state(&model);
-    let rope = model.next_rope_position;
+    let rope = model.sequences.single().next_rope_position;
     let draft = |model: &mut Qwen35| -> Result<Vec<f32>> {
         match kind {
             SpeculativeType::DraftDflash => Ok(model.draft_block_logits(42, 3, &cancel)?.unwrap()),
@@ -138,7 +140,7 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     let prepared = model.prepare_prepared(&input, restored)?;
     exact(model.forward_prepared(prepared, &cancel)?, &expected);
     exact(&state(&model), &expected_state);
-    assert_eq!(model.next_rope_position, rope);
+    assert_eq!(model.sequences.single().next_rope_position, rope);
     exact(&draft(&mut model)?, &expected_draft);
     model.abort_verification()?;
 

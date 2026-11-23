@@ -4,7 +4,7 @@ use super::{
 };
 use crate::model::trace::Trace;
 use crate::{
-    layers::gated_delta::{LayerState, MixerWeights, Scratch},
+    layers::gated_delta::{LayerState, MixerWeights as GdnWeights, Scratch},
     ops::norm,
 };
 use crate::{
@@ -16,7 +16,16 @@ use crate::{
 };
 use anyhow::Result;
 
+use std::ops::{DerefMut, Range};
+
 mod mixers;
+
+pub(super) struct MixerSpan<'a, S> {
+    pub state: S,
+    pub rows: Range<usize>,
+    pub position: usize,
+    pub rope: &'a [[usize; 3]],
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Execution<'a> {
@@ -30,16 +39,14 @@ pub(super) struct Execution<'a> {
     pub verify: bool,
 }
 
-pub(super) enum Mixer {
-    Recurrent {
-        weights: MixerWeights,
-        state: Box<LayerState>,
-    },
-    Attention {
-        cache: Attention,
-        q_norm: Vec<f32>,
-        k_norm: Vec<f32>,
-    },
+pub(super) enum MixerWeights {
+    Recurrent(GdnWeights),
+    Attention { q_norm: Vec<f32>, k_norm: Vec<f32> },
+}
+
+pub(super) enum LayerSeqState {
+    Recurrent(Box<LayerState>),
+    Attention(Attention),
 }
 
 pub(super) struct Layer {
@@ -48,7 +55,7 @@ pub(super) struct Layer {
     pub inputs: Projection,
     pub output: Linear,
     pub ffn: FeedForward,
-    pub mixer: Mixer,
+    pub mixer: MixerWeights,
 }
 
 pub(super) enum FeedForward {
@@ -126,20 +133,54 @@ impl Buffers {
 impl Layer {
     pub fn forward(
         &mut self,
+        state: &mut LayerSeqState,
         w: &mut Buffers,
         e: &Execution<'_>,
         timings: &mut Timings,
         paging: Option<&crate::model::experts::paged::Paging>,
     ) -> Result<()> {
-        self.mix(w, e, timings)?;
+        self.mix(state, w, e, timings)?;
         self.feed_forward(w, e, timings, paging)
     }
 
     pub(super) fn mix(
         &mut self,
+        state: &mut LayerSeqState,
         w: &mut Buffers,
         e: &Execution<'_>,
         timings: &mut Timings,
+    ) -> Result<()> {
+        self.mix_spans(
+            w,
+            e,
+            timings,
+            std::iter::once(MixerSpan {
+                state,
+                rows: 0..e.rows,
+                position: e.position,
+                rope: e.rope_positions,
+            }),
+        )
+    }
+
+    pub(super) fn forward_spans<'a, S: DerefMut<Target = LayerSeqState>>(
+        &mut self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+        paging: Option<&crate::model::experts::paged::Paging>,
+        spans: impl Iterator<Item = MixerSpan<'a, S>>,
+    ) -> Result<()> {
+        self.mix_spans(w, e, timings, spans)?;
+        self.feed_forward(w, e, timings, paging)
+    }
+
+    fn mix_spans<'a, S: DerefMut<Target = LayerSeqState>>(
+        &self,
+        w: &mut Buffers,
+        e: &Execution<'_>,
+        timings: &mut Timings,
+        spans: impl Iterator<Item = MixerSpan<'a, S>>,
     ) -> Result<()> {
         let Execution {
             config: c,
@@ -162,7 +203,7 @@ impl Layer {
             )
         })?;
         trace.save(position, index, "input", &w.normalized[..rows * h])?;
-        let attended_width = self.mixer.forward(&self.inputs, w, e, timings)?;
+        let attended_width = self.mixer.forward(&self.inputs, w, e, timings, spans)?;
         trace.save(
             position,
             index,

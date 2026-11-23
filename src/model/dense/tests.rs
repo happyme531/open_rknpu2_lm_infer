@@ -79,7 +79,10 @@ fn paired_prefill_matches_serial_logits_and_cache() -> Result<()> {
                         &format!("history={history}, prompt={prompt}, step={step}"),
                     )?;
                 }
-                ensure!(model.dual_groups > 0, "paired prefill was not exercised");
+                ensure!(
+                    model.work.dual_groups > 0,
+                    "paired prefill was not exercised"
+                );
             }
         }
         eprintln!(

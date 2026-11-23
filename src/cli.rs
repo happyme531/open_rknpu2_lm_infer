@@ -6,7 +6,7 @@ use crate::{
     sampling::{DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, DraftSampling, SamplingParams},
     text::TextCodec,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
     io::{self, Read},
@@ -30,6 +30,13 @@ pub struct Cli {
 #[derive(Args)]
 pub struct ModelArgs {
     #[arg(
+        long,
+        global = true,
+        default_value_t = 1,
+        help = "Fixed sequence slots for serve and tune; 1 uses the single-request engine; also accepts -np"
+    )]
+    pub parallel: usize,
+    #[arg(
         short = 'm',
         long,
         global = true,
@@ -51,7 +58,7 @@ pub struct ModelArgs {
         global = true,
         env = "LLAMA_ARG_UBATCH",
         default_value_t = 128,
-        help = "Physical prefill batch size; also accepts -ub"
+        help = "Physical prefill batch size and total token limit per continuous batching step; also accepts -ub"
     )]
     pub chunk: usize,
     #[arg(long, global = true, default_value_t = 1, value_parser = parse_prefill_ubatches,
@@ -206,6 +213,24 @@ fn parse_u32(s: &str) -> std::result::Result<u32, String> {
 }
 impl ModelArgs {
     fn validate_command(&self, command: &Command) -> Result<()> {
+        ensure!(self.parallel > 0, "parallel must be positive");
+        if self.parallel > 1 {
+            ensure!(
+                matches!(
+                    command,
+                    Command::Serve { .. } | Command::Tune { vision: false, .. }
+                ),
+                "parallel inference is available for serve and text tuning"
+            );
+            ensure!(
+                self.prefill_ubatches == 1 && self.spec_type == SpeculativeType::None,
+                "parallel inference requires prefill-ubatches=1 and spec-type=none"
+            );
+            ensure!(
+                self.parallel <= self.chunk && self.chunk <= 256,
+                "parallel must be <= ubatch-size <= 256"
+            );
+        }
         if self.spec_type == SpeculativeType::DraftMtp
             && self.spec_draft_n_max > 0
             && matches!(command, Command::Tune { .. })
@@ -484,6 +509,8 @@ fn llama_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ff
             }
             if !positional && arg == "-pg" {
                 "--n-prompt-gen".into()
+            } else if !positional && arg == "-np" {
+                "--parallel".into()
             } else if !positional && arg == "-ub" {
                 "--ubatch-size".into()
             } else if !positional && arg == "-ctxcp" {
@@ -643,6 +670,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
     } else {
         None
     };
+    let batch = (model_args.parallel > 1).then_some(crate::model::batch::BatchConfig {
+        slots: model_args.parallel,
+        max_rows: model_args.chunk,
+    });
     let options = model_args.options()?;
     match cli.command {
         Command::Models => unreachable!("handled before model options"),
@@ -776,7 +807,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
             tool_call_parser,
             ..
         } => {
-            let engine = Engine::start_with_cache_prompt(options, cache_prompt)?;
+            let engine = if let Some(batch) = batch {
+                Engine::start_batch(options, batch)?
+            } else {
+                Engine::start_with_cache_prompt(options, cache_prompt)?
+            };
             let mut progress = engine.subscribe_progress();
             let display = tokio::spawn(async move {
                 let mut display = crate::progress::TerminalProgress::new(false);
@@ -806,7 +841,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             batches,
             report,
         } => {
-            tune::run(options, vision, images, batches, report)?;
+            tune::run(options, vision, images, batches, report, batch)?;
         }
         Command::Eval {
             tokens_file,
@@ -1269,6 +1304,47 @@ mod tests {
             assert!(
                 Cli::try_parse_from(["infer", "-m", "model", "run", "--prefill-ubatches", value])
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_service_and_text_tuning_check_incompatible_options() {
+        for (subcommand, parallel) in [("serve", "-np"), ("tune", "--parallel")] {
+            let cli = parse(&["infer", subcommand, parallel, "4", "--ubatch-size", "32"]);
+            assert_eq!(cli.model.parallel, 4);
+            assert_eq!(cli.model.chunk, 32);
+            assert!(cli.model.validate_command(&cli.command).is_ok());
+        }
+        for args in [
+            vec!["infer", "serve", "--parallel", "0"],
+            vec!["infer", "serve", "-np", "4", "-ub", "2"],
+            vec!["infer", "tune", "-np", "4", "-ub", "257"],
+            vec![
+                "infer",
+                "serve",
+                "--parallel",
+                "2",
+                "--prefill-ubatches",
+                "2",
+            ],
+            vec![
+                "infer",
+                "serve",
+                "--parallel",
+                "2",
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "0",
+            ],
+            vec!["infer", "run", "--parallel", "2"],
+            vec!["infer", "tune", "--vision", "--parallel", "2"],
+        ] {
+            let cli = parse(&args);
+            assert!(
+                cli.model.validate_command(&cli.command).is_err(),
+                "{args:?}"
             );
         }
     }

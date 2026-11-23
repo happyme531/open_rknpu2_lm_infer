@@ -31,7 +31,7 @@ impl Qwen35 {
             "Qwen3.5 verification transaction is active"
         );
         ensure!(
-            start == self.position
+            start == self.sequences.single().position
                 && start < input.tokens.len()
                 && input.positions.len() == input.tokens.len(),
             "prepared input position mismatch"
@@ -70,13 +70,13 @@ impl Qwen35 {
                         Some(cancel),
                     )?);
                 }
-                let feature =
-                    self.vision
-                        .as_mut()
-                        .unwrap()
-                        .encode(&span.image, &self.cpu.pool, cancel)?;
+                let feature = self.vision.as_mut().unwrap().encode(
+                    &span.image,
+                    &self.weights.cpu.pool,
+                    cancel,
+                )?;
                 ensure!(
-                    feature.len() == span.image.tokens() * self.config.hidden_size,
+                    feature.len() == span.image.tokens() * self.weights.config.hidden_size,
                     "vision/text hidden size mismatch"
                 );
                 features.push((span.start, feature));
@@ -108,7 +108,7 @@ impl Qwen35 {
                     );
                 }
                 crate::progress::prefill_shape(group[0].range.len() != self.options.chunk, || {
-                    if self.paging.is_some() {
+                    if self.weights.paging.is_some() {
                         self.prompt_chunk(inputs[0].0, Some(cancel), inputs[0].1)
                     } else {
                         self.execute(&inputs[..group.len()], Some(cancel), false)
@@ -124,7 +124,7 @@ impl Qwen35 {
                 }
             }
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
-            self.next_rope_position = input.next_position;
+            self.sequences.single_mut().next_rope_position = input.next_position;
             self.output_head(rows)?;
             if let Some(progress) = progress.as_mut() {
                 let total = input.tokens.len() - start;

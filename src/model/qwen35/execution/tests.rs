@@ -9,10 +9,12 @@ use clap::Parser;
 
 fn state(model: &Qwen35) -> Vec<f32> {
     model
-        .layers
+        .sequences
+        .single()
+        .mixers
         .iter()
-        .flat_map(|layer| match &layer.mixer {
-            crate::model::qwen35::decoder::Mixer::Recurrent { state, .. } => state
+        .flat_map(|layer| match &*layer {
+            crate::model::qwen35::decoder::LayerSeqState::Recurrent(state) => state
                 .canonical()
                 .iter()
                 .chain(state.convolution())
@@ -57,7 +59,7 @@ fn paired_prefill_preserves_recurrence_features_and_decode() -> Result<()> {
     if mtp {
         model.enable_mtp(3)?;
     }
-    model.capture_features(&[0, model.layers.len() - 1])?;
+    model.capture_features(&[0, model.weights.layers.len() - 1])?;
     model.reserve(1536)?;
     model.prepare(128)?;
     let tokens: Vec<u32> = (1000..2536).collect();
@@ -102,7 +104,7 @@ fn paired_prefill_preserves_recurrence_features_and_decode() -> Result<()> {
         );
     }
     let positions: Vec<_> = (0..257).map(|p| [p, p / 2, p / 3]).collect();
-    let h = model.config.hidden_size;
+    let h = model.weights.config.hidden_size;
     let features = [(120, std::sync::Arc::<[f32]>::from(vec![0.125; 16 * h]))];
     let mut expected = Vec::new();
     for lanes in [1, 2] {

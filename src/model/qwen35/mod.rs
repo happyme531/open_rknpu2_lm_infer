@@ -15,6 +15,7 @@ mod prefill;
 mod rope;
 mod runtime;
 mod stats;
+mod step;
 mod timings;
 mod transaction;
 pub mod vision;

@@ -69,14 +69,15 @@ impl Qwen35 {
         let start = Instant::now();
         let (tokens, prepared) = inputs[0];
         let rows = tokens.len();
-        let position = self.position;
+        let position = self.sequences.single().position;
+        let rope_start = self.sequences.single().next_rope_position;
         let rope = self.phases.measure(Phase::Cpu, || {
             embed(
-                &self.embedding,
+                &self.weights.embedding,
                 &mut self.work,
                 tokens,
                 position,
-                self.next_rope_position,
+                rope_start,
                 prepared,
             )
         })?;
@@ -84,18 +85,19 @@ impl Qwen35 {
             .mtp
             .as_ref()
             .filter(|_| !verify)
-            .map(|_| self.work.hidden[..rows * self.config.hidden_size].to_vec());
+            .map(|_| self.work.hidden[..rows * self.weights.config.hidden_size].to_vec());
         self.features.begin(rows);
         let mut other_timings = Timings::default();
         let mut other_rope = Cow::Borrowed(&[][..]);
         let mut other_embeddings = None;
+        let mixers = &mut self.sequences.single_mut().mixers;
         let execution = Execution {
-            config: &self.config,
-            cpu: &self.cpu,
+            config: &self.weights.config,
+            cpu: &self.weights.cpu,
             rows,
             position,
             index: 0,
-            trace: &self.trace,
+            trace: &self.weights.trace,
             rope_positions: &rope,
             verify,
         };
@@ -104,18 +106,18 @@ impl Qwen35 {
             let work = self.secondary_work.as_mut().expect("prepared second lane");
             other_rope = self.phases.measure(Phase::Cpu, || {
                 embed(
-                    &self.embedding,
+                    &self.weights.embedding,
                     work,
                     tokens,
                     position + rows,
-                    self.next_rope_position + rows,
+                    rope_start + rows,
                     prepared,
                 )
             })?;
             other_embeddings = self
                 .mtp
                 .as_ref()
-                .map(|_| work.hidden[..tokens.len() * self.config.hidden_size].to_vec());
+                .map(|_| work.hidden[..tokens.len() * self.weights.config.hidden_size].to_vec());
             let other_features = self
                 .secondary_features
                 .as_mut()
@@ -132,10 +134,11 @@ impl Qwen35 {
             let features = &mut self.features;
             let timings = &mut self.phases;
             pipeline::run(
-                &self.layers,
+                &self.weights.layers,
                 cancelled,
                 |i, layer| {
                     layer.forward(
+                        &mut mixers.lock(i),
                         first,
                         &Execution {
                             index: i as i32,
@@ -144,12 +147,13 @@ impl Qwen35 {
                         timings,
                         None,
                     )?;
-                    features.record(i, &first.hidden[..rows * self.config.hidden_size]);
+                    features.record(i, &first.hidden[..rows * self.weights.config.hidden_size]);
                     Ok(())
                 },
                 |i, layer| {
                     lane.run(|| {
                         layer.forward(
+                            &mut mixers.lock(i),
                             work,
                             &Execution {
                                 index: i as i32,
@@ -158,30 +162,41 @@ impl Qwen35 {
                             &mut other_timings,
                             None,
                         )?;
-                        other_features
-                            .record(i, &work.hidden[..tokens.len() * self.config.hidden_size]);
+                        other_features.record(
+                            i,
+                            &work.hidden[..tokens.len() * self.weights.config.hidden_size],
+                        );
                         Ok(())
                     })
                 },
             )?;
             self.phases.merge(other_timings);
         } else {
-            for (i, layer) in self.layers.iter_mut().enumerate() {
+            for (i, (layer, state)) in self
+                .weights
+                .layers
+                .iter_mut()
+                .zip(mixers.iter_mut())
+                .enumerate()
+            {
                 ensure!(
                     !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
                     "generation cancelled"
                 );
                 layer.forward(
+                    state,
                     &mut self.work,
                     &Execution {
                         index: i as i32,
                         ..execution
                     },
                     &mut self.phases,
-                    self.paging.as_ref(),
+                    self.weights.paging.as_ref(),
                 )?;
-                self.features
-                    .record(i, &self.work.hidden[..rows * self.config.hidden_size]);
+                self.features.record(
+                    i,
+                    &self.work.hidden[..rows * self.weights.config.hidden_size],
+                );
             }
         }
         if !verify {
@@ -219,21 +234,21 @@ impl Qwen35 {
         cancelled: Option<&AtomicBool>,
     ) -> Result<()> {
         if let (Some(mtp), Some(embeddings)) = (&mut self.mtp, embeddings) {
-            let h = self.config.hidden_size;
+            let h = self.weights.config.hidden_size;
             norm::rms_norm(
                 &self.work.hidden[..rows * h],
-                &self.final_norm,
-                self.config.epsilon,
+                &self.weights.final_norm,
+                self.weights.config.epsilon,
                 true,
                 &mut self.work.normalized[..rows * h],
             )?;
             mtp.catch_up(
-                &self.config,
-                &self.cpu,
+                &self.weights.config,
+                &self.weights.cpu,
                 embeddings,
                 &self.work.normalized[..rows * h],
                 rope,
-                &self.trace,
+                &self.weights.trace,
             )?;
         }
         if secondary {
@@ -243,14 +258,7 @@ impl Qwen35 {
             self.features.commit(rows);
         }
         self.flush_features(cancelled)?;
-        self.position += rows;
-        self.next_rope_position = rope
-            .iter()
-            .flatten()
-            .copied()
-            .max()
-            .unwrap_or(self.next_rope_position)
-            + 1;
+        self.sequences.single_mut().advance(rope);
         Ok(())
     }
 }

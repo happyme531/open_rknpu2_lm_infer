@@ -330,6 +330,14 @@ impl Projection {
         }
         Ok(())
     }
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn prepare_swiglu(&self, buckets: &[usize]) -> Result<()> {
+        if let [(Linear::Quantized(linear), _)] = self.parts.as_slice() {
+            linear.prepare_swiglu(buckets)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_swiglu(
         &self,
         input: &[f32],

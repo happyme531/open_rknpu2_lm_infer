@@ -2,9 +2,9 @@ use crate::{
     model::{self, LanguageModel, ModelInfo, ModelOptions},
     progress::{DecodeProgress, GenerationProgress, Phase, Reporter},
     sampling::{Sampler, SamplingParams},
-    text::{OutputDecoder, StopFilter, TextCodec},
+    text::TextCodec,
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -15,10 +15,13 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
+mod batch;
 mod context;
+mod generated_text;
 #[cfg(test)]
 mod tests;
 use context::{PrefixCache, validate_request_tokens};
+use generated_text::GeneratedText;
 
 mod types;
 pub use types::*;
@@ -32,17 +35,46 @@ struct Job {
     queued: Instant,
 }
 
+enum JobSender {
+    Single {
+        sender: mpsc::Sender<Job>,
+        tokens: Arc<Mutex<ServingTokens>>,
+    },
+    Batch(batch::Sender),
+}
+
+impl JobSender {
+    fn wake(&self) {
+        if let Self::Batch(sender) = self {
+            sender.wake.notify_one();
+        }
+    }
+
+    fn available(&self) -> bool {
+        match self {
+            Self::Single { sender, .. } => !sender.is_closed(),
+            Self::Batch(sender) => sender.available(),
+        }
+    }
+}
+
 struct EngineInner {
-    sender: Option<mpsc::Sender<Job>>,
+    sender: Option<JobSender>,
     info: ModelInfo,
     sampling_defaults: SamplingParams,
     codec: Arc<TextCodec>,
-    stats: Arc<RwLock<Value>>,
+    stats: Arc<RwLock<EngineStats>>,
     active: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     user_boundaries: bool,
     progress: watch::Sender<GenerationProgress>,
+}
+
+#[derive(Default)]
+struct EngineStats {
+    diagnostics: Value,
+    serving: ServingSnapshot,
 }
 
 impl Drop for EngineInner {
@@ -53,7 +85,9 @@ impl Drop for EngineInner {
         {
             cancel.store(true, Ordering::Relaxed);
         }
-        self.sender.take();
+        if let Some(sender) = self.sender.take() {
+            sender.wake();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -76,8 +110,10 @@ impl Engine {
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);
+        let tokens = Arc::new(Mutex::new(ServingTokens::default()));
+        let worker_tokens = tokens.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let stats = Arc::new(RwLock::new(Value::Null));
+        let stats = Arc::new(RwLock::new(EngineStats::default()));
         let worker_stats = stats.clone();
         let active = Arc::new(Mutex::new(None));
         let worker_active = active.clone();
@@ -93,7 +129,8 @@ impl Engine {
         let worker = thread::Builder::new()
             .name("rknpu-inference".into())
             .spawn(move || {
-                let mut progress = Reporter::new(worker_progress, speculation);
+                let mut progress =
+                    Reporter::new(worker_progress, speculation).with_token_counts(worker_tokens);
                 let loaded = (|| -> Result<_> {
                     let chunk = options.chunk;
                     let mut options = options;
@@ -121,7 +158,7 @@ impl Engine {
                     }
                 };
                 if let Ok(mut latest) = worker_stats.write() {
-                    *latest = model.stats();
+                    latest.diagnostics = model.stats();
                 }
                 progress.phase(Phase::Ready);
                 if ready_tx
@@ -160,7 +197,7 @@ impl Engine {
                         }
                     }
                     if let Ok(mut latest) = worker_stats.write() {
-                        *latest = model.stats();
+                        latest.diagnostics = model.stats();
                     }
                     if let Ok(mut running) = worker_active.lock() {
                         *running = None;
@@ -172,7 +209,7 @@ impl Engine {
             .context("inference worker stopped during loading")??;
         Ok(Self {
             inner: Arc::new(EngineInner {
-                sender: Some(sender),
+                sender: Some(JobSender::Single { sender, tokens }),
                 info,
                 sampling_defaults,
                 codec,
@@ -196,8 +233,28 @@ impl Engine {
         self.inner
             .stats
             .read()
-            .map(|v| v.clone())
+            .map(|stats| stats.diagnostics.clone())
             .unwrap_or(Value::Null)
+    }
+    pub(crate) fn serving_snapshot(&self) -> ServingSnapshot {
+        self.snapshot(self.inner.stats.read().unwrap().serving)
+    }
+
+    fn snapshot(&self, batch: ServingSnapshot) -> ServingSnapshot {
+        match self.inner.sender.as_ref().unwrap() {
+            JobSender::Single { sender, tokens } => ServingSnapshot {
+                tokens: *tokens.lock().unwrap(),
+                speculation: self.inner.progress.borrow().speculation,
+                active: u64::from(self.inner.active.lock().unwrap().is_some()),
+                parallel: 1,
+                waiting: (sender.max_capacity() - sender.capacity()) as u64,
+                blocked: 0,
+            },
+            JobSender::Batch(sender) => ServingSnapshot {
+                waiting: sender.waiting() as u64,
+                ..batch
+            },
+        }
     }
     /// Latest active-request status; subscribers need not drain every update.
     /// Clone snapshots before doing IO so the watch read lock stays short.
@@ -217,12 +274,29 @@ impl Engine {
                 .ends_with("<think>"))
     }
     pub fn shutdown(&self) {
-        self.inner.shutdown.store(true, Ordering::Relaxed);
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.sender.as_ref().unwrap().wake();
         if let Ok(active) = self.inner.active.lock()
             && let Some(cancel) = active.as_ref()
         {
             cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    pub fn health(&self) -> (bool, Value) {
+        let sender = self.inner.sender.as_ref().unwrap();
+        let available = !self.inner.shutdown.load(Ordering::Acquire) && sender.available();
+        let stats = self.inner.stats.read().unwrap();
+        let serving = self.snapshot(stats.serving);
+        let mut health = json!({"status": if available { "ok" } else { "unavailable" },
+            "model": self.info().id, "parallel": serving.parallel, "active": serving.active,
+            "waiting": serving.waiting, "blocked": serving.blocked});
+        if matches!(sender, JobSender::Batch(_)) {
+            for key in ["batch", "kv_payload_bytes", "rss_kib", "slot_reset"] {
+                health[key] = stats.diagnostics[key].clone();
+            }
+        }
+        (available, health)
     }
 
     pub fn generate(&self, request: GenerationRequest) -> Result<GenerationHandle> {
@@ -234,10 +308,10 @@ impl Engine {
         request: GenerationRequest,
         preserve_tool_markers: bool,
     ) -> Result<GenerationHandle> {
-        ensure!(
-            !self.inner.shutdown.load(Ordering::Relaxed),
-            "inference worker is shutting down"
-        );
+        let sender = self.inner.sender.as_ref().unwrap();
+        if self.inner.shutdown.load(Ordering::Acquire) || !sender.available() {
+            return Err(EngineUnavailable.into());
+        }
         request.sampling.validate()?;
         ensure!(
             request.stop.len() <= 16,
@@ -251,6 +325,12 @@ impl Engine {
             .inner
             .codec
             .prepare(&request.prompt, self.inner.user_boundaries)?;
+        if matches!(sender, JobSender::Batch(_)) {
+            ensure!(
+                input.images.is_empty(),
+                "parallel inference currently supports text inputs"
+            );
+        }
         validate_request_tokens(&input.tokens, request.max_tokens, self.info())?;
         let (events_tx, events) = mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -262,13 +342,15 @@ impl Engine {
             cancel: cancel.clone(),
             queued: Instant::now(),
         };
-        match self.inner.sender.as_ref().unwrap().try_send(job) {
-            Ok(()) => Ok(GenerationHandle { events, cancel }),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(EngineBusy.into()),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(anyhow!("inference worker is unavailable"))
-            }
+        match sender {
+            JobSender::Batch(sender) => sender.send(job)?,
+            JobSender::Single { sender, .. } => match sender.try_send(job) {
+                Ok(()) => (),
+                Err(mpsc::error::TrySendError::Full(_)) => return Err(EngineBusy.into()),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(EngineUnavailable.into()),
+            },
         }
+        Ok(GenerationHandle { events, cancel })
     }
 }
 
@@ -341,11 +423,12 @@ fn run_generation(
         model.info().vocab_size,
         &job.input.tokens,
     )?;
-    let mut filter = StopFilter::new(job.request.stop.clone())?;
-    let mut decoder = OutputDecoder::new(&codec.tokenizer, job.preserve_tool_markers);
-    let mut text = String::new();
-    let mut generated = 0;
-    let mut reason = "length";
+    let mut output = GeneratedText::new(
+        codec,
+        job.preserve_tool_markers,
+        job.request.max_tokens,
+        job.request.stop.clone(),
+    )?;
     let mut ttft_ms = None;
     let mut decode_calls = 0;
     let mut decode_model_ms = 0.0;
@@ -367,15 +450,16 @@ fn run_generation(
     let mut repair_rows = 0;
     let mut events = Vec::new();
     progress.decoding();
-    while generated < job.request.max_tokens {
+    while output.reason().is_none() {
         ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
+        let before = output.generated();
         let call = Instant::now();
         let round = if let Some(anchor) = pending.filter(|_| model.speculation_window() > 0) {
             Some(crate::speculative::run_round(
                 model,
                 &mut sampler,
                 anchor,
-                job.request.max_tokens - generated,
+                job.request.max_tokens - before,
                 &job.cancel,
             )?)
         } else {
@@ -402,34 +486,18 @@ fn run_generation(
             sampled = [sampler.sample(logits)?];
             &sampled
         };
-        let mut emitted = 0;
-        let mut stopped = false;
         for &token in batch {
             ensure!(!job.cancel.load(Ordering::Relaxed), "generation cancelled");
-            generated += 1;
-            emitted += 1;
             pending = Some(token);
-            if model.info().eos_tokens.contains(&token) {
-                stopped = true;
-                reason = "stop";
+            if let Some(piece) = output.push(token, &model.info().eos_tokens, &mut sampler)? {
+                events.push(piece);
+            }
+            if output.reason().is_some() {
                 break;
             }
-            sampler.observe(token);
-            if let Some(piece) = decoder
-                .step(token)
-                .map_err(|e| anyhow!("stream decode: {e}"))?
-            {
-                let (output, stop) = filter.push(&piece);
-                if !output.is_empty() {
-                    events.push(output);
-                }
-                if stop {
-                    stopped = true;
-                    reason = "stop";
-                    break;
-                }
-            }
         }
+        let generated = output.generated();
+        let emitted = generated - before;
         if let Some(round) = round {
             let repair_start = Instant::now();
             model.finish_verification(emitted)?;
@@ -454,7 +522,7 @@ fn run_generation(
             decode_calls += 1;
             consumed_tokens += emitted;
         }
-        if generated > emitted {
+        if before > 0 {
             decode_model_ms += call.elapsed().as_secs_f64() * 1000.;
         }
         progress.decode(DecodeProgress {
@@ -470,24 +538,21 @@ fn run_generation(
             ..Default::default()
         });
         for output in events.drain(..) {
-            text.push_str(&output);
             if ttft_ms.is_none() {
                 ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.);
             }
             send_event(job, GenerationEvent::Token(output))?;
         }
-        if stopped {
-            break;
-        }
     }
-    let tail = filter.finish();
+    let tail = output.flush();
     if !tail.is_empty() {
-        text.push_str(&tail);
         send_event(job, GenerationEvent::Token(tail))?;
     }
+    let generated = output.generated();
+    let reason = output.reason().unwrap();
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
     let result = GenerationResult {
-        text,
+        text: output.into_text(),
         finish_reason: reason.into(),
         prompt_tokens: job.input.tokens.len(),
         completion_tokens: generated,

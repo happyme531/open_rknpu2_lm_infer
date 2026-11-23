@@ -17,7 +17,7 @@ impl Snapshot {
 mod tests;
 use super::{
     config::Config,
-    decoder::{Buffers, Execution, Layer, Mixer},
+    decoder::{Buffers, Execution, Layer, LayerSeqState, MixerWeights},
     timings::Timings,
 };
 use crate::{
@@ -29,6 +29,7 @@ use anyhow::{Result, ensure};
 pub(super) struct Predictor {
     pub backend: crate::npu::Backend,
     layer: Layer,
+    seq: LayerSeqState,
     fc: Linear,
     hidden_norm: Vec<f32>,
     embedding_norm: Vec<f32>,
@@ -64,7 +65,7 @@ impl Predictor {
         Ok(())
     }
     pub fn reset(&mut self) -> Result<()> {
-        if let Mixer::Attention { cache, .. } = &self.layer.mixer {
+        if let LayerSeqState::Attention(cache) = &self.seq {
             cache.reset()?;
         }
         self.seed.clear();
@@ -75,7 +76,7 @@ impl Predictor {
         Ok(())
     }
     fn truncate(&mut self, position: usize) -> Result<()> {
-        if let Mixer::Attention { cache, .. } = &self.layer.mixer {
+        if let LayerSeqState::Attention(cache) = &self.seq {
             cache.truncate(position)?;
         }
         self.position = position;
@@ -147,7 +148,9 @@ impl Predictor {
             self.work.key[r * kv..(r + 1) * kv].copy_from_slice(&row[..kv]);
             self.work.value[r * kv..(r + 1) * kv].copy_from_slice(&row[kv..]);
         }
-        if let Mixer::Attention { cache, k_norm, .. } = &self.layer.mixer {
+        if let (MixerWeights::Attention { k_norm, .. }, LayerSeqState::Attention(cache)) =
+            (&self.layer.mixer, &self.seq)
+        {
             norm::rms_norm(
                 &self.work.key[..rows * kv],
                 k_norm,
@@ -188,6 +191,7 @@ impl Predictor {
         let rows = positions.len();
         self.fuse(c, hidden, embedding, rows)?;
         self.layer.forward(
+            &mut self.seq,
             &mut self.work,
             &Execution {
                 config: c,

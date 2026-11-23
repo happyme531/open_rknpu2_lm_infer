@@ -1,4 +1,4 @@
-use super::{decoder::Mixer, runtime::Qwen35};
+use super::{decoder::LayerSeqState, runtime::Qwen35};
 use serde_json::{Value, json};
 
 impl Qwen35 {
@@ -13,22 +13,23 @@ impl Qwen35 {
         if let Some(draft) = &self.dflash {
             backends.extend_from_slice(draft.backends());
         }
-        let mut result = crate::model::metrics::backend_stats(&backends, self.head.backend());
+        let mut result =
+            crate::model::metrics::backend_stats(&backends, self.weights.head.backend());
         let mut state_bytes = 0;
         let mut verification_state_bytes = 0;
         let mut conv_bytes = 0;
         let mut log_bytes = 0;
         let mut kv_bytes = 0;
-        for layer in self.layers.iter() {
-            match &layer.mixer {
-                Mixer::Recurrent { state, .. } => {
+        for mixer in self.sequences.single().mixers.iter() {
+            match &*mixer {
+                LayerSeqState::Recurrent(state) => {
                     let memory = state.memory_usage();
                     state_bytes += memory.canonical_state_bytes;
                     verification_state_bytes += memory.verification_state_bytes;
                     conv_bytes += memory.convolution_history_bytes;
                     log_bytes += memory.update_log_bytes;
                 }
-                Mixer::Attention { cache, .. } => {
+                LayerSeqState::Attention(cache) => {
                     kv_bytes += cache.bytes().expect("live Qwen3.5 native KV cache")
                 }
             }
@@ -48,28 +49,28 @@ impl Qwen35 {
         );
         let draft = self.dflash.as_ref().map(|d| d.stats());
         let fields = json!({
-            "position":self.position,"layers":self.layers.len(),"architecture":self.info.architecture,
-            "routed_experts":self.config.moe.as_ref().map(|m| m.experts),
-            "experts_per_token":self.config.moe.as_ref().map(|m| m.top_k),
+            "position":self.sequences.single().position,"layers":self.weights.layers.len(),"architecture":self.info.architecture,
+            "routed_experts":self.weights.config.moe.as_ref().map(|m| m.experts),
+            "experts_per_token":self.weights.config.moe.as_ref().map(|m| m.top_k),
             "expert_min_weight":self.options.experts.min_weight,
             "expert_pruning_renormalize":false,
-            "expert_storage":self.config.moe.as_ref().map(|_| if self.paging.is_some() {"stream"} else {"resident"}),
+            "expert_storage":self.weights.config.moe.as_ref().map(|_| if self.weights.paging.is_some() {"stream"} else {"resident"}),
             "prefill_logical_chunk":self.prompt_chunk_rows(),
-            "expert_cache_policy":self.paging.as_ref().map(|_| "per-layer LRU; requested and predicted protection; prompt-tail seed"),
-            "expert_paging":self.paging.as_ref().map(|p|p.stats()),
-            "expert_layers":self.layers.iter().filter_map(|l| match &l.ffn {super::decoder::FeedForward::Routed(m)=>Some(m.statistics()),_=>None}).collect::<Vec<_>>(),
+            "expert_cache_policy":self.weights.paging.as_ref().map(|_| "per-layer LRU; requested and predicted protection; prompt-tail seed"),
+            "expert_paging":self.weights.paging.as_ref().map(|p|p.stats()),
+            "expert_layers":self.weights.layers.iter().filter_map(|l| match &l.ffn {super::decoder::FeedForward::Routed(m)=>Some(m.statistics()),_=>None}).collect::<Vec<_>>(),
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "gdn_state_bytes":state_bytes,"gdn_convolution_bytes":conv_bytes,"gdn_update_log_bytes":log_bytes,
             "gdn_verification_state_bytes":verification_state_bytes,
             "cpu_scratch_bytes":scratch_bytes,"attention_cache_payload_bytes":kv_bytes,
             "mapped_weight_bytes":self.loader.store.mapped_bytes(),
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
-            "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
-            "multimodal_enabled":self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":vision.0,"next_rope_position":self.next_rope_position,
+            "lm_head_weight_bits":self.weights.head.bits(),"lm_head_backend":self.weights.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
+            "multimodal_enabled":self.loader.store.contains("model.visual.patch_embed.proj.weight"),"vision_loaded":vision.0,"next_rope_position":self.sequences.single().next_rope_position,
             "vision_encoder_calls":vision.1,"vision_cache_hits":vision.2,
             "vision_dtype":self.options.vision_dtype.as_str(),
             "vision_encoder_ms":vision.3,"vision_feature_cache_bytes":vision.4,
-            "trace_directory":self.trace.path(),"attention_tile":self.options.attention_tile,
+            "trace_directory":self.weights.trace.path(),"attention_tile":self.options.attention_tile,
             "tuning_enabled":self.options.tune,"tuning_search_enabled":self.options.tune_search,"tune_cache":self.options.tune_cache,
             "activation_quantization":"full-K maxabs/127, round-away, clamp[-127,127]"
         });

@@ -15,7 +15,11 @@ CLI `run`、`chat` 默认 `temperature=1`、`top_k=20`、`top_p=0.95`。HTTP API
 
 CLI 和 HTTP 默认生成上限均为 `2048`（CLI `--n-predict`，HTTP `max_tokens` / `max_completion_tokens`）。设置 `temperature` 为 `0` 可启用贪心采样。比较速度或输出时应显式使用相同的采样参数。
 
-`usage.prompt_tokens_details.cached_tokens` 记录当前请求实际复用的 KV 前缀。发生 context 超限时在排队前返回400；请求队列满时返回503。关闭流式连接会取消对应推理。
+`usage.prompt_tokens_details.cached_tokens` 记录当前请求实际复用的 KV 前缀。发生 context 超限时在排队前返回 400。关闭流式连接会取消对应推理。
+
+`serve --parallel N`（或 `serve -np N`）在 `N > 1` 时启用连续批处理。`--ubatch-size` 是单步 decode 和 prefill 共用的 token 预算，要求 `N ≤ ubatch-size ≤ 256`。活跃槽位用完后，请求进入无上限的等待队列，`GET /health` 的 `waiting` 字段显示排队数。单请求引擎的等待队列容量为 4，队列满时返回 503。
+
+服务约每秒在 stderr 分别报告 `Prefill batch` 和 `Decode batch`，显示实际墙钟窗口内的全服务 token 数和吞吐量（tok/s），以及采样时的运行槽位和排队请求数。Prefill 吞吐只计算新执行的提示词 token，另列复用的前缀 token。首个输出使用 prefill logits，Decode 从之后的目标模型步开始计数。有投机轮次的窗口还会报告提议和接受的草稿数、接受率以及每轮平均接受草稿数。窗口内没有已完成工作时，日志分别显示无已完成模型工作、活跃槽均被输出阻塞，或只有排队请求。服务转入空闲后打印一次状态。
 
 ## Function tools
 

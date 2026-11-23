@@ -198,7 +198,7 @@ fn check_cache_miss(rc: i32, name: &str) -> Result<()> {
         check(rc, name)
     }
 }
-fn bucket(rows: usize) -> Result<usize> {
+pub(crate) fn bucket(rows: usize) -> Result<usize> {
     ensure!(
         (1..=256).contains(&rows),
         "linear batch must be within 1..256"
@@ -289,6 +289,15 @@ struct LinearPadding {
 }
 
 impl LinearPadding {
+    fn grow(&mut self, input: usize, output: usize) {
+        if self.input.len() < input {
+            self.input.resize(input, 0.0);
+        }
+        if self.output.len() < output {
+            self.output.resize(output, 0.0);
+        }
+    }
+
     fn bytes(&self) -> u64 {
         (self.input.capacity() + self.output.capacity()) as u64 * 4
     }
@@ -553,7 +562,8 @@ impl Backend {
                 },
                 rk_npu_w4a8_weights_free,
                 "certified W4 weights",
-            )?;
+            )
+            .with_context(|| format!("allocate weights in IOMMU domain {}", b.domain_id))?;
             let mut info = rk_npu_w4a8_weight_info::default();
             check(
                 unsafe { rk_npu_w4a8_weights_query(handle.raw, &mut info) },
@@ -602,7 +612,8 @@ impl Backend {
                 },
                 rk_npu_f32i8f32_weights_free,
                 "W8 weights",
-            )?;
+            )
+            .with_context(|| format!("allocate weights in IOMMU domain {}", b.domain_id))?;
             let mut info = rk_npu_matmul_weight_requirements::default();
             check(
                 unsafe { rk_npu_f32i8f32_weights_memory_query(&cfg, &mut info) },
@@ -656,8 +667,34 @@ impl Backend {
         dimension: usize,
         softmax_scale: f32,
     ) -> Result<Attention> {
-        self.attention_masked(query_heads, kv_heads, dimension, softmax_scale, false)
+        self.attention_masked(
+            query_heads,
+            kv_heads,
+            dimension,
+            softmax_scale,
+            false,
+            false,
+        )
     }
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn reserved_attention(
+        &self,
+        query_heads: usize,
+        kv_heads: usize,
+        dimension: usize,
+        softmax_scale: f32,
+    ) -> Result<Attention> {
+        let attention =
+            self.attention_masked(query_heads, kv_heads, dimension, softmax_scale, false, true)?;
+        attention.reserve_tail()?;
+        Ok(attention)
+    }
+
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn domain_id(&self) -> u32 {
+        self.0.lock().unwrap().domain_id
+    }
+
     /// Temporary K/V and query scratch sized to one complete input sequence.
     pub fn full_attention(
         &self,
@@ -705,6 +742,7 @@ impl Backend {
             dimension,
             (dimension as f32).sqrt().recip(),
             true,
+            false,
         )
     }
     fn attention_masked(
@@ -714,6 +752,7 @@ impl Backend {
         dimension: usize,
         softmax_scale: f32,
         noncausal: bool,
+        reserve: bool,
     ) -> Result<Attention> {
         let mut b = self.0.lock().unwrap();
         ensure!(
@@ -735,7 +774,7 @@ impl Backend {
             }
             b.attention = Some(AttentionWork::new(b.domain.raw, config, b.options.chunk)?);
         }
-        let cfg = &b.attention.as_ref().unwrap().config;
+        let mut cfg = b.attention.as_ref().unwrap().config;
         ensure!(
             cfg.query_heads as usize == query_heads
                 && cfg.kv_heads as usize == kv_heads
@@ -744,9 +783,12 @@ impl Backend {
                 && (cfg.mask_mode == RK_NPU_ATTENTION_F16_NO_MASK) == noncausal,
             "attention workspace geometry mismatch"
         );
+        if reserve {
+            cfg.initial_capacity = cfg.max_capacity;
+        }
         let mut raw = ptr::null_mut();
         check(
-            unsafe { rk_npu_attention_f16_cache_create(b.domain.raw, cfg, &mut raw) },
+            unsafe { rk_npu_attention_f16_cache_create(b.domain.raw, &cfg, &mut raw) },
             "create native KV cache",
         )?;
         Ok(Attention {
@@ -780,6 +822,25 @@ impl Backend {
                 );
             }
             b.with_work(key, m, |_| Ok(()))?;
+        }
+        Ok(())
+    }
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn prepare_batch_padding(&self, max_rows: usize) -> Result<()> {
+        for rows in (1..=max_rows).rev() {
+            let padded = bucket(rows)?;
+            if padded == rows {
+                continue;
+            }
+            let mut backend = self.0.lock().unwrap();
+            let (input, output) = backend
+                .material
+                .keys()
+                .fold((0, 0), |(input, output), &(_, k, n, _)| {
+                    (input.max(k), output.max(n))
+                });
+            backend.padding.grow(padded * input, padded * output);
+            break;
         }
         Ok(())
     }
@@ -864,9 +925,9 @@ impl Backend {
         let idle = b.domain.idle.lock().unwrap();
         let idle_linear = &idle[b.lane].linear;
         let work = || b.work.values().chain(idle_linear.values());
-        let workspace: u64 = work().map(|w| w.bytes).sum::<u64>()
-            + b.padding.bytes()
+        let linear_device_bytes = work().map(|w| w.bytes).sum::<u64>()
             + b.moe_work.values().map(|w| w.bytes).sum::<u64>();
+        let workspace = linear_device_bytes + b.padding.bytes();
         let memory = b.domain_memory();
         let material: usize = b
             .material
@@ -876,12 +937,36 @@ impl Backend {
         let staging = b.attention.as_ref().map_or(0, |w| {
             (w.q.capacity() + w.k.capacity() + w.v.capacity()) * 2 + w.output.capacity() * 4
         });
+        let attention_device_bytes = b.attention.as_ref().map_or(0, |w| {
+            let cfg = &w.config;
+            let mut sizes = rk_npu_attention_f16_sizes::default();
+            if unsafe {
+                rk_npu_attention_f16_query(
+                    cfg,
+                    cfg.max_capacity,
+                    cfg.max_query_rows,
+                    cfg.max_capacity,
+                    &mut sizes,
+                )
+            } != 0
+            {
+                return 0;
+            }
+            let tail = cfg.kv_heads as u64 * (cfg.head_dim + 32) as u64 * cfg.kv_tile as u64 * 2;
+            sizes.query_bytes
+                + 2 * sizes.score_bytes
+                + sizes.mask_bytes
+                + sizes.partial_bytes
+                + 2 * tail
+        });
         json!({"backend": "open-rknpu2", "loaded_w4": b.loaded_w4, "loaded_w8": b.loaded_w8,
             "idle_prefill_tf32_workspaces": idle[b.lane].tf32.len(),
             "idle_prefill_fp16_workspaces": idle[b.lane].floating.len(),
             "compress_w8a8": b.options.compress_w8a8,
             "weight_payload_bytes_estimated": b.options.compress_w8a8 && b.loaded_w8 > 0,
             "weight_payload_bytes": b.weight_bytes, "workspace_payload_bytes": workspace,
+            "linear_device_workspace_bytes": linear_device_bytes,
+            "attention_device_workspace_bytes_estimate": attention_device_bytes,
             "linear_padding_bytes": b.padding.bytes(),
             // Both execution lanes see the same context-level totals.
             "domain_memory": {
@@ -1348,6 +1433,20 @@ impl Linear {
     pub fn run(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<()> {
         self.run_npu(input, output, rows, false)
     }
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn prepare_swiglu(&self, buckets: &[usize]) -> Result<()> {
+        if self.w4.is_some() && self.n().is_multiple_of(64) {
+            let mut backend = self.owner.0.lock().unwrap();
+            let domain = backend.domain_id;
+            for &rows in buckets {
+                backend
+                    .with_swiglu_work(self.key, bucket(rows)?, |_| Ok(()))
+                    .with_context(|| format!("prepare SwiGLU M={rows} in IOMMU domain {domain}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn run_swiglu(&self, input: &[f32], output: &mut [f32], rows: usize) -> Result<bool> {
         if self.w4.is_none() || !self.n().is_multiple_of(64) {
             return Ok(false);
@@ -1386,12 +1485,7 @@ impl Linear {
         let (a, c) = if m != rows {
             let real_input = rows * self.k();
             let padded_input = m * self.k();
-            if padding.input.len() < padded_input {
-                padding.input.resize(padded_input, 0.0);
-            }
-            if padding.output.len() < m * width {
-                padding.output.resize(m * width, 0.0);
-            }
+            padding.grow(padded_input, m * width);
             padding.input[..real_input].copy_from_slice(&input[..real_input]);
             padding.input[real_input..padded_input].fill(0.0);
             (padding.input.as_ptr(), padding.output.as_mut_ptr())

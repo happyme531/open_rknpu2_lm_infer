@@ -1,6 +1,6 @@
 //! Resident prefix checkpoints, following llama.cpp's partial-state cache.
 //! Ordinary attention KV stays in place and is truncated on restore.
-use super::{decoder::Mixer, mtp, runtime::Qwen35};
+use super::{decoder::LayerSeqState, mtp, runtime::Qwen35};
 use crate::{layers::gated_delta::Snapshot, model::LanguageModel};
 use anyhow::{Result, ensure};
 use std::time::Instant;
@@ -19,29 +19,31 @@ impl Qwen35 {
             self.round.is_none(),
             "cannot checkpoint tentative target state"
         );
-        if self.position == 0 || self.prefix_cache.settings.capacity == 0 {
+        if self.sequences.single().position == 0 || self.prefix_cache.settings.capacity == 0 {
             return Ok(());
         }
-        if self.prefix_cache.reuse(self.position) {
+        if self.prefix_cache.reuse(self.sequences.single().position) {
             return Ok(());
         }
         let start = Instant::now();
         self.prefix_cache.make_room();
         let mtp = self.mtp.as_ref().map(|m| m.snapshot());
         let recurrent = self
-            .layers
+            .sequences
+            .single()
+            .mixers
             .iter()
-            .filter_map(|l| match &l.mixer {
-                Mixer::Recurrent { state, .. } => Some(state.snapshot()),
+            .filter_map(|l| match &*l {
+                LayerSeqState::Recurrent(state) => Some(state.snapshot()),
                 _ => None,
             })
             .collect::<Result<Vec<_>>>()?;
         let bytes = recurrent.iter().map(Snapshot::bytes).sum::<usize>()
             + mtp.as_ref().map_or(0, mtp::Snapshot::bytes);
         self.prefix_cache.insert(
-            self.position,
+            self.sequences.single().position,
             Checkpoint {
-                next_rope: self.next_rope_position,
+                next_rope: self.sequences.single().next_rope_position,
                 recurrent,
                 mtp,
             },
@@ -53,10 +55,10 @@ impl Qwen35 {
 
     pub(super) fn restore_cached_prefix(&mut self, maximum: usize) -> Result<usize> {
         ensure!(
-            self.round.is_none() && maximum <= self.position,
+            self.round.is_none() && maximum <= self.sequences.single().position,
             "invalid target prefix restore"
         );
-        if maximum == self.position {
+        if maximum == self.sequences.single().position {
             return Ok(maximum);
         }
         let Some(checkpoint) = self
@@ -71,10 +73,10 @@ impl Qwen35 {
         let position = checkpoint.position;
         let result = (|| -> Result<()> {
             let mut snapshots = checkpoint.state.recurrent.iter();
-            for layer in self.layers.iter_mut() {
-                match &mut layer.mixer {
-                    Mixer::Recurrent { state, .. } => state.restore(snapshots.next().unwrap())?,
-                    Mixer::Attention { cache, .. } => cache.truncate(position)?,
+            for mixer in self.sequences.single_mut().mixers.iter_mut() {
+                match mixer {
+                    LayerSeqState::Recurrent(state) => state.restore(snapshots.next().unwrap())?,
+                    LayerSeqState::Attention(cache) => cache.truncate(position)?,
                 }
             }
             if let (Some(mtp), Some(snapshot)) = (&mut self.mtp, &checkpoint.state.mtp) {
@@ -84,8 +86,8 @@ impl Qwen35 {
                 draft.restore_prefix(position)?;
             }
             self.features.reset();
-            self.position = position;
-            self.next_rope_position = checkpoint.state.next_rope;
+            self.sequences.single_mut().position = position;
+            self.sequences.single_mut().next_rope_position = checkpoint.state.next_rope;
             self.logits.clear();
             Ok(())
         })();

@@ -1,4 +1,7 @@
-use crate::model::ModelOptions;
+use crate::model::{
+    ModelOptions,
+    batch::{self, BatchConfig},
+};
 use crate::{
     model::VisionDtype,
     npu::{self, Backend, FloatBackend},
@@ -15,12 +18,21 @@ pub(super) fn run(
     images: Vec<PathBuf>,
     batches: Vec<usize>,
     report: Option<PathBuf>,
+    batch: Option<BatchConfig>,
 ) -> Result<()> {
     ensure!(options.tune, "tune cannot be combined with --no-tune");
     options.tune_search = true;
     let start = Instant::now();
     let mut result = if vision {
         vision_profiles(options, images)?
+    } else if let Some(config) = batch {
+        ensure!(
+            batches.iter().all(|m| (1..=config.max_rows).contains(m)),
+            "tuning batches must be within 1..ubatch-size"
+        );
+        let model = batch::load(options, config)?;
+        json!({"mode": "text", "parallel": config.slots, "ubatch_size": config.max_rows,
+            "batches": config.decoder_buckets(), "head_batches": config.head_buckets(), "stats": model.stats()})
     } else {
         text_profiles(options, batches)?
     };

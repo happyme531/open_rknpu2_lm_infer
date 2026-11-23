@@ -2,6 +2,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[allow(
+    dead_code,
+    reason = "Shared batch execution is compiled independently of model selection."
+)]
+pub mod batch;
 pub mod checkpoint;
 #[allow(
     dead_code,

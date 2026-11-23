@@ -249,6 +249,69 @@ impl Attention {
         )?;
         Ok(info.key_bytes + info.value_bytes + info.tail_bytes)
     }
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(super) fn reserve_tail(&self) -> Result<()> {
+        let cache = self.cache.lock().unwrap();
+        let b = self.owner.0.lock().unwrap();
+        let work = b.attention.as_ref().unwrap();
+        // A single final query binds the per-cache compact tail. Its largest
+        // partial tile is one 32-token stripe short of a complete PV tile.
+        let length = work.config.max_capacity.min(work.config.kv_tile - 32);
+        let zeros = vec![0u16; self.kv_heads * self.dimension * length as usize];
+        check(
+            unsafe {
+                rk_npu_attention_f16_cache_append(
+                    b.context.raw,
+                    cache.raw,
+                    zeros.as_ptr(),
+                    zeros.as_ptr(),
+                    length,
+                )
+            },
+            "prime reserved KV tail",
+        )?;
+        check(
+            unsafe {
+                rk_npu_attention_f16_prepare_query(
+                    b.context.raw,
+                    work.workspace.raw,
+                    cache.raw,
+                    1,
+                    length - 1,
+                )
+            },
+            "reserve compact KV tail",
+        )?;
+        check(
+            unsafe { rk_npu_attention_f16_cache_truncate(cache.raw, 0) },
+            "clear reserved KV tail fixture",
+        )
+    }
+
+    #[allow(dead_code, reason = "Used by continuous-batching models.")]
+    pub(crate) fn batch_memory(&self) -> (u32, u64, u64) {
+        let cache = self.cache.lock().unwrap();
+        let mut info = rk_npu_attention_f16_cache_info::default();
+        check(
+            unsafe { rk_npu_attention_f16_cache_get_info(cache.raw, &mut info) },
+            "native KV memory",
+        )
+        .expect("live native KV cache");
+        let prefix_rows = u64::from(info.capacity as u32 / 32 + 1) * self.kv_heads as u64;
+        let lut_disabled = std::env::var("RK_NPU_ATTN_LUT_EXP").is_ok_and(|flag| flag != "1");
+        let totals = if lut_disabled {
+            0
+        } else {
+            (prefix_rows + self.kv_heads as u64) * self.dimension as u64 * 4
+        };
+        let absmax = prefix_rows * 2 + 64;
+        (
+            self.owner.domain_id(),
+            info.key_bytes + info.value_bytes + info.tail_bytes,
+            totals + absmax,
+        )
+    }
+
     pub fn reserve(&self, capacity: usize) -> Result<()> {
         let cache = self.cache.lock().unwrap();
         let b = self.owner.0.lock().unwrap();

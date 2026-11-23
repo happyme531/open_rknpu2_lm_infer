@@ -1,6 +1,6 @@
 use super::{
     config::Config,
-    decoder::{Buffers, Layer, Mixer},
+    decoder::{Buffers, Layer, LayerSeqState},
     multimodal::EmbeddedChunk,
     timings::Timings,
 };
@@ -9,12 +9,13 @@ use crate::ops::norm;
 use crate::{
     model::{
         LanguageModel, ModelInfo, ModelOptions, PreparedPrefill,
+        batch::SeqPool,
         checkpoint::{QuantLoader, Tensor, TensorStore},
         cpu::Cpu,
         dflash::DFlash,
         workspace::{PrefillPlan, Targets, Workspaces},
     },
-    npu::Backend,
+    npu::{Attention, Backend},
 };
 use anyhow::{Result, ensure};
 use std::{
@@ -25,33 +26,70 @@ use std::{
     time::Instant,
 };
 
+pub(super) struct SeqState {
+    pub mixers: crate::model::pipeline::Layers<LayerSeqState>,
+    pub position: usize,
+    pub next_rope_position: usize,
+    pub reserved: usize,
+}
+
+impl SeqState {
+    pub(super) fn reset(
+        &mut self,
+        reset_attention: impl Fn(&Attention) -> Result<()>,
+    ) -> Result<()> {
+        for mixer in self.mixers.iter_mut() {
+            match mixer {
+                LayerSeqState::Recurrent(state) => state.reset(),
+                LayerSeqState::Attention(cache) => reset_attention(cache)?,
+            }
+        }
+        self.position = 0;
+        self.next_rope_position = 0;
+        Ok(())
+    }
+
+    pub(super) fn advance(&mut self, rope: &[[usize; 3]]) {
+        self.position += rope.len();
+        self.next_rope_position = rope
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(self.next_rope_position)
+            + 1;
+    }
+}
+
+pub(super) struct Weights {
+    pub config: Config,
+    pub cpu: Cpu,
+    pub layers: crate::model::pipeline::Layers<Layer>,
+    pub paging: Option<crate::model::experts::paged::Paging>,
+    pub embedding: Tensor,
+    pub final_norm: Vec<f32>,
+    pub head: crate::model::output_head::OutputHead,
+    pub trace: Trace,
+}
+
 pub struct Qwen35 {
     pub(super) options: ModelOptions,
     pub(super) info: ModelInfo,
-    pub(super) config: Config,
     pub(super) loader: Arc<QuantLoader>,
-    pub(super) cpu: Cpu,
     pub(super) backends: Vec<Backend>,
-    pub(super) layers: crate::model::pipeline::Layers<Layer>,
-    pub(super) paging: Option<crate::model::experts::paged::Paging>,
-    pub(super) embedding: Tensor,
-    pub(super) final_norm: Vec<f32>,
-    pub(super) head: crate::model::output_head::OutputHead,
+    pub(super) weights: Weights,
+    pub(super) sequences: SeqPool<SeqState>,
     pub(super) work: Buffers,
     pub(super) secondary: Option<crate::npu::ExecutionLane>,
     pub(super) secondary_work: Option<Buffers>,
     pub(super) dual_groups: usize,
-    pub(super) position: usize,
-    pub(super) reserved: usize,
     pub(super) logits: Vec<f32>,
-    pub(super) trace: Trace,
     pub(super) load_ms: f64,
     pub(super) forward_ms: f64,
     pub(super) head_ms: f64,
     pub(super) phases: Timings,
     pub(super) mtp_available: bool,
     pub(super) vision: Option<super::vision::Encoder>,
-    pub(super) next_rope_position: usize,
     pub(super) round: Option<super::transaction::Round>,
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
@@ -99,7 +137,7 @@ impl Qwen35 {
             "prefill-ubatches must be 1 or 2"
         );
         options.validate_speculation()?;
-        let mut model = super::load::load(options)?;
+        let mut model = super::load::load(options, None)?;
         if matches!(
             model.options.speculation.kind,
             crate::model::SpeculativeType::DraftDflash | crate::model::SpeculativeType::DraftDspark
@@ -110,16 +148,46 @@ impl Qwen35 {
         if model.options.compress_w8a8 {
             let start = Instant::now();
             crate::npu::release_compression_scratch(
-                model.backends.iter().chain(model.head.backend()),
+                model.backends.iter().chain(model.weights.head.backend()),
             );
             model.load_ms += start.elapsed().as_secs_f64() * 1000.;
         }
         Ok(model)
     }
 
+    #[cfg(feature = "model-qwen35")]
+    pub(in crate::model) fn load_batch(
+        options: ModelOptions,
+        config: crate::model::batch::BatchConfig,
+    ) -> Result<Self> {
+        let mut model = super::load::load(options, Some(config))?;
+        crate::model::batch::prepare(config, &model.backends, model.weights.head.backend())?;
+        if !model.weights.trace.enabled() {
+            let buckets = config.decoder_buckets();
+            for layer in model.weights.layers.iter() {
+                if let super::decoder::FeedForward::Dense { gate_up, .. } = &layer.ffn {
+                    gate_up.prepare_swiglu(&buckets)?;
+                }
+            }
+        }
+        model
+            .work
+            .recurrent
+            .prepare(&[model.options.chunk.min(config.max_rows)])?;
+        model.loader.store.release_pages()?;
+        if model.options.compress_w8a8 {
+            crate::npu::release_compression_scratch(
+                model.backends.iter().chain(model.weights.head.backend()),
+            );
+        }
+        crate::model::batch::report(&model)?;
+        Ok(model)
+    }
+
     pub(super) fn check_input(&self, tokens: &[u32]) -> Result<()> {
         ensure!(
-            !tokens.is_empty() && tokens.len() <= self.options.context - self.position,
+            !tokens.is_empty()
+                && tokens.len() <= self.options.context - self.sequences.single().position,
             "empty Qwen3.5 input or context capacity exceeded"
         );
         ensure!(
@@ -159,10 +227,11 @@ impl Qwen35 {
             self.round.is_none(),
             "Qwen3.5 verification transaction is active"
         );
+        let position = self.sequences.single().position;
         self.workspaces
-            .begin_input(self.position, tokens.len(), &self.backends);
+            .begin_input(position, tokens.len(), &self.backends);
         let result = (|| {
-            self.reserve(self.position + tokens.len())?;
+            self.reserve(position + tokens.len())?;
             let mut rows = 0;
             for (first, second) in crate::model::prefill::batches(
                 tokens,
@@ -172,7 +241,7 @@ impl Qwen35 {
                 let inputs = [(first, None), (second.unwrap_or_default(), None)];
                 let count = if second.is_some() { 2 } else { 1 };
                 crate::progress::prefill_shape(first.len() != self.options.chunk, || {
-                    if self.paging.is_some() {
+                    if self.weights.paging.is_some() {
                         self.prompt_chunk(first, cancelled, None)
                     } else {
                         self.execute(&inputs[..count], cancelled, false)
@@ -188,7 +257,8 @@ impl Qwen35 {
             if logits {
                 self.output_head(rows)?;
             } else {
-                self.workspaces.finish_head_free(self.position);
+                self.workspaces
+                    .finish_head_free(self.sequences.single().position);
             }
             Ok(())
         })();
@@ -206,9 +276,10 @@ impl Qwen35 {
                 && targets.iter().all(|v| (*v as usize) < self.info.vocab_size),
             "invalid Qwen3.5 scoring targets"
         );
+        let position = self.sequences.single().position;
         self.workspaces
-            .begin_input(self.position, tokens.len(), &self.backends);
-        self.reserve(self.position + tokens.len())?;
+            .begin_input(position, tokens.len(), &self.backends);
+        self.reserve(position + tokens.len())?;
         let mut values = Vec::with_capacity(tokens.len());
         for (tokens, targets) in tokens
             .chunks(self.options.chunk)
@@ -216,20 +287,20 @@ impl Qwen35 {
         {
             self.chunk(tokens, None, None)?;
             let start = Instant::now();
-            let h = self.config.hidden_size;
+            let h = self.weights.config.hidden_size;
             let rows = tokens.len();
             norm::rms_norm(
                 &self.work.hidden[..rows * h],
-                &self.final_norm,
-                self.config.epsilon,
+                &self.weights.final_norm,
+                self.weights.config.epsilon,
                 true,
                 &mut self.work.normalized[..rows * h],
             )?;
             let vocab = self.info.vocab_size;
             self.logits.resize(rows * vocab, 0.0);
-            self.head.prepare(rows)?;
-            self.head.run(
-                &self.cpu,
+            self.weights.head.prepare(rows)?;
+            self.weights.head.run(
+                &self.weights.cpu,
                 &self.work.normalized[..rows * h],
                 &mut self.logits,
                 rows,
@@ -265,7 +336,7 @@ impl Qwen35 {
             Targets {
                 primary: &self.backends,
                 secondary: self.secondary.as_ref(),
-                head: self.head.backend(),
+                head: self.weights.head.backend(),
                 recurrent: [
                     Some(&mut self.work.recurrent),
                     self.secondary_work.as_mut().map(|work| &mut work.recurrent),
@@ -300,19 +371,13 @@ impl LanguageModel for Qwen35 {
         self.prefix_cache.settings.capacity > 0
     }
     fn position(&self) -> usize {
-        self.position
+        self.sequences.single().position
     }
     fn reset(&mut self) -> Result<()> {
-        if let Some(paging) = &self.paging {
+        if let Some(paging) = &self.weights.paging {
             paging.reset();
         }
-        for layer in self.layers.iter_mut() {
-            match &mut layer.mixer {
-                Mixer::Recurrent { state, .. } => state.reset(),
-                Mixer::Attention { cache, .. } => cache.reset()?,
-            }
-        }
-        self.position = 0;
+        self.sequences.single_mut().reset(Attention::reset)?;
         self.workspaces.reset();
         self.round = None;
         self.features.reset();
@@ -325,7 +390,6 @@ impl LanguageModel for Qwen35 {
         if let Some(draft) = &mut self.dflash {
             draft.reset()?;
         }
-        self.next_rope_position = 0;
         self.prefix_cache.clear();
         self.forward_ms = 0.0;
         self.head_ms = 0.0;
@@ -342,22 +406,22 @@ impl LanguageModel for Qwen35 {
             tokens > 0 && tokens <= self.options.context,
             "Qwen3.5 reservation exceeds context"
         );
-        if tokens > self.reserved {
-            for layer in self.layers.iter() {
-                if let Mixer::Attention { cache, .. } = &layer.mixer {
+        if tokens > self.sequences.single().reserved {
+            for mixer in self.sequences.single().mixers.iter() {
+                if let LayerSeqState::Attention(cache) = &*mixer {
                     cache.reserve(tokens)?;
                 }
             }
-            self.reserved = tokens.div_ceil(32) * 32;
+            self.sequences.single_mut().reserved = tokens.div_ceil(32) * 32;
         }
         Ok(())
     }
     fn truncate(&mut self, position: usize) -> Result<bool> {
         ensure!(
-            position <= self.position,
+            position <= self.sequences.single().position,
             "cannot extend Qwen3.5 state by truncation"
         );
-        if position == self.position {
+        if position == self.sequences.single().position {
             return Ok(true);
         }
         if position == 0 {
@@ -378,14 +442,15 @@ impl LanguageModel for Qwen35 {
             prompt_tokens > 0 && prompt_tokens <= self.options.context,
             "Qwen3.5 prompt exceeds context"
         );
-        let paired = self.paging.is_none()
+        let paired = self.weights.paging.is_none()
             && crate::model::prefill::raw_uses_secondary(
                 prompt_tokens,
                 self.prompt_chunk_rows(),
                 self.options.prefill_ubatches,
             );
+        let position = self.sequences.single().position;
         self.prepare_rows(
-            self.position..self.position + prompt_tokens,
+            position..position + prompt_tokens,
             None,
             [prompt_tokens],
             paired,
@@ -414,7 +479,7 @@ impl LanguageModel for Qwen35 {
             checkpoint: self.prefix_cache.last_position(),
             plan_id: Some(crate::model::prefill::PlanId::new()),
         };
-        let paired = self.paging.is_none()
+        let paired = self.weights.paging.is_none()
             && crate::model::prefill::groups(
                 &prepared.steps,
                 self.options.chunk,
@@ -470,7 +535,7 @@ impl LanguageModel for Qwen35 {
     fn enable_mtp(&mut self, max_draft: usize) -> Result<()> {
         let start = Instant::now();
         ensure!(
-            self.position == 0 && self.round.is_none(),
+            self.sequences.single().position == 0 && self.round.is_none(),
             "configure MTP before prefill"
         );
         if max_draft == 0 {
@@ -494,7 +559,7 @@ impl LanguageModel for Qwen35 {
             .ok_or_else(|| anyhow::anyhow!("no free IOMMU domain for MTP"))?;
         self.mtp = Some(super::mtp::Predictor::load(
             &self.options,
-            &self.config,
+            &self.weights.config,
             &self.loader.store,
             domain,
             max_draft,
@@ -525,10 +590,18 @@ impl LanguageModel for Qwen35 {
             .mtp
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("MTP is disabled"))?;
-        let input = mtp.draft(&self.config, &self.cpu, &self.embedding, token, &self.trace)?;
+        let input = mtp.draft(
+            &self.weights.config,
+            &self.weights.cpu,
+            &self.weights.embedding,
+            token,
+            &self.weights.trace,
+        )?;
         let head_start = Instant::now();
         self.logits.resize(self.info.vocab_size, 0.);
-        self.head.run(&self.cpu, &input, &mut self.logits, 1)?;
+        self.weights
+            .head
+            .run(&self.weights.cpu, &input, &mut self.logits, 1)?;
         self.head_ms += head_start.elapsed().as_secs_f64() * 1000.;
         Ok(&self.logits)
     }

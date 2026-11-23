@@ -17,7 +17,7 @@ use std::{
 
 impl Qwen35 {
     pub(super) fn prompt_chunk_rows(&self) -> usize {
-        if self.paging.is_some() && self.mtp.is_none() {
+        if self.weights.paging.is_some() && self.mtp.is_none() {
             self.options.chunk.max(1024)
         } else {
             self.options.chunk
@@ -30,17 +30,18 @@ impl Qwen35 {
         cancel: Option<&AtomicBool>,
         prepared: Option<EmbeddedChunk<'_>>,
     ) -> Result<()> {
-        if self.paging.is_none() || self.mtp.is_some() || tokens.len() <= self.options.chunk {
+        if self.weights.paging.is_none() || self.mtp.is_some() || tokens.len() <= self.options.chunk
+        {
             return self.chunk(tokens, cancel, prepared);
         }
         let start = Instant::now();
-        let h = self.config.hidden_size;
+        let h = self.weights.config.hidden_size;
         let rows = tokens.len();
-        let position = self.position;
+        let position = self.sequences.single().position;
         let mut hidden = vec![0.; rows * h];
         self.phases.measure(Phase::Cpu, || {
             for (&token, dest) in tokens.iter().zip(hidden.chunks_exact_mut(h)) {
-                self.embedding.row(token as usize, dest);
+                self.weights.embedding.row(token as usize, dest);
             }
         });
         let positions;
@@ -63,7 +64,8 @@ impl Qwen35 {
             }
             positions
         } else {
-            positions = (self.next_rope_position..self.next_rope_position + rows)
+            positions = (self.sequences.single().next_rope_position
+                ..self.sequences.single().next_rope_position + rows)
                 .map(|p| [p; 3])
                 .collect::<Vec<_>>();
             &positions
@@ -71,7 +73,13 @@ impl Qwen35 {
         let mut normalized = vec![0.; rows * h];
         let mut routed = vec![0.; rows * h];
         self.features.begin(rows);
-        for (index, layer) in self.layers.iter_mut().enumerate() {
+        for (index, (layer, state)) in self
+            .weights
+            .layers
+            .iter_mut()
+            .zip(self.sequences.single_mut().mixers.iter_mut())
+            .enumerate()
+        {
             for offset in (0..rows).step_by(self.options.chunk) {
                 ensure!(
                     !cancel.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -81,14 +89,15 @@ impl Qwen35 {
                 let count = end - offset;
                 self.work.hidden[..count * h].copy_from_slice(&hidden[offset * h..end * h]);
                 layer.mix(
+                    state,
                     &mut self.work,
                     &Execution {
-                        config: &self.config,
-                        cpu: &self.cpu,
+                        config: &self.weights.config,
+                        cpu: &self.weights.cpu,
                         rows: count,
                         position: position + offset,
                         index: index as i32,
-                        trace: &self.trace,
+                        trace: &self.weights.trace,
                         rope_positions: &rope_positions[offset..end],
                         verify: false,
                     },
@@ -108,17 +117,17 @@ impl Qwen35 {
                 &normalized,
                 &mut routed,
                 &Execution {
-                    config: &self.config,
-                    cpu: &self.cpu,
+                    config: &self.weights.config,
+                    cpu: &self.weights.cpu,
                     rows,
                     position,
                     index: index as i32,
-                    trace: &self.trace,
+                    trace: &self.weights.trace,
                     rope_positions,
                     verify: false,
                 },
                 &mut self.phases,
-                self.paging.as_ref(),
+                self.weights.paging.as_ref(),
             )?;
             for offset in (0..rows).step_by(self.options.chunk) {
                 ensure!(
@@ -132,31 +141,31 @@ impl Qwen35 {
                 moe.shared(
                     &mut self.work,
                     &Execution {
-                        config: &self.config,
-                        cpu: &self.cpu,
+                        config: &self.weights.config,
+                        cpu: &self.weights.cpu,
                         rows: count,
                         position: position + offset,
                         index: index as i32,
-                        trace: &self.trace,
+                        trace: &self.weights.trace,
                         rope_positions: &rope_positions[offset..end],
                         verify: false,
                     },
                     &mut self.phases,
                 )?;
-                self.trace.save(
+                self.weights.trace.save(
                     position + offset,
                     index as i32,
                     "ffn",
                     &self.work.projected[..count * h],
                 )?;
                 self.phases.measure(Phase::Cpu, || {
-                    self.cpu.add(
+                    self.weights.cpu.add(
                         &mut hidden[offset * h..end * h],
                         &self.work.projected[..count * h],
                     );
                 });
                 self.work.hidden[..count * h].copy_from_slice(&hidden[offset * h..end * h]);
-                self.trace.save(
+                self.weights.trace.save(
                     position + offset,
                     index as i32,
                     "output",
@@ -167,14 +176,7 @@ impl Qwen35 {
         }
         self.features.commit(rows);
         self.flush_features(cancel)?;
-        self.position += rows;
-        self.next_rope_position = rope_positions
-            .iter()
-            .flatten()
-            .copied()
-            .max()
-            .unwrap_or(self.next_rope_position)
-            + 1;
+        self.sequences.single_mut().advance(rope_positions);
         if self.options.compress_w8a8 {
             crate::npu::release_compression_scratch(&self.backends);
         }

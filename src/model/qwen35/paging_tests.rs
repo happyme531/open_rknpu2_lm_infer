@@ -69,13 +69,17 @@ fn run_batches(batches: &[usize]) -> Result<()> {
         let tokens = &windows[0][cursor..cursor + rows];
         cursor += rows;
         let position = model.position();
-        let paging = model.paging.as_ref().context("expected streaming model")?;
+        let paging = model
+            .weights
+            .paging
+            .as_ref()
+            .context("expected streaming model")?;
         paging.forward_marker(position, tokens.len(), true);
         let staged_before = paging.stats()["io"]["staged_records"].as_u64().unwrap();
         let start = Instant::now();
         model.forward(tokens)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
-        let paging = model.paging.as_ref().unwrap();
+        let paging = model.weights.paging.as_ref().unwrap();
         let logits = &model.logits;
         paging.forward_marker(position, tokens.len(), false);
         if rows > crate::model::experts::DECODE_BATCH_MAX_ROWS {
@@ -103,7 +107,7 @@ fn run_batches(batches: &[usize]) -> Result<()> {
         );
     }
     std::fs::write(report_path.with_extension("logits.f32"), outputs)?;
-    model.paging.as_ref().unwrap().save_timeline()?;
+    model.weights.paging.as_ref().unwrap().save_timeline()?;
     report["completed"] = json!(true);
     report["stats"] = model.stats();
     let status = std::fs::read_to_string("/proc/self/status")?;

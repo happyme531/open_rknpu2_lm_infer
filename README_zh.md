@@ -21,6 +21,7 @@
 - 🎯 **比原厂更准**：采用先进的量化算法，Qwen3-4B 和 MiniCPM5-2B 的 WikiText-2 PPL 分别比 rknn-llm W8A8 低 2.17% 和 2.28%。
 - 🔓 **完全开源**：基于自研高性能开源 RKNPU2 算子库 [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/)，整个推理流程无任何原厂闭源库依赖，可随意研究/优化/添加新模型支持。
 - 📦 **混合 W4/W8 量化**：4-bit/8-bit 权重配合 8-bit 动态激活的混合量化，相比原厂W8A8量化占用内存更低。权重 mmap 按需加载，Qwen3-4B 在 4K 上下文下峰值 RSS 约 3.9 GiB。
+- 🔀 **多请求并发**：连续批处理和分块预填充让服务在同一个模型步内推进多个文本请求。
 - 🧠 **低内存运行 MoE**：兼容的 MoE 模型可选择专家常驻，或从磁盘流式加载打包后的专家权重，并使用逐层 NPU 缓存与预取。
 - ⚡ **投机解码**：使用 Qwen3.5 MTP 或匹配的 DFlash/DSpark 草稿模型生成候选 token，再由目标模型验证。
 - 🧩 **开箱即用**：一个二进制同时提供 CLI、终端聊天 TUI 和 OpenAI 兼容 API，支持流式输出、thinking、function calling 和前缀缓存。
@@ -215,6 +216,24 @@ EXPERT_STORE=/path/to/expert-store # 强烈建议使用m.2 pcie3.0 x4接口连�
 Prompt 前缀复用独立于磁盘专家库和 NPU 专家缓存。服务默认启用前缀缓存；可用 `serve --no-cache-prompt` 对服务关闭，或在单个 OpenAI 兼容请求中设置 `extra_body={"cache_prompt": False}`。实际复用的 token 数在 `usage.prompt_tokens_details.cached_tokens` 中返回。
 
 对于含SSM层的模型，`--ctx-checkpoints` 设置状态检查点数量上限（默认 32），`--checkpoint-min-step` 设置最小间距（默认 8192 token）。`--ctx-checkpoints 0` 只关闭这些状态检查点，不会关闭服务的整个 prompt 缓存。
+
+### 连续批处理
+
+在 OpenAI 兼容 API 服务中使用 `serve --parallel N`（或 `-np N`，`N > 1`）可启用固定槽位连续批处理。多个并发请求的 prefill 与 decode token 会合并到同一步 NPU 前向中执行，提升多客户端吞吐：
+
+```sh
+./bin/open_rknpu2_lm_infer --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
+  --ctx-size 4096 --parallel 4 serve --port 8080
+```
+
+可结合相同参数与 `--tune-cache` 提前调优该配置下可达的批处理桶：
+
+```sh
+./bin/open_rknpu2_lm_infer tune --model models/Qwen3-4B-W4A8-Mixed-QQQ-Rot-RK3588 \
+  --ctx-size 4096 --parallel 4
+```
+
+连续批处理支持 `qwen3`、`llama`、`granite`、`qwen3_5` 和 `qwen3_5_moe` 模型的文本请求。该模式要求 `--prefill-ubatches 1` 和 `--spec-type none`，每个槽位按 `--ctx-size` 预留 KV 容量。需要 prompt 前缀复用时使用单请求模式。并发请求额度可在调用端控制。
 
 ### 投机解码
 

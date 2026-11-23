@@ -1,6 +1,6 @@
 //! Atomic hybrid target verification. GDN retains compact inputs; attention
 //! appends tentative KV and discards the unaccepted suffix at commit/abort.
-use super::{decoder::Mixer, runtime::Qwen35};
+use super::{decoder::LayerSeqState, runtime::Qwen35};
 use crate::{model::LanguageModel, ops::norm};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -32,7 +32,7 @@ impl Qwen35 {
                 && tokens.len() <= self.options.chunk,
             "verification exceeds the reserved speculative window or ubatch"
         );
-        self.reserve(self.position + tokens.len())?;
+        self.reserve(self.sequences.single().position + tokens.len())?;
         self.release_prefill_workspaces()?;
         self.round = Some(Round {
             tokens: tokens.to_vec(),
@@ -43,14 +43,15 @@ impl Qwen35 {
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
             let head_start = Instant::now();
             let rows = tokens.len();
-            let h = self.config.hidden_size;
-            self.phases.context(self.position, rows, -1, true);
+            let h = self.weights.config.hidden_size;
+            self.phases
+                .context(self.sequences.single().position, rows, -1, true);
             self.phases
                 .trace("target head preparation", || -> Result<()> {
                     norm::rms_norm(
                         &self.work.hidden[..rows * h],
-                        &self.final_norm,
-                        self.config.epsilon,
+                        &self.weights.final_norm,
+                        self.weights.config.epsilon,
                         true,
                         &mut self.work.normalized[..rows * h],
                     )?;
@@ -60,11 +61,11 @@ impl Qwen35 {
                         .hidden
                         .extend_from_slice(&self.work.normalized[..rows * h]);
                     self.logits.resize(rows * self.info.vocab_size, 0.);
-                    self.head.prepare(rows)
+                    self.weights.head.prepare(rows)
                 })?;
             self.phases.trace("target head", || {
-                self.head.run(
-                    &self.cpu,
+                self.weights.head.run(
+                    &self.weights.cpu,
                     &self.work.normalized[..rows * h],
                     &mut self.logits,
                     rows,
@@ -100,36 +101,39 @@ impl Qwen35 {
             "invalid target commit boundary"
         );
         let result = (|| -> Result<()> {
-            for layer in self.layers.iter_mut() {
-                match &mut layer.mixer {
-                    Mixer::Recurrent { state, .. } => {
-                        state.finish_round(&self.cpu.pool, consumed)?
+            let position = self.sequences.single().position + consumed;
+            for mixer in self.sequences.single_mut().mixers.iter_mut() {
+                match mixer {
+                    LayerSeqState::Recurrent(state) => {
+                        state.finish_round(&self.weights.cpu.pool, consumed)?
                     }
-                    Mixer::Attention { cache, .. } => cache.truncate(self.position + consumed)?,
+                    LayerSeqState::Attention(cache) => cache.truncate(position)?,
                 }
             }
             if let Some(mtp) = &mut self.mtp {
                 let round = self.round.as_ref().unwrap();
-                let h = self.config.hidden_size;
+                let h = self.weights.config.hidden_size;
                 let mut embeddings = vec![0.; consumed * h];
                 for (r, &token) in round.tokens[..consumed].iter().enumerate() {
-                    self.embedding
+                    self.weights
+                        .embedding
                         .row(token as usize, &mut embeddings[r * h..(r + 1) * h]);
                 }
-                let rope: Vec<_> = (self.next_rope_position..self.next_rope_position + consumed)
+                let rope: Vec<_> = (self.sequences.single().next_rope_position
+                    ..self.sequences.single().next_rope_position + consumed)
                     .map(|p| [p; 3])
                     .collect();
                 mtp.catch_up(
-                    &self.config,
-                    &self.cpu,
+                    &self.weights.config,
+                    &self.weights.cpu,
                     &embeddings,
                     &round.hidden[..consumed * h],
                     &rope,
-                    &self.trace,
+                    &self.weights.trace,
                 )?;
             }
-            self.position += consumed;
-            self.next_rope_position += consumed;
+            self.sequences.single_mut().position += consumed;
+            self.sequences.single_mut().next_rope_position += consumed;
             self.features.commit(consumed);
             self.flush_features(None)?;
             let vocab = self.info.vocab_size;
@@ -158,10 +162,11 @@ impl Qwen35 {
             if !verified {
                 return Ok(());
             }
-            for layer in self.layers.iter_mut() {
-                match &mut layer.mixer {
-                    Mixer::Recurrent { state, .. } => state.abort_round(),
-                    Mixer::Attention { cache, .. } => cache.truncate(self.position)?,
+            let position = self.sequences.single().position;
+            for mixer in self.sequences.single_mut().mixers.iter_mut() {
+                match mixer {
+                    LayerSeqState::Recurrent(state) => state.abort_round(),
+                    LayerSeqState::Attention(cache) => cache.truncate(position)?,
                 }
             }
             // The last committed logits may have been overwritten by verify.

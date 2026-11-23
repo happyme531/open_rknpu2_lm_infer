@@ -1,5 +1,60 @@
 use super::*;
 use crate::sampling::SamplingParams;
+use anyhow::anyhow;
+
+#[test]
+fn serving_windows_distinguish_queue_output_backpressure_and_completed_work() {
+    let previous = ServingSnapshot {
+        tokens: ServingTokens {
+            decode: 8,
+            ..Default::default()
+        },
+        active: 2,
+        parallel: 2,
+        ..Default::default()
+    };
+    let window = previous.window(previous, true);
+    assert_eq!(window.quiet, Some(QuietWindow::NoCompletedWork));
+    let blocked = ServingSnapshot {
+        blocked: 2,
+        ..previous
+    };
+    assert_eq!(
+        blocked.window(previous, true).quiet,
+        Some(QuietWindow::OutputBlocked)
+    );
+    let waiting = ServingSnapshot {
+        active: 0,
+        waiting: 1,
+        ..previous
+    };
+    assert_eq!(
+        waiting.window(previous, true).quiet,
+        Some(QuietWindow::Waiting)
+    );
+    let idle = ServingSnapshot {
+        waiting: 0,
+        ..waiting
+    };
+    assert_eq!(idle.window(previous, true).quiet, Some(QuietWindow::Idle));
+    assert_eq!(idle.window(idle, false).quiet, None);
+
+    let current = ServingSnapshot {
+        tokens: ServingTokens {
+            prefill: 4,
+            cached: 7,
+            decode: 10,
+            ..Default::default()
+        },
+        ..blocked
+    };
+    let window = current.window(previous, true);
+    assert!(window.prefill && window.decode && window.busy);
+    assert_eq!(window.tokens.prefill, 4);
+    assert_eq!(window.tokens.cached, 7);
+    assert_eq!(window.tokens.decode, 2);
+    assert_eq!(window.quiet, None);
+}
 
 fn greedy() -> SamplingParams {
     SamplingParams {
@@ -282,7 +337,7 @@ fn confidence_truncation_preserves_greedy_commit_and_budget_boundaries() -> Resu
     Ok(())
 }
 
-fn codec() -> Result<(tempfile::TempDir, TextCodec)> {
+pub(super) fn codec() -> Result<(tempfile::TempDir, TextCodec)> {
     let dir = tempfile::tempdir()?;
     let vocab = [("[EOS]", 0), ("A", 1), ("B", 2), ("C", 3), ("D", 4)]
         .into_iter()

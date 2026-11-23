@@ -17,6 +17,10 @@ impl<T> Layers<T> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+    pub fn lock(&self, index: usize) -> MutexGuard<'_, T> {
+        self.0[index].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = MutexGuard<'_, T>> {
         self.0
             .iter()
